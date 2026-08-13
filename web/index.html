@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="sr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Jarvis — lični AI asistent</title>
+  <link rel="stylesheet" href="/static/styles.css?v=5" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">✦</span>
+      <span class="title">Jarvis</span>
+      <span class="subtle">lični AI asistent</span>
+    </div>
+    <div class="status" id="status-line">
+      <span class="dot" id="ws-dot"></span>
+      <span id="ws-text">povezivanje…</span>
+      <span class="sep">·</span>
+      <span class="subtle" id="model-text">model: —</span>
+      <select id="model-select" title="Aktivan model"></select>
+      <select id="voice-select" title="Jarvis glas (TTS)"></select>
+      <button id="voice-test" title="Proba glasa">▶</button>
+      <button id="tts-toggle" title="Jarvis glas (TTS)">🔊</button>
+      <button id="tts-server" title="Reprodukuj kroz sistemske zvučnike (server afplay)">🔈</button>
+    </div>
+    <nav class="tabs">
+      <button data-tab="chat" class="active">Razgovor</button>
+      <button data-tab="permissions">Dozvole</button>
+      <button data-tab="connections">Konekcije</button>
+      <button data-tab="local-models">Lokalni modeli</button>
+      <button data-tab="tools">Alati</button>
+      <button data-tab="logs">Logovi</button>
+    </nav>
+  </header>
+
+  <main>
+    <section class="tab active" id="tab-chat">
+      <div class="chat-wrap">
+        <aside class="sessions">
+          <button id="new-session" class="primary">+ Nova konverzacija</button>
+          <ul id="sessions-list"></ul>
+        </aside>
+        <div class="chat-main">
+          <div id="transcript" class="transcript"></div>
+          <div class="composer">
+            <button id="mic" title="Push-to-talk (⌥⌘ Space)">
+              <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z"/></svg>
+            </button>
+            <textarea id="input" rows="1" placeholder="Pitaj Jarvisa… (Enter = pošalji, Shift+Enter = novi red)"></textarea>
+            <span id="busy-text" class="subtle"></span>
+            <button id="stop" title="Prekini trenutni odgovor" disabled>■</button>
+            <button id="send" class="primary">Pošalji</button>
+          </div>
+          <div id="permission-banner" class="banner hidden"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-permissions">
+      <div class="panel">
+        <div class="row">
+          <label>Podrazumevana politika:</label>
+          <select id="perm-default">
+            <option value="allow">allow — automatski dozvoli</option>
+            <option value="ask">ask — uvek pitaj</option>
+            <option value="deny">deny — blokiraj</option>
+          </select>
+          <button id="perm-default-save" class="primary">Sačuvaj</button>
+        </div>
+        <table class="perm-table">
+          <thead>
+            <tr><th>Tool</th><th>Opis</th><th>Politika</th><th></th></tr>
+          </thead>
+          <tbody id="perm-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-local-models">
+      <div class="panel">
+        <div class="row">
+          <h3>Lokalni modeli (Ollama)</h3>
+          <button id="local-refresh" class="primary">Osveži</button>
+        </div>
+        <p class="hint">Prikazani su SVI modeli koje Ollama ima na disku.
+          Modeli označeni sa <code>⚠ bez tool-ova</code> ne mogu da izvršavaju
+          akcije (muzika, kalendar…) — za to prebaci na cloud model.
+          <code>JARVIS_LOCAL_MODELS</code> u <code>.env</code> služi samo za
+          override parametara (<code>id|tag|n_ctx|keep_alive|flags</code>).
+          Kad je model učitan, pojavljuje se u dropdown-u gore i može se
+          izabrati kao aktivan LLM. Zahteva <code>ollama serve</code> u pozadini.</p>
+        <div id="local-engine-missing" class="banner hidden">
+          <code>ollama</code> daemon nije pokrenut. Pokreni
+          <code>ollama serve</code> (ili <code>brew services start ollama</code>) i osveži ovu stranicu.
+        </div>
+        <table class="perm-table">
+          <thead>
+            <tr><th>Model</th><th>Ollama tag</th><th>Veličina</th><th>Alati</th><th>Status</th><th></th></tr>
+          </thead>
+          <tbody id="local-models-tbody"></tbody>
+        </table>
+        <div class="row" style="margin-top:12px; gap:8px;">
+          <input id="pull-tag" type="text" placeholder="npr. qwen3:14b ili llama3.2:3b" style="flex:1;">
+          <button id="pull-start" class="primary">⬇ Skini model (pull)</button>
+        </div>
+        <div id="pull-list"></div>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-connections">
+      <div class="panel">
+        <div class="conn" id="conn-minimax">
+          <h3>Minimax token plan (LLM)</h3>
+          <div class="kv"><span>base_url</span><code id="conn-mm-url"></code></div>
+          <div class="kv"><span>model</span><code id="conn-mm-model"></code></div>
+          <div class="kv"><span>api_key</span><code id="conn-mm-key"></code></div>
+          <p class="hint">Ključ i endpoint se čitaju iz <code>~/.config/kilo/kilo.jsonc</code>.</p>
+        </div>
+        <div class="conn" id="conn-kilo">
+          <h3>Kilo CLI (kod/terminal)</h3>
+          <div class="kv"><span>bin</span><code id="conn-kilo-bin"></code></div>
+          <div class="kv"><span>config</span><code id="conn-kilo-cfg"></code></div>
+          <div class="kv"><span>dostupan</span><code id="conn-kilo-ok"></code></div>
+        </div>
+        <div class="conn" id="conn-audio">
+          <h3>Audio (lokalno)</h3>
+          <div class="kv"><span>whisper</span><code id="conn-whisper"></code></div>
+          <div class="kv"><span>piper</span><code id="conn-piper"></code></div>
+        </div>
+        <div class="conn" id="conn-ptt">
+          <h3>Global Push-to-Talk</h3>
+          <div class="kv"><span>Key</span><code id="ptt-key"></code></div>
+          <div class="kv"><span>mute while held</span><code id="ptt-mute"></code></div>
+          <div class="kv"><span>auto-send</span><code id="ptt-autosend"></code></div>
+          <div class="kv"><span>status</span><code id="ptt-status"></code></div>
+          <p class="hint" id="ptt-hint"></p>
+          <div class="row">
+            <button id="ptt-toggle" class="primary">Uključi / Isključi</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-tools">
+      <div class="panel">
+        <table class="perm-table">
+          <thead>
+            <tr><th>Tool</th><th>Opis</th><th>Parametri</th></tr>
+          </thead>
+          <tbody id="tools-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-logs">
+      <div class="panel">
+        <div class="logs-head">
+          <span class="subtle">Živi log događaja iz bus-a.</span>
+          <label><input type="checkbox" id="autoscroll" checked /> auto-scroll</label>
+          <button id="logs-clear">Očisti</button>
+        </div>
+        <pre id="log-stream"></pre>
+      </div>
+    </section>
+  </main>
+
+  <div id="perm-modal" class="modal hidden">
+    <div class="modal-card">
+      <h3>Zahtev za dozvolu</h3>
+      <p>Jarvis želi da izvrši:</p>
+      <div class="perm-tool" id="perm-modal-tool"></div>
+      <pre class="perm-args" id="perm-modal-args"></pre>
+      <label class="remember"><input type="checkbox" id="perm-modal-remember" /> Zapamti izbor za ovaj tool</label>
+      <div class="modal-actions">
+        <button id="perm-modal-deny">Odbij</button>
+        <button id="perm-modal-allow" class="primary">Dozvoli</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=11"></script>
+</body>
+</html>

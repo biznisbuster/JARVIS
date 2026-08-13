@@ -1,0 +1,26 @@
+{
+  "default_policy": "allow",
+  "tools": {
+    "time_now": "allow",
+    "reminders_create": "allow",
+    "reminders_list": "allow",
+    "calendar_today": "allow",
+    "open_app": "allow",
+    "open_url": "allow",
+    "play_youtube": "allow",
+    "ytm_play": "allow",
+    "ytm_pause": "allow",
+    "ytm_resume": "allow",
+    "ytm_next": "allow",
+    "ytm_previous": "allow",
+    "ytm_volume_up": "allow",
+    "ytm_volume_down": "allow",
+    "ytm_volume_mute": "allow",
+    "ytm_status": "allow",
+    "web_search": "allow",
+    "read_clipboard": "allow",
+    "write_clipboard": "allow",
+    "system_volume": "allow",
+    "kilo_run": "allow"
+  }
+}

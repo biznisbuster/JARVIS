@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Thin wrapper: `jarvis serve|ui|doctor`.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [ -d .venv ]; then
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+fi
+exec python -m jarvis "$@"

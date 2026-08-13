@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis"
+version = "0.3.0"
+description = "Lični glasovni AI asistent (macOS, FastAPI, OpenAI-compat LLM)"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.23,<2",
+    "ruff>=0.6,<1",
+]
+
+[project.scripts]
+jarvis = "jarvis.__main__:main"
+
+[tool.setuptools]
+packages = ["jarvis", "jarvis.agent", "jarvis.audio", "jarvis.media"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [
+    ".venv",
+    "data",
+    "logs",
+    "models",
+    "node_modules",
+]
+
+[tool.ruff.lint]
+# Slojevi koje NE diramo (legacy kod) — pojačaćemo kad bude clean baseline.
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear (subset)
+    "C4",   # flake8-comprehensions
+]
+ignore = [
+    "E501",   # line length (formatter handles)
+    "B008",   # do not perform function calls in argument defaults (FastAPI Depends)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["jarvis"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
