@@ -1060,6 +1060,28 @@ async def _ytm_send_transport(action: str) -> dict[str, Any]:
     return {**result, "adapter": result.get("adapter", "ytm_web")}
 
 
+async def _ytm_send_volume(action: str) -> dict[str, Any]:
+    """Change and verify volume on the dedicated YT Music media element."""
+    try:
+        result = await _ytm_web.control_volume(action)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "error": str(exc),
+        }
+    log.info(
+        "ytm volume %s → web result=%s",
+        action,
+        json.dumps(result, ensure_ascii=False, default=str),
+    )
+    return {**result, "adapter": result.get("adapter", "ytm_web")}
+
+
 async def ytm_pause(args: dict[str, Any]) -> str:
     return json.dumps(await _ytm_send_transport("pause"), ensure_ascii=False)
 
@@ -1077,36 +1099,15 @@ async def ytm_previous(args: dict[str, Any]) -> str:
 
 
 async def ytm_volume_up(args: dict[str, Any]) -> str:
-    if not _ytm_app_installed():
-        return _ytm_unavailable()
-    rc, _, err = await _osascript(
-        "set volume output volume ((((output volume of (get volume settings)) + 6) min 100))"
-    )
-    if rc != 0:
-        return json.dumps({"ok": False, "error": err or "YTM volume up failed"})
-    return json.dumps({"ok": True, "action": "volume_up"})
+    return json.dumps(await _ytm_send_volume("volume_up"), ensure_ascii=False)
 
 
 async def ytm_volume_down(args: dict[str, Any]) -> str:
-    if not _ytm_app_installed():
-        return _ytm_unavailable()
-    rc, _, err = await _osascript(
-        "set volume output volume ((((output volume of (get volume settings)) - 6) max 0))"
-    )
-    if rc != 0:
-        return json.dumps({"ok": False, "error": err or "YTM volume down failed"})
-    return json.dumps({"ok": True, "action": "volume_down"})
+    return json.dumps(await _ytm_send_volume("volume_down"), ensure_ascii=False)
 
 
 async def ytm_volume_mute(args: dict[str, Any]) -> str:
-    if not _ytm_app_installed():
-        return _ytm_unavailable()
-    rc, _, err = await _osascript(
-        "set volume with output muted (not (output muted of (get volume settings)))"
-    )
-    if rc != 0:
-        return json.dumps({"ok": False, "error": err or "YTM mute failed"})
-    return json.dumps({"ok": True, "action": "mute_toggle"})
+    return json.dumps(await _ytm_send_volume("volume_mute"), ensure_ascii=False)
 
 
 async def ytm_status(args: dict[str, Any]) -> str:
@@ -1371,20 +1372,20 @@ def build_registry() -> list[ToolDef]:
         ),
         ToolDef(
             "ytm_volume_up",
-            "Pojačaj zvuk — menja SISTEMSKI izlazni zvuk (ne samo YTM).",
-            _schema("ytm_volume_up", "Pojačaj sistemski zvuk.", {}, []),
+            "Pojačaj samo YT Music player (ne menja macOS sistemski zvuk).",
+            _schema("ytm_volume_up", "Pojačaj samo YT Music player.", {}, []),
             ytm_volume_up,
         ),
         ToolDef(
             "ytm_volume_down",
-            "Smanji zvuk — menja SISTEMSKI izlazni zvuk (ne samo YTM).",
-            _schema("ytm_volume_down", "Smanji sistemski zvuk.", {}, []),
+            "Smanji samo YT Music player (ne menja macOS sistemski zvuk).",
+            _schema("ytm_volume_down", "Smanji samo YT Music player.", {}, []),
             ytm_volume_down,
         ),
         ToolDef(
             "ytm_volume_mute",
-            "Utišaj / vrati zvuk — menja SISTEMSKI mute (ne samo YTM).",
-            _schema("ytm_volume_mute", "Mute sistemskog zvuka.", {}, []),
+            "Utišaj / vrati samo YT Music player (ne menja macOS sistemski mute).",
+            _schema("ytm_volume_mute", "Utišaj ili vrati samo YT Music player.", {}, []),
             ytm_volume_mute,
         ),
         ToolDef(

@@ -139,6 +139,48 @@ async def test_missing_loaded_player_does_not_fall_back_to_desktop_transport(
     assert desktop_calls == []
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "action"),
+    [
+        ("ytm_volume_up", "volume_up"),
+        ("ytm_volume_down", "volume_down"),
+        ("ytm_volume_mute", "volume_mute"),
+    ],
+)
+async def test_ytm_volume_uses_dedicated_media_element_not_system_volume(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    action: str,
+) -> None:
+    web_calls: list[str] = []
+
+    async def fake_control_volume(requested: str) -> dict[str, object]:
+        web_calls.append(requested)
+        return {
+            "ok": True,
+            "action": requested,
+            "adapter": "ytm_web",
+            "delivered": True,
+            "verified": True,
+            "verification": "verified",
+            "before": {"volume": 0.5, "muted": False},
+            "after": {"volume": 0.6, "muted": requested == "volume_mute"},
+        }
+
+    async def forbidden_system_volume(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("YT Music volume must not call macOS system volume")
+
+    monkeypatch.setattr(tools._ytm_web, "control_volume", fake_control_volume)
+    monkeypatch.setattr(tools, "_osascript", forbidden_system_volume)
+
+    result = json.loads(await getattr(tools, tool_name)({}))
+
+    assert result["ok"] is True
+    assert result["adapter"] == "ytm_web"
+    assert result["verified"] is True
+    assert web_calls == [action]
+
+
 async def test_transport_state_refuses_generic_nowplaying_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

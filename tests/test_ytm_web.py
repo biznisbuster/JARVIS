@@ -30,6 +30,9 @@ class FakePage:
         search_result_shape: str = "href",
         component_candidates: list[dict[str, object]] | None = None,
         playback_starts: bool = True,
+        identity_available: bool = True,
+        transport_control_shape: str = "player_bar",
+        volume_available: bool = True,
     ) -> None:
         self.closed = closed
         self.url = url
@@ -42,9 +45,15 @@ class FakePage:
         self.search_result_shape = search_result_shape
         self.component_candidates = component_candidates or []
         self.playback_starts = playback_starts
+        self.identity_available = identity_available
+        self.transport_control_shape = transport_control_shape
+        self.volume_available = volume_available
         self.last_query = ""
         self.bring_to_front_calls = 0
         self.wait_for_selector_calls: list[str] = []
+        self.transport_commands: list[str] = []
+        self.volume_commands: list[str] = []
+        self.state_reads = 0
         self.state = {
             "ok": True,
             "playing": False,
@@ -55,6 +64,8 @@ class FakePage:
             "ariaLabel": "Play",
             "currentTime": 0,
             "duration": 200,
+            "volume": 0.5,
+            "muted": False,
         }
 
     def is_closed(self) -> bool:
@@ -164,10 +175,47 @@ class FakePage:
                 "selection_method": "watch_endpoint_anchor",
                 "component": "ytmusic-responsive-list-item-renderer",
             }
-        if "document.querySelector('video')" in script and "title" in script:
-            return dict(self.state)
+        if "ytmPlayerState" in script:
+            self.state_reads += 1
+            state = dict(self.state)
+            if not self.identity_available:
+                state.update({"title": "", "artist": "", "track_id": ""})
+            return state
+        if "ytmMediaVolumeState" in script:
+            if not self.volume_available:
+                return {"ok": False, "volume": None, "muted": None, "error": "no video element"}
+            return {
+                "ok": True,
+                "volume": self.state["volume"],
+                "muted": self.state["muted"],
+            }
+        if "ytmMediaVolumeControl" in script:
+            action = str(arg)
+            self.volume_commands.append(action)
+            if not self.volume_available:
+                return {"ok": False, "error": "no video element"}
+            before = {
+                "volume": self.state["volume"],
+                "muted": self.state["muted"],
+            }
+            if action == "volume_up":
+                self.state["volume"] = min(1.0, self.state["volume"] + 0.10)
+            elif action == "volume_down":
+                self.state["volume"] = max(0.0, self.state["volume"] - 0.10)
+            elif action == "volume_mute":
+                self.state["muted"] = not self.state["muted"]
+            else:
+                return {"ok": False, "error": f"unknown volume action: {action}"}
+            return {"ok": True, "method": "html_media_element", "before": before, "requested": action}
         if "video.play" in script:
             action = arg
+            self.transport_commands.append(str(action))
+            if action in ("next", "previous") and (
+                self.transport_control_shape != "player_bar"
+                or "ytmusic-player-bar" not in script
+                or f"{action}-button" not in script
+            ):
+                return {"ok": False, "error": f"missing player-bar {action} control"}
             if action == "play":
                 self.state["playing"] = True
             elif action == "pause":
@@ -347,6 +395,7 @@ async def test_connect_launches_a_headed_persistent_profile(monkeypatch) -> None
     launch = fake_pw.chromium.launch_persistent_context
     assert launch.calls[0]["headless"] is False
     assert launch.calls[0]["user_data_dir"].endswith("ytm_test_profile")
+    assert "--start-minimized" not in launch.calls[0]["args"]
     assert ytm_web._connection_marker_path().is_file()
 
 
@@ -390,6 +439,18 @@ async def test_warm_up_does_not_launch_profile_without_connection_marker(monkeyp
 
     assert ytm_web._warmup_task is None
     assert ytm_web._launched is False
+
+
+async def test_warm_up_restores_saved_profile_minimized(monkeypatch) -> None:
+    fake_pw = _install_fake_playwright(monkeypatch)
+    ytm_web._JARVIS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    ytm_web._connection_marker_path().touch()
+
+    ytm_web.warm_up()
+    assert ytm_web._warmup_task is not None
+    await ytm_web._warmup_task
+
+    assert "--start-minimized" in fake_pw.chromium.launch_persistent_context.calls[0]["args"]
 
 
 async def test_ensure_ready_does_not_restore_unconnected_profile(monkeypatch) -> None:
@@ -583,6 +644,8 @@ async def test_control_next_verifies_track_transition(monkeypatch) -> None:
     assert result["track_changed"] is True
     assert result["before"]["track_id"] == "test-track"
     assert result["after"]["track_id"] == "next-track"
+    assert page.transport_commands == ["next"]
+    assert page.bring_to_front_calls == 0
 
 
 async def test_control_next_does_not_use_playing_as_track_verification(monkeypatch) -> None:
@@ -598,6 +661,97 @@ async def test_control_next_does_not_use_playing_as_track_verification(monkeypat
     assert result["delivered"] is True
     assert result["verification"] == "failed"
     assert result["track_changed"] is False
+    assert page.transport_commands == ["next"]
+
+
+async def test_control_previous_verifies_track_transition(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    page.state["playing"] = True
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control("previous")
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["delivered"] is True
+    assert result["track_changed"] is True
+    assert result["after"]["track_id"] == "previous-track"
+    assert page.transport_commands == ["previous"]
+
+
+@pytest.mark.parametrize("action", ["next", "previous"])
+async def test_control_non_idempotent_action_is_sent_once_when_identity_unavailable(
+    monkeypatch,
+    action: str,
+) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(identity_available=False)
+    page.state["playing"] = True
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control(action)
+
+    assert result["ok"] is False
+    assert result["delivered"] is True
+    assert result["verified"] is False
+    assert result["verification"] == "unavailable"
+    assert result["degraded"] is True
+    assert page.transport_commands == [action]
+    assert page.state_reads <= 5
+
+
+@pytest.mark.parametrize(
+    ("action", "start_volume", "expected_volume"),
+    [("volume_up", 0.95, 1.0), ("volume_down", 0.05, 0.0)],
+)
+async def test_control_volume_clamps_and_verifies_media_element(
+    monkeypatch,
+    action: str,
+    start_volume: float,
+    expected_volume: float,
+) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    page.state["volume"] = start_volume
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control_volume(action)
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["adapter"] == "ytm_web"
+    assert result["before"]["volume"] == start_volume
+    assert result["after"]["volume"] == expected_volume
+    assert page.volume_commands == [action]
+
+
+async def test_control_volume_mute_toggles_and_verifies_media_element(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control_volume("volume_mute")
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["before"]["muted"] is False
+    assert result["after"]["muted"] is True
+    assert page.volume_commands == ["volume_mute"]
+
+
+async def test_control_volume_without_media_element_is_explicit_failure(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(volume_available=False)
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control_volume("volume_up")
+
+    assert result["ok"] is False
+    assert result["delivered"] is False
+    assert result["verified"] is False
+    assert result["verification"] == "not_attempted"
+    assert page.volume_commands == []
 
 
 @pytest.mark.parametrize(

@@ -502,6 +502,14 @@ YT Music related tool tests
 - [x] Resolve the live Polymer search-result shape, stale successive-search
       behavior and Playwright verification call so direct YTM playback can
       select and verify two different requested tracks.
+- [x] Use the live `ytmusic-player-bar` custom-control shape for next/previous
+      and keep transition verification to one delivered action plus bounded
+      state reads only.
+- [x] Route YT Music volume up/down/mute through the dedicated HTML media
+      element with clamping and readback verification; keep `system_volume`
+      as the macOS-wide volume tool.
+- [x] Keep normal saved-profile restore headed but minimized, while explicit
+      Connect still presents the dedicated browser for login/reconnection.
 - [ ] Complete real macOS/YT Music connection and audible playback validation.
 
 ## Suggested verification semantics
@@ -1107,6 +1115,106 @@ audible from the dedicated browser and repeat the check after a restart.
 NO — the focused real adapter check passes, but the required user-led manual
 Phase 1 validation and audible playback checkpoint remain outstanding. Do not
 merge and do not start Phase 2.
+
+---
+
+## Phase 1 final focused runtime pass (2026-08-14)
+
+### Root cause
+
+The live authenticated YT Music player bar does not expose the transport
+controls as `#next-button` and `#previous-button`. It renders
+`yt-icon-button.next-button` and `yt-icon-button.previous-button` inside
+`ytmusic-player-bar`; the actionable inner buttons carry the `Next` and
+`Previous` ARIA labels. The old selectors therefore returned `no next button`
+or `no previous button` even though the visible controls were usable.
+
+The YT Music volume tools were still using AppleScript `set volume`, which
+changed the whole macOS output device rather than the dedicated YT Music
+player. The headless Chrome smoke test also reached the music origin but did
+not render the YT Music app, search box or player bar, so headless mode was not
+adopted as the normal runtime.
+
+### Completed
+
+- Scoped next/previous discovery to the authenticated `ytmusic-player-bar`
+  custom controls and clicked exactly one actionable inner button.
+- Preserved strict before/after track-identity verification and added bounded
+  delayed state reads only; delivered next/previous commands are never resent
+  by the verification path.
+- Added YT Music-only volume operations using `video.volume` and
+  `video.muted`, with ±0.10 clamping, readback and explicit degraded failure
+  results when the media element is unavailable.
+- Updated tool schemas, prompt guidance and README semantics so `ytm_volume_*`
+  is distinct from macOS-wide `system_volume`.
+- Kept explicit Connect headed and presented; saved normal restore uses the
+  headed browser with `--start-minimized`.
+- Real authenticated adapter validation completed `next` ×5 and `previous`
+  ×3 with `CONNECTED`, `delivered=true`, `verified=true` and changed title /
+  artist state for each transition. The YTM volume up/down/mute/toggle path
+  also returned verified media-element readback.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/tools.py`
+- `jarvis/agent/prompts.py`
+- `tests/test_ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `README.md`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added player-bar-shaped fake DOM coverage for next/previous, single command
+  delivery, unchanged-track failure and delivered-but-unverifiable degraded
+  results with bounded read counts.
+- Added YT Music media-element volume clamp, mute, readback and unavailable
+  element coverage.
+- Added a tool-level regression proving YT Music volume never calls the
+  macOS system-volume AppleScript.
+- Added lifecycle coverage for minimized saved-profile restore versus
+  explicitly presented Connect.
+
+### Validation
+
+- `./.venv/bin/pytest -q tests/test_ytm_web.py tests/test_phase0_media_regressions.py` -> PASS (`60 passed`)
+- Real authenticated `ytm_web` adapter using `/Users/marko/.jarvis/ytm_profile` -> PASS: `CONNECTED`; search/play verified; next ×5 and previous ×3 each delivered one player-bar click and verified a changed track identity; volume up/down/mute/toggle verified HTML media-element state.
+- Headless authenticated Chrome smoke -> NOT ADOPTED: origin loaded, but the YT Music app, search box and player bar did not render.
+- Headed saved-profile restore with `--start-minimized` -> PASS: the adapter restored `CONNECTED`; the read-only macOS window-list probe found no on-screen matching YT Music window. Audible output and focus behavior were not independently measured.
+
+### Manual validation still required
+
+- Start JARVIS with `./scripts/start.sh` and use the connected profile through
+  chat: play a specific Relja song, play a different Vlado Georgiev song,
+  pause, resume, next ×5 and previous ×3.
+- Confirm successful tool results show `adapter=ytm_web`,
+  `connection_state=CONNECTED`, `verified=true` and the actual YT Music
+  title/artist; confirm the dedicated browser remains backgrounded during
+  normal actions and is presented only by Connect/reconnect.
+- Test `ytm_volume_up/down/mute` while another macOS audio source is present,
+  confirming only YT Music changes, then confirm the audio is audible.
+- Repeat the playback and persistence checks after a JARVIS restart.
+
+### New issues discovered
+
+- Headless Chrome did not render the authenticated YT Music surface in the
+  real-profile smoke test; this is recorded in Appendix A. Phase 1 uses the
+  safer headed-minimized fallback and does not add a new browser architecture.
+
+### Remaining risks
+
+- Audible output, exact focus/window behavior and the user-led chat sequence
+  still require manual confirmation on this macOS session.
+- YT Music may change its Polymer control classes or labels; failures remain
+  explicit and limited to one delivered non-idempotent action.
+- Phase 2 `MediaService` and state-ownership work has not started.
+
+### Ready for next phase
+
+NO — the focused runtime correction is implemented and directly validated, but
+the required user-led audible/manual Phase 1 checkpoint remains outstanding.
+Do not merge and do not start Phase 2.
 
 ---
 
@@ -2052,6 +2160,29 @@ desktop or normal-YouTube fallback.
 
 **Blocks current phase:** yes — code and direct adapter validation are fixed,
 but user-led manual playback/audible validation remains required.
+
+## [P2] Headless Chrome did not render the authenticated YT Music surface
+
+**Found in phase:** 1
+**Files:** `jarvis/media/ytm_web.py`
+
+**Symptom:**
+The real authenticated profile could launch in headless Chrome and reach
+`https://music.youtube.com`, but the YT Music app, search box and player bar
+were not rendered in the bounded smoke test.
+
+**Root cause:**
+The exact headless rendering/autoplay incompatibility was not isolated. The
+same profile works in headed Chrome, so Phase 1 does not assume that an origin
+load in headless mode means that YT Music is usable.
+
+**Recommended phase:**
+Phase 1 — resolved operationally by retaining a headed dedicated browser and
+starting saved normal-runtime sessions minimized. Revisit only if a reliable
+background audio mode is needed later.
+
+**Blocks current phase:** no — headed minimized restore is the selected
+fallback; manual focus and audible behavior remain required.
 
 ---
 

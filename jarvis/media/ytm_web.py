@@ -55,6 +55,8 @@ _search_ready: bool = False
 _player_loaded: bool = False
 _playing: bool | None = None
 
+_YTM_VOLUME_STEP = 0.10
+
 
 def _get_lock() -> asyncio.Lock:
     global _lock
@@ -172,7 +174,7 @@ def _resolve_profile() -> tuple[Path, list[str]]:
     return _JARVIS_PROFILE_DIR, ["--no-first-run", "--disable-blink-features=AutomationControlled"]
 
 
-async def _launch_browser() -> bool:
+async def _launch_browser(*, start_minimized: bool = False) -> bool:
     """Launch the one headed, persistent browser used by all YTM actions."""
     global _pw, _context, _ytm_page, _launched, _active_profile, _browser
     if _context_runtime_alive():
@@ -181,6 +183,8 @@ async def _launch_browser() -> bool:
             return True
 
     user_data_dir, args = _resolve_profile()
+    if start_minimized:
+        args = [*args, "--start-minimized"]
     log.info("ytm_web: launching persistent browser profile=%s", user_data_dir)
 
     try:
@@ -217,7 +221,7 @@ async def _launch_browser() -> bool:
                 _context = await _pw.chromium.launch_persistent_context(
                     user_data_dir=str(_JARVIS_PROFILE_DIR),
                     headless=False,
-                    args=["--no-first-run", "--disable-blink-features=AutomationControlled"],
+                    args=args,
                     timeout=30000,
                 )
             except Exception as exc:
@@ -529,7 +533,7 @@ async def _restore_existing_connection() -> None:
     _connection_state = CONNECTING
     _connection_error = None
     try:
-        if await _launch_browser():
+        if await _launch_browser(start_minimized=True):
             await _navigate_to_ytm()
         else:
             _connection_state = ERROR
@@ -567,7 +571,7 @@ async def ensure_ready() -> bool:
         if not _profile_is_connected():
             return False
         _connection_state = CONNECTING
-        if not await _launch_browser():
+        if not await _launch_browser(start_minimized=True):
             _connection_state = ERROR
             _connection_error = "Could not restore the YT Music browser"
             return False
@@ -584,6 +588,8 @@ def is_available() -> bool:
 
 _STATE_JS = """
 () => {
+  const ytmPlayerState = true;
+  void ytmPlayerState;
   const video = document.querySelector('video');
   const playPause = document.querySelector('#play-pause-button');
   const titleEl = document.querySelector('.title.ytmusic-player-bar');
@@ -609,7 +615,7 @@ _STATE_JS = """
 }
 """
 
-_CONTROL_JS = """
+_CONTROL_JS = r"""
 async (action) => {
   if (action === 'play' || action === 'pause') {
     const video = document.querySelector('video');
@@ -622,24 +628,110 @@ async (action) => {
     return { ok: true, method: 'video.pause' };
   }
   if (action === 'next') {
-    const btn = document.querySelector('#next-button');
-    if (!btn) return { ok: false, error: 'no next button' };
-    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
-      return { ok: false, error: 'next button disabled' };
+    const bar = document.querySelector('ytmusic-player-bar');
+    if (!bar) return { ok: false, error: 'no ytmusic-player-bar' };
+    const labels = ['next', 'sledeća', 'sljedeća'];
+    const host = Array.from(bar.querySelectorAll('yt-icon-button, button, [role="button"]'))
+      .find((element) => {
+        const style = getComputedStyle(element);
+        const visible = !element.hidden && style.display !== 'none'
+          && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+        if (!visible) return false;
+        const classes = String(element.className || '').split(/\s+/);
+        const title = (element.getAttribute('title') || '').trim().toLowerCase();
+        const aria = (element.getAttribute('aria-label') || '').trim().toLowerCase();
+        return classes.includes('next-button') || labels.includes(title) || labels.includes(aria);
+      });
+    if (!host) return { ok: false, error: 'no next control in ytmusic-player-bar' };
+    const target = host.matches('yt-icon-button, [role="button"]')
+      ? (host.querySelector('button[aria-label], button') || host)
+      : host;
+    if (host.disabled || host.getAttribute('aria-disabled') === 'true'
+      || target.disabled || target.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, error: 'next control disabled' };
     }
-    btn.click();
-    return { ok: true, method: 'click #next-button' };
+    target.click();
+    return {
+      ok: true,
+      method: 'click ytmusic-player-bar .next-button button',
+      control: { tag: host.tagName.toLowerCase(), className: String(host.className || ''),
+        title: host.getAttribute('title') || '', aria: target.getAttribute('aria-label') || '' },
+    };
   }
   if (action === 'previous') {
-    const btn = document.querySelector('#previous-button');
-    if (!btn) return { ok: false, error: 'no previous button' };
-    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
-      return { ok: false, error: 'previous button disabled' };
+    const bar = document.querySelector('ytmusic-player-bar');
+    if (!bar) return { ok: false, error: 'no ytmusic-player-bar' };
+    const labels = ['previous', 'prethodna'];
+    const host = Array.from(bar.querySelectorAll('yt-icon-button, button, [role="button"]'))
+      .find((element) => {
+        const style = getComputedStyle(element);
+        const visible = !element.hidden && style.display !== 'none'
+          && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+        if (!visible) return false;
+        const classes = String(element.className || '').split(/\s+/);
+        const title = (element.getAttribute('title') || '').trim().toLowerCase();
+        const aria = (element.getAttribute('aria-label') || '').trim().toLowerCase();
+        return classes.includes('previous-button') || labels.includes(title) || labels.includes(aria);
+      });
+    if (!host) return { ok: false, error: 'no previous control in ytmusic-player-bar' };
+    const target = host.matches('yt-icon-button, [role="button"]')
+      ? (host.querySelector('button[aria-label], button') || host)
+      : host;
+    if (host.disabled || host.getAttribute('aria-disabled') === 'true'
+      || target.disabled || target.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, error: 'previous control disabled' };
     }
-    btn.click();
-    return { ok: true, method: 'click #previous-button' };
+    target.click();
+    return {
+      ok: true,
+      method: 'click ytmusic-player-bar .previous-button button',
+      control: { tag: host.tagName.toLowerCase(), className: String(host.className || ''),
+        title: host.getAttribute('title') || '', aria: target.getAttribute('aria-label') || '' },
+    };
   }
   return { ok: false, error: 'unknown action: ' + action };
+}
+"""
+
+_MEDIA_VOLUME_STATE_JS = r"""
+() => {
+  const ytmMediaVolumeState = true;
+  void ytmMediaVolumeState;
+  const video = document.querySelector('video');
+  if (!video) return { ok: false, volume: null, muted: null, error: 'no video element' };
+  return {
+    ok: true,
+    volume: Number.isFinite(video.volume) ? video.volume : null,
+    muted: !!video.muted,
+  };
+}
+"""
+
+_MEDIA_VOLUME_CONTROL_JS = r"""
+async (action) => {
+  const ytmMediaVolumeControl = true;
+  void ytmMediaVolumeControl;
+  const video = document.querySelector('video');
+  if (!video) return { ok: false, error: 'no video element' };
+  const before = {
+    volume: Number.isFinite(video.volume) ? video.volume : null,
+    muted: !!video.muted,
+  };
+  if (action === 'volume_up') {
+    video.volume = Math.min(1, Math.max(0, video.volume + 0.10));
+  } else if (action === 'volume_down') {
+    video.volume = Math.min(1, Math.max(0, video.volume - 0.10));
+  } else if (action === 'volume_mute') {
+    video.muted = !video.muted;
+  } else {
+    return { ok: false, error: 'unknown volume action: ' + action };
+  }
+  return {
+    ok: true,
+    method: 'html_media_element',
+    before,
+    requested: action,
+  };
 }
 """
 
@@ -972,6 +1064,138 @@ async def get_state() -> dict[str, Any]:
     return result
 
 
+async def _read_volume_state() -> dict[str, Any]:
+    if _ytm_page is None:
+        return {"ok": False, "volume": None, "muted": None, "error": "YT Music page is unavailable"}
+    try:
+        result = await _ytm_page.evaluate(_MEDIA_VOLUME_STATE_JS)
+    except Exception as exc:
+        return {"ok": False, "volume": None, "muted": None, "error": str(exc)}
+    if not isinstance(result, dict):
+        return {"ok": False, "volume": None, "muted": None, "error": "unexpected volume state"}
+    return result
+
+
+def _verify_volume_action(
+    action: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    if not isinstance(after, dict) or not after.get("ok"):
+        return False, "unavailable"
+    if action == "volume_mute":
+        if not isinstance(before, dict) or not isinstance(before.get("muted"), bool):
+            return False, "unavailable"
+        if isinstance(after.get("muted"), bool) and after["muted"] != before["muted"]:
+            return True, "verified"
+        return False, "failed"
+    if not isinstance(before, dict) or not isinstance(before.get("volume"), (int, float)):
+        return False, "unavailable"
+    if not isinstance(after.get("volume"), (int, float)):
+        return False, "unavailable"
+    delta = _YTM_VOLUME_STEP if action == "volume_up" else -_YTM_VOLUME_STEP
+    expected = min(1.0, max(0.0, float(before["volume"]) + delta))
+    if abs(float(after["volume"]) - expected) <= 0.011:
+        return True, "verified"
+    return False, "failed"
+
+
+async def control_volume(action: str) -> dict[str, Any]:
+    """Change only the connected YT Music HTML media element volume."""
+    if action not in ("volume_up", "volume_down", "volume_mute"):
+        return {
+            "ok": False,
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "error": f"unknown volume action: {action}",
+        }
+    if not await ensure_ready():
+        status = _status_payload()
+        return {
+            "ok": False,
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "degraded": False,
+            "connection_state": status["state"],
+            "page_ready": status["page_ready"],
+            "search_ready": status["search_ready"],
+            "player_loaded": status["player_loaded"],
+            "error": f"YT Music is {status['state'].lower()}",
+        }
+
+    before = await _read_volume_state()
+    if not before.get("ok"):
+        status = _status_payload()
+        return {
+            "ok": False,
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "degraded": False,
+            "connection_state": status["state"],
+            "before": before,
+            "after": None,
+            "error": before.get("error", "YT Music media element is unavailable"),
+        }
+
+    try:
+        send_result = await _ytm_page.evaluate(_MEDIA_VOLUME_CONTROL_JS, action)
+    except Exception as exc:
+        send_result = {"ok": False, "error": str(exc)}
+    delivered = bool(isinstance(send_result, dict) and send_result.get("ok"))
+    if not delivered:
+        status = _status_payload()
+        return {
+            "ok": False,
+            "action": action,
+            "method": (send_result or {}).get("method"),
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "degraded": False,
+            "connection_state": status["state"],
+            "before": before,
+            "after": None,
+            "error": (send_result or {}).get("error", "volume command was not delivered"),
+        }
+
+    await asyncio.sleep(0.05)
+    after = await _read_volume_state()
+    verified, verification = _verify_volume_action(action, before, after)
+    status = _status_payload()
+    result = {
+        "ok": bool(delivered and verified),
+        "action": action,
+        "method": (send_result or {}).get("method", "html_media_element"),
+        "adapter": "ytm_web",
+        "delivered": delivered,
+        "verified": verified,
+        "verification": verification,
+        "degraded": delivered and not verified and verification == "unavailable",
+        "connection_state": status["state"],
+        "before": before,
+        "after": after,
+        "volume": after.get("volume"),
+        "muted": after.get("muted"),
+    }
+    if not verified:
+        result["error"] = (
+            "YT Music volume change could not be verified"
+            if verification == "unavailable"
+            else "YT Music volume did not reach the requested value"
+        )
+    return result
+
+
 def _track_identity(state: dict[str, Any] | None) -> tuple[str, ...] | None:
     """Return the strongest available identity for a loaded track."""
     if not isinstance(state, dict) or not state.get("ok"):
@@ -1058,6 +1282,7 @@ async def control(action: str) -> dict[str, Any]:
     try:
         send_result = await _ytm_page.evaluate(_CONTROL_JS, action)
     except Exception as exc:
+        status = _status_payload()
         return {
             "ok": False,
             "error": str(exc),
@@ -1067,10 +1292,14 @@ async def control(action: str) -> dict[str, Any]:
             "verified": False,
             "verification": "not_attempted",
             "before": before,
+            "after": None,
+            "state": before,
+            "connection_state": status["state"],
         }
 
     delivered = bool(send_result and send_result.get("ok"))
     if not delivered:
+        status = _status_payload()
         return {
             "ok": False,
             "action": action,
@@ -1082,6 +1311,7 @@ async def control(action: str) -> dict[str, Any]:
             "before": before,
             "after": None,
             "state": before,
+            "connection_state": status["state"],
             "error": (send_result or {}).get("error", "command was not delivered"),
         }
 
@@ -1090,9 +1320,15 @@ async def control(action: str) -> dict[str, Any]:
     verified, verification = _verify_action(action, before, state)
 
     if not verified and action in ("next", "previous"):
-        await asyncio.sleep(0.5)
-        state = await get_state()
-        verified, verification = _verify_action(action, before, state)
+        # Track navigation can update the player bar after the first read.
+        # These are reads only: a delivered non-idempotent command is never
+        # sent again from this verification path.
+        for _ in range(3):
+            await asyncio.sleep(0.4)
+            state = await get_state()
+            verified, verification = _verify_action(action, before, state)
+            if verified:
+                break
 
     track_changed = None
     if action in ("next", "previous"):
@@ -1116,6 +1352,8 @@ async def control(action: str) -> dict[str, Any]:
         "before": before,
         "after": state,
         "state": state,
+        "connection_state": _status_payload()["state"],
+        "control": (send_result or {}).get("control"),
     }
     if track_changed is not None or action in ("next", "previous"):
         result["track_changed"] = track_changed

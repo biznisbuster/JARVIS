@@ -48,14 +48,17 @@ za `ask` dozvolu pre izvršenja.
 
 ## YouTube Music
 
-YT Music koristi namensku, vidljivu persistent browser sesiju u
+YT Music koristi namensku persistent headed browser sesiju u
 `~/.jarvis/ytm_profile`. Na novom uređaju otvori tab *Konekcije* i klikni
 *Poveži YouTube Music*; prijava se obavlja direktno na Google/YT Music stranici.
-JARVIS ne prima, ne upisuje i ne čuva Google lozinku. Ista browser sesija se
-zatim koristi za pretragu, reprodukciju i DOM verifikaciju pause/resume/next/
-previous akcija. Nepotvrđen profil se ne otvara automatski pri restartu; dugme
-za povezivanje ga prikaže radi prijave. Ako sesija istekne, status prelazi u
-*Potrebna prijava*.
+JARVIS ne prima, ne upisuje i ne čuva Google lozinku. U normalnom radu sačuvana
+sesija se pokreće minimizirano, dok je dugme za povezivanje prikaže radi prijave
+ili ponovnog povezivanja. Ista browser sesija se zatim koristi za pretragu,
+reprodukciju, YT Music-only volume i DOM verifikaciju pause/resume/next/previous
+akcija. Ako sesija istekne, status prelazi u *Potrebna prijava*.
+
+`ytm_volume_up/down/mute` menjaju samo HTML media element YT Music playera;
+`system_volume` je alat za ceo macOS izlazni zvuk.
 
 ## Šta imaš odmah
 
