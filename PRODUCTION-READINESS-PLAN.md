@@ -983,8 +983,9 @@ credentials: `/Users/marko/.jarvis/ytm_profile`, one active YT Music tab,
 
 ### New issues discovered
 
-- No unresolved additional issue was found. The missing-avatar probe and
-  multi-page login handoff were blocking Phase 1 issues and are fixed in this
+- The connection correction is resolved, but a separate real-runtime
+  playback/search issue was observed and recorded in Appendix A. The
+  missing-avatar probe and multi-page login handoff are fixed in this
   correction; the manual playback checkpoint remains outstanding.
 
 ### Remaining risks
@@ -1914,6 +1915,31 @@ Phase 1 — fixed with multi-page adoption and evidence-based login detection;
 manual connection and playback retest required.
 
 **Blocks current phase:** yes — resolved in code; manual retest required.
+
+## [P1] Connected YT Music search did not produce a playable result
+
+**Found in phase:** 1
+**Files:** `jarvis/media/ytm_web.py`
+
+**Symptom:**
+After the dedicated profile reached `CONNECTED`, real `ytm_play` requests for
+`Relja Popović` and `Vlado Georgiev` used the `ytm_web` adapter but timed out
+after 12 seconds waiting for the YT Music search-result selector. The logged
+results were explicit failures (`ok=false`, `delivered=false`,
+`verified=false`), so no false playback success was reported.
+
+**Root cause:**
+Not established by the connection-only validation. The connection path and
+auth probe were healthy; the failure is isolated to the subsequent YT Music
+search/result-control path and needs a focused real playback investigation.
+
+**Recommended phase:**
+Phase 1 — investigate in a separate playback-focused pass after the login
+handoff is manually revalidated. Do not broaden this correction into a
+playback rewrite.
+
+**Blocks current phase:** yes — manual Phase 1 playback validation remains
+blocked; not fixed in this connection correction.
 
 ---
 
