@@ -466,6 +466,10 @@ YT Music related tool tests
 - [x] Verify next/previous using changed track identity when possible.
 - [x] If track identity is unavailable, use a clearly documented degraded
       verification strategy.
+- [x] Do not repeat a delivered `next`/`previous` command when verification is
+      unavailable or proves that no transition occurred.
+- [x] Allow bounded additional state reads after delivery, and allow fallback
+      transports only when the prior transport did not deliver the command.
 - [x] Do not set mirrored state to playing merely because a key event was
       delivered.
 - [x] Return `ok=False` when no channel can verify the intended effect.
@@ -548,6 +552,11 @@ gap: it treated `playing=True` as proof of a track transition. The generic
 now-playing fallback also accepted `playing=True` when no before/after track
 identity existed.
 
+The generic fallback also retained retry behavior after a successful
+`next`/`previous` delivery when transition verification was unavailable.
+Because those actions are non-idempotent, that could skip multiple tracks
+before the system returned a failure.
+
 ### Completed
 
 - Removed the unconditional play/pause key after desktop `next` and
@@ -585,11 +594,16 @@ identity existed.
 - Added web-adapter track-transition success/failure coverage.
 - Added generic now-playing coverage proving a transition requires an
   observed identity change.
+- Added generic transport coverage proving delivered `next`/`previous`
+  commands are sent once when verification is unavailable or shows no change,
+  while a not-delivered transport may fall back and a later state read can
+  verify the transition.
+- Kept play/pause retry behavior separately covered as idempotent transport.
 
 ### Validation
 
-- `./.venv/bin/pytest tests/test_phase0_media_regressions.py tests/test_ytm_web.py tests/test_nowplaying.py -q` -> PASS (`21 passed`)
-- `./.venv/bin/pytest -q` -> PASS (`105 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
+- `./.venv/bin/pytest tests/test_phase0_media_regressions.py tests/test_ytm_web.py tests/test_nowplaying.py -q` -> PASS (`30 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`114 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
 - `./.venv/bin/ruff check .` -> FAIL (4 pre-existing findings in `jarvis/audio/focus.py`, `jarvis/log.py`, `jarvis/media/ytm_web.py` and `tests/test_web_ui_7b.py`)
 - `./.venv/bin/ruff format --check .` -> FAIL (8 pre-existing formatted files; no added Phase 1 formatting issue)
 - `git diff --check` -> PASS
@@ -608,14 +622,20 @@ identity existed.
 
 ### New issues discovered
 
-- None. Existing Phase 3 xfails, the Phase 0 frontend dependency advisory and
-  the deferred MediaService world-state test remain outside this phase.
+- The Phase 1 review found that generic now-playing fallback retry behavior
+  could repeat a delivered non-idempotent command when identity verification
+  was unavailable. It was fixed in this Phase 1 correction; see Appendix A.
+  Existing Phase 3 xfails, the Phase 0 frontend dependency advisory and the
+  deferred MediaService world-state test remain outside this phase.
 
 ### Remaining risks
 
 - The desktop fallback still relies on generic macOS now-playing evidence when
   the dedicated YTM web state is unavailable; YTM-specific manual validation
   is required to confirm what MediaRemote exposes on this machine.
+- A delivered desktop `next`/`previous` command now returns an explicit
+  unverified/degraded failure when identity remains unavailable; callers must
+  decide whether and when a user-requested retry is appropriate.
 - Full Ruff validation remains red on pre-existing repository findings.
 - Phase 2 MediaService/state-ownership work has intentionally not started.
 
@@ -1404,6 +1424,26 @@ Template:
 
 **Blocks current phase:** yes/no
 ```
+
+## [P1] Delivered generic next/previous command could be repeated
+
+**Found in phase:** 1
+**Files:** `jarvis/media/nowplaying.py`
+
+**Symptom:**
+If `nowplaying-cli` reported a successful `next` or `previous` delivery but
+track identity could not be read, the fallback chain could send the same
+non-idempotent action again and potentially skip multiple tracks.
+
+**Root cause:**
+The generic transport treated failed verification uniformly and retried or
+fell back after delivery, without distinguishing a delivered command from a
+transport that failed before delivery.
+
+**Recommended phase:**
+Phase 1 — fixed in the Phase 1 correction.
+
+**Blocks current phase:** yes — resolved.
 
 ## [P2] Frontend dependency audit reports vulnerabilities
 
