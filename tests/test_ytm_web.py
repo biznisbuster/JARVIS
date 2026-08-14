@@ -175,6 +175,16 @@ async def test_is_available_true_when_ready(monkeypatch) -> None:
     assert ytm_web.is_available() is True
 
 
+async def test_dead_ytm_page_is_not_reported_ready(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    monkeypatch.setattr(ytm_web, "_ytm_page", FakePage(closed=True))
+    monkeypatch.setattr(ytm_web, "_launched", True)
+    monkeypatch.setattr(ytm_web, "_ready", True)
+    monkeypatch.setattr(ytm_web, "_browser", types.SimpleNamespace(is_connected=lambda: True))
+
+    assert ytm_web.is_available() is False
+
+
 async def test_get_state_not_ready_returns_error(monkeypatch) -> None:
     _install_fake_playwright(monkeypatch, launch_should_fail=True)
     result = await ytm_web.get_state()
