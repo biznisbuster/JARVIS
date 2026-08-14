@@ -501,5 +501,15 @@ async def _execute_tool(session: Session, tc: dict[str, Any], store: perm_mod.Pe
         result_text = json.dumps({"ok": False, "error": repr(exc)})
         await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
     else:
-        await BUS.publish("tool_done", {"session": session.id, "tool": name, "ok": True})
+        done_payload: dict[str, Any] = {"session": session.id, "tool": name, "ok": True}
+        try:
+            result = json.loads(result_text)
+        except (TypeError, json.JSONDecodeError):
+            result = None
+        if isinstance(result, dict) and isinstance(result.get("ok"), bool):
+            done_payload["ok"] = result["ok"]
+            for key in ("delivered", "verified", "degraded", "verification", "error"):
+                if key in result:
+                    done_payload[key] = result[key]
+        await BUS.publish("tool_done", done_payload)
     session.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})

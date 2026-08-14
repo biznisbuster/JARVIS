@@ -850,6 +850,13 @@ def _ytm_unavailable() -> str:
     return json.dumps({"ok": False, "error": f"'{_YTM_APP_NAME}' app not installed"})
 
 
+def _ytm_play_result(path: str, result: dict[str, Any]) -> str:
+    """Serialize and log the complete YT Music play result for diagnosis."""
+    serialized = json.dumps(result, ensure_ascii=False, default=str)
+    log.info("ytm_play: path=%s result=%s", path, serialized)
+    return serialized
+
+
 # Pouzdano biranje prvog rezultata: scrape-ujemo YTM search HTML, izvučemo
 # prvi videoId, i otvorimo `https://music.youtube.com/watch?v=ID` — YTM tamo
 # uvek kreće pesmu od početka, bez obzira na prethodni queue.
@@ -928,14 +935,15 @@ async def ytm_play(args: dict[str, Any]) -> str:
 
     if _ytm_web.is_available():
         result = await _ytm_web.play_query(query)
-        log.info("ytm_play: web → %s", result.get("ok"))
-        if result.get("ok"):
-            state = result.get("state") or {}
-            if state.get("playing") is True:
-                _YTM_STATE.mark_playing()
-            elif state.get("playing") is False:
-                _YTM_STATE.mark_paused()
-            return json.dumps(
+        log.info(
+            "ytm_play: path=ytm_web adapter=ytm_web result=%s",
+            json.dumps(result, ensure_ascii=False, default=str),
+        )
+        state = result.get("state") or {}
+        if result.get("ok") and state.get("ok") is True and state.get("playing") is True:
+            _YTM_STATE.mark_playing()
+            return _ytm_play_result(
+                "ytm_web",
                 {
                     "ok": True,
                     "query": query,
@@ -951,11 +959,14 @@ async def ytm_play(args: dict[str, Any]) -> str:
                         "playing": state.get("playing"),
                         "title": state.get("title", ""),
                         "artist": state.get("artist", ""),
+                        "track_id": state.get("track_id") or state.get("trackId", ""),
                     },
                 },
-                ensure_ascii=False,
             )
-        log.warning("ytm_play: web failed (%s), falling back to Quartz", result.get("error"))
+        log.warning(
+            "ytm_play: web failed; falling back to desktop YT Music result=%s",
+            json.dumps(result, ensure_ascii=False, default=str),
+        )
 
     if not _ytm_app_installed():
         return json.dumps(
@@ -977,41 +988,35 @@ async def ytm_play(args: dict[str, Any]) -> str:
         watch_url = f"https://music.youtube.com/watch?v={video_id}"
         if await _ytm_open_url(watch_url):
             await asyncio.sleep(1.6)
-            before = await _ytm_read_transport_state()
-            sent = False
-            if before is not None and before.get("playing") is True:
-                after = before
-                verified, verification = True, "verified"
-            else:
-                pid = await _ytm_pid()
-                sent = await _ytm_post_keycode(pid, _YTM_KEY_CODES["play"])
-                await asyncio.sleep(0.45)
-                after = await _ytm_read_transport_state()
-                verified, verification = _ytm_verify_transport("play", before, after)
-                verified = sent and verified
-            log.info("ytm_play(fallback): opened %s, sent space=%s verified=%s", video_id, sent, verified)
+            after = await _ytm_read_transport_state()
+            track_id = str((after or {}).get("track_id") or (after or {}).get("trackId") or "").strip()
+            verified = _ytm_state_is_specific(after) and after.get("playing") is True and track_id == video_id
+            verification = (
+                "verified" if verified else "unavailable" if not _ytm_state_is_specific(after) else "failed"
+            )
             if verified:
                 _ytm_update_mirrored_state(after)
             else:
                 _YTM_STATE.mark_unknown()
-            return json.dumps(
+            return _ytm_play_result(
+                "desktop_video_id",
                 {
                     "ok": verified,
                     "query": query,
                     "video_id": video_id,
-                    "method": "video_id+space" if sent else "video_id+state",
+                    "method": "video_id+ytm_state" if verified else "video_id",
+                    "adapter": "ytm_desktop",
                     "action": "play",
-                    "delivered": sent,
+                    "delivered": True,
                     "verified": verified,
                     "verification": verification,
-                    "degraded": sent and not verified and verification == "unavailable",
-                    "before": before,
+                    "degraded": not verified and verification == "unavailable",
                     "after": after,
                     "state": after,
                     "expected_state": "playing",
-                    **({} if verified else {"error": "playback state did not reach playing"}),
+                    "expected_video_id": video_id,
+                    **({} if verified else {"error": "requested YT Music track could not be verified"}),
                 },
-                ensure_ascii=False,
             )
 
     q = _ytm_escape(query)
@@ -1100,22 +1105,21 @@ async def _ytm_read_state_via_dom() -> dict[str, Any] | None:
 async def _ytm_read_transport_state() -> dict[str, Any] | None:
     """Read transport state from the strongest currently available channel.
 
-    The desktop fallback has no dedicated YTM DOM, so generic now-playing
-    state is only treated as evidence when it returns a real state object.
-    The mirrored state is intentionally not used as verification evidence.
+    Only the dedicated YT Music DOM is trusted. Generic macOS now-playing
+    state may belong to JARVIS TTS, a browser tab, or another audio app, so it
+    is not valid evidence for a YT Music action. The mirrored state is also
+    intentionally not used as verification evidence.
     """
     web_state = await _ytm_read_state_via_dom()
     if web_state is not None and web_state.get("ok"):
         return {**web_state, "source": "ytm_web"}
-
-    try:
-        system_state = await _np.get_state()
-    except Exception as exc:  # noqa: BLE001
-        log.debug("ytm transport state read failed: %s", exc)
-        return None
-    if system_state.get("ok"):
-        return {**system_state, "source": "nowplaying"}
+    log.debug("ytm transport state unavailable; refusing generic now-playing evidence")
     return None
+
+
+def _ytm_state_is_specific(state: dict[str, Any] | None) -> bool:
+    """Return whether state came from the dedicated YT Music adapter."""
+    return isinstance(state, dict) and state.get("ok") is True and state.get("source") == "ytm_web"
 
 
 def _ytm_track_identity(state: dict[str, Any] | None) -> tuple[str, ...] | None:
@@ -1138,7 +1142,7 @@ def _ytm_verify_transport(
     after: dict[str, Any] | None,
 ) -> tuple[bool, str]:
     """Verify the requested effect from observed state, not delivery."""
-    if not isinstance(after, dict) or not after.get("ok"):
+    if not _ytm_state_is_specific(after):
         return False, "unavailable"
     if action == "pause":
         if after.get("playing") is False:
@@ -1150,6 +1154,8 @@ def _ytm_verify_transport(
         return False, "unavailable" if after.get("playing") is None else "failed"
 
     before_identity = _ytm_track_identity(before)
+    if not _ytm_state_is_specific(before):
+        return False, "unavailable"
     after_identity = _ytm_track_identity(after)
     if before_identity is None or after_identity is None:
         return False, "unavailable"
@@ -1195,7 +1201,9 @@ async def _ytm_send_transport(action: str) -> dict[str, Any]:
         try:
             result = await _ytm_web.control(action)
             log.info(
-                "ytm transport %s → web: ok=%s verified=%s", action, result.get("ok"), result.get("verified")
+                "ytm transport %s → web: result=%s",
+                action,
+                json.dumps(result, ensure_ascii=False, default=str),
             )
             if result.get("ok") or result.get("delivered"):
                 if result.get("verified"):
@@ -1230,7 +1238,11 @@ async def _ytm_send_transport(action: str) -> dict[str, Any]:
 
     before = await _ytm_read_transport_state()
     desired_playing = {"pause": False, "play": True}.get(action)
-    if desired_playing is not None and before is not None and before.get("playing") is desired_playing:
+    if (
+        desired_playing is not None
+        and _ytm_state_is_specific(before)
+        and before.get("playing") is desired_playing
+    ):
         _ytm_update_mirrored_state(before)
         return {
             "ok": True,
@@ -1288,7 +1300,10 @@ async def _ytm_send_transport(action: str) -> dict[str, Any]:
         after_identity = _ytm_track_identity(after)
         track_changed = (
             before_identity != after_identity
-            if before_identity is not None and after_identity is not None
+            if _ytm_state_is_specific(before)
+            and _ytm_state_is_specific(after)
+            and before_identity is not None
+            and after_identity is not None
             else None
         )
 
@@ -1316,6 +1331,11 @@ async def _ytm_send_transport(action: str) -> dict[str, Any]:
             if action in ("next", "previous")
             else f"playback state did not reach {'playing' if action == 'play' else 'paused'}"
         )
+    log.info(
+        "ytm transport %s → desktop result=%s",
+        action,
+        json.dumps(result, ensure_ascii=False, default=str),
+    )
     return result
 
 

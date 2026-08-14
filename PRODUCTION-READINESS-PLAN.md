@@ -474,6 +474,8 @@ YT Music related tool tests
       delivered.
 - [x] Return `ok=False` when no channel can verify the intended effect.
 - [x] Add adapter/method metadata to diagnostic result.
+- [x] Reject generic macOS now-playing evidence as YT Music verification.
+- [x] Make `tool_done` reflect structured tool result status when available.
 - [x] Preserve current working play/pause behavior while strengthening
       verification.
 
@@ -557,6 +559,14 @@ The generic fallback also retained retry behavior after a successful
 Because those actions are non-idempotent, that could skip multiple tracks
 before the system returned a failure.
 
+Real manual validation then confirmed a second contamination path: when the
+dedicated YT Music web adapter was unavailable, the desktop fallback accepted
+generic macOS now-playing state. It treated an already-playing unrelated
+track as proof that a new YT Music request had started, and could observe
+JARVIS TTS as if it were the requested YT Music track. The same run confirmed
+that `_execute_tool()` published `tool_done.ok=True` for any tool that returned
+without raising, even when its JSON result contained `{"ok": false}`.
+
 ### Completed
 
 - Removed the unconditional play/pause key after desktop `next` and
@@ -571,15 +581,25 @@ before the system returned a failure.
   the requested result, while verifying all delivered commands.
 - Hardened the existing desktop YT Music play fallbacks against the same
   command-delivery false-success behavior.
+- Restricted YT Music transport verification to dedicated `ytm_web` state;
+  generic macOS now-playing state is now rejected and produces an explicit
+  delivered-but-unverified/degraded result.
+- Removed the desktop `ytm_play` shortcut that treated any existing playing
+  state as the requested track, and stopped sending Space when requested
+  playback cannot be verified from YT Music-specific state.
+- Made `tool_done` include the structured tool result status and diagnostic
+  fields when a tool returns JSON with an `ok` field.
 - Converted the Phase 0 strict YT Music xfails into passing regressions and
   added web/generic transport verification coverage.
 
 ### Files changed
 
+- `jarvis/agent/loop.py`
 - `jarvis/agent/tools.py`
 - `jarvis/media/nowplaying.py`
 - `jarvis/media/ytm_web.py`
 - `tests/test_phase0_media_regressions.py`
+- `tests/test_loop_tool_events.py`
 - `tests/test_ytm_web.py`
 - `tests/test_nowplaying.py`
 - `PRODUCTION-READINESS-PLAN.md`
@@ -599,11 +619,15 @@ before the system returned a failure.
   while a not-delivered transport may fall back and a later state read can
   verify the transition.
 - Kept play/pause retry behavior separately covered as idempotent transport.
+- Added regressions proving JARVIS/TTS generic now-playing state cannot verify
+  YT Music transitions or a new `ytm_play` request.
+- Added a focused regression proving `tool_done.ok` reflects a structured
+  tool failure.
 
 ### Validation
 
-- `./.venv/bin/pytest tests/test_phase0_media_regressions.py tests/test_ytm_web.py tests/test_nowplaying.py -q` -> PASS (`30 passed`)
-- `./.venv/bin/pytest -q` -> PASS (`114 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
+- `./.venv/bin/pytest tests/test_phase0_media_regressions.py tests/test_ytm_web.py tests/test_nowplaying.py tests/test_loop_tool_events.py -q` -> PASS (`36 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`120 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
 - `./.venv/bin/ruff check .` -> FAIL (4 pre-existing findings in `jarvis/audio/focus.py`, `jarvis/log.py`, `jarvis/media/ytm_web.py` and `tests/test_web_ui_7b.py`)
 - `./.venv/bin/ruff format --check .` -> FAIL (8 pre-existing formatted files; no added Phase 1 formatting issue)
 - `git diff --check` -> PASS
@@ -613,26 +637,42 @@ before the system returned a failure.
 
 ### Manual validation still required
 
-- Real macOS/YT Music validation was not run by the agent. On macOS, start
-  JARVIS with `./scripts/start.sh`, ensure YT Music is installed and logged
-  in, then issue `play`, `pause`, `resume`, `next` five times and `previous`
-  three times through the UI. Confirm every transition changes the track and
-  that no `next`/`previous` action pauses playback unexpectedly. Repeat with
-  the browser adapter unavailable if desktop fallback coverage is required.
+- Manual validation was performed on real macOS/YT Music and FAILED. The
+  dedicated web adapter reported `ready=False` because its player bar was not
+  ready, so the run used the desktop Quartz path. `ytm_play` and transport
+  results were not reliable, and generic now-playing evidence was shown to be
+  unsafe for YT Music verification.
+- The runtime log identifies the failed paths as `ytm_play(fallback)` with a
+  scraped video ID and the desktop Quartz transport path (`pid=48245`). For
+  `Relja Popovic`, the old log recorded `sent space=False verified=True` even
+  though the state was the already-playing generic `Top Gun`/`Relja`; for
+  `Vlado Georgiev`, it recorded `sent space=True verified=False` and the model
+  retried. The old code did not log the complete JSON result; this correction
+  now logs the complete result with adapter/path metadata.
+- After this correction, repeat on macOS with YT Music logged in to the
+  persistent browser profile. Start JARVIS with `./scripts/start.sh`, then
+  issue `ytm_play` for a different song/artist while another track is already
+  playing, followed by `pause`, `resume`, `next` five times and `previous`
+  three times. Confirm successful results identify `adapter=ytm_web`, have
+  `verified=true`, and refer to the requested/actual YT Music track. If the
+  web adapter is unavailable, confirm the desktop path returns explicit
+  `ok=false` delivered/degraded results rather than claiming success.
 
 ### New issues discovered
 
 - The Phase 1 review found that generic now-playing fallback retry behavior
   could repeat a delivered non-idempotent command when identity verification
   was unavailable. It was fixed in this Phase 1 correction; see Appendix A.
+- Real manual validation found generic JARVIS/TTS now-playing contamination
+  and a misleading `tool_done.ok` event; both are fixed in this correction.
   Existing Phase 3 xfails, the Phase 0 frontend dependency advisory and the
   deferred MediaService world-state test remain outside this phase.
 
 ### Remaining risks
 
-- The desktop fallback still relies on generic macOS now-playing evidence when
-  the dedicated YTM web state is unavailable; YTM-specific manual validation
-  is required to confirm what MediaRemote exposes on this machine.
+- The desktop fallback can deliver YT Music commands but cannot claim success
+  without dedicated YT Music state; when the web adapter is unavailable it
+  intentionally returns delivered-but-unverified/degraded results.
 - A delivered desktop `next`/`previous` command now returns an explicit
   unverified/degraded failure when identity remains unavailable; callers must
   decide whether and when a user-requested retry is appropriate.
@@ -641,8 +681,8 @@ before the system returned a failure.
 
 ### Ready for next phase
 
-NO — automated Phase 1 implementation is complete, but manual real
-macOS/YT Music validation is required before merge. Phase 2 has not been
+NO — manual Phase 1 validation failed. The corrected branch requires a new
+real macOS/YT Music validation pass before merge. Phase 2 has not been
 started.
 
 ---
@@ -1444,6 +1484,47 @@ transport that failed before delivery.
 Phase 1 — fixed in the Phase 1 correction.
 
 **Blocks current phase:** yes — resolved.
+
+## [P1] Generic macOS now-playing state contaminated YT Music verification
+
+**Found in phase:** 1
+**Files:** `jarvis/agent/tools.py`
+
+**Symptom:**
+When the dedicated YT Music web adapter was unavailable, desktop `ytm_play`
+and transport actions accepted `nowplaying-cli` state that could describe
+JARVIS TTS or another audio application. An already-playing unrelated track
+could therefore be reported as a newly requested YT Music track.
+
+**Root cause:**
+`_ytm_read_transport_state()` used generic macOS now-playing as a fallback,
+and desktop `ytm_play` treated `playing=True` as sufficient without matching
+the requested YT Music video identity.
+
+**Recommended phase:**
+Phase 1 — fixed by rejecting generic state and returning explicit degraded
+failures when YT Music-specific state is unavailable.
+
+**Blocks current phase:** yes — resolved in code; manual retest required.
+
+## [P2] `tool_done` event conflated execution with operation success
+
+**Found in phase:** 1
+**Files:** `jarvis/agent/loop.py`
+
+**Symptom:**
+The debug event reported `tool_done.ok=True` whenever a tool returned without
+raising, even when the tool returned structured JSON with `{"ok": false}`.
+
+**Root cause:**
+`_execute_tool()` did not inspect the structured tool result before publishing
+the completion event.
+
+**Recommended phase:**
+Phase 1 — fixed with a minimal result-status projection; the Phase 5
+ToolExecutor refactor has not started.
+
+**Blocks current phase:** no — resolved.
 
 ## [P2] Frontend dependency audit reports vulnerabilities
 
