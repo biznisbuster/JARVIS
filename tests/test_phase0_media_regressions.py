@@ -79,6 +79,35 @@ async def test_ytm_play_does_not_use_desktop_deeplink_when_web_unavailable(
     assert desktop_calls == []
 
 
+async def test_connected_ytm_play_failure_preserves_connection_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def connected_search_failure(query: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "query": query,
+            "adapter": "ytm_web",
+            "connection_state": "CONNECTED",
+            "stage": "result_selection",
+            "search_submitted": True,
+            "result_found": False,
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "error_code": "NO_PLAYABLE_SEARCH_RESULT",
+            "error": "no playable YT Music search result",
+        }
+
+    monkeypatch.setattr(tools._ytm_web, "play_query", connected_search_failure)
+
+    result = json.loads(await tools.ytm_play({"query": "Unknown artist"}))
+
+    assert result["ok"] is False
+    assert result["connection_state"] == "CONNECTED"
+    assert result["error_code"] == "NO_PLAYABLE_SEARCH_RESULT"
+    assert result["stage"] == "result_selection"
+
+
 async def test_missing_loaded_player_does_not_fall_back_to_desktop_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -499,6 +499,9 @@ YT Music related tool tests
       treating a missing avatar selector as proof of logout.
 - [x] Let normal connection polling detect login completion and persist the
       marker only after the dedicated YT Music surface is verified usable.
+- [x] Resolve the live Polymer search-result shape, stale successive-search
+      behavior and Playwright verification call so direct YTM playback can
+      select and verify two different requested tracks.
 - [ ] Complete real macOS/YT Music connection and audible playback validation.
 
 ## Suggested verification semantics
@@ -1001,6 +1004,109 @@ credentials: `/Users/marko/.jarvis/ytm_profile`, one active YT Music tab,
 NO — the connection correction passed real profile restore smoke validation,
 but the required user-led connection and audible playback checkpoint has not
 yet been repeated after this correction. Do not merge and do not start Phase 2.
+
+---
+
+## Phase 1 playback DOM correction update (2026-08-14)
+
+### Root cause
+
+The authenticated YT Music page did not use the selector shape assumed by the
+old `play_query()` implementation. The live search surface rendered
+`ytmusic-responsive-list-item-renderer` and `ytmusic-two-row-item-renderer`
+components. A playable row carried `videoId` and a nested `watchEndpoint` in
+Polymer component data, while its rendered watch link could be `/watch` or a
+watch URL without the old guaranteed `href*="/watch?v="` shape. Artist and
+album/navigation rows exposed browse data without a playable `videoId`.
+
+Two additional runtime issues were confirmed during the focused real-browser
+check. Setting the search input and pressing Enter changed the URL but could
+leave stale result rows during a second request, so the same dedicated page
+now navigates directly to the YT Music `/search?q=...` URL. Also, this
+Playwright version exposes the `wait_for_function` argument as keyword-only;
+passing the verification payload positionally caused the real readiness and
+player checks to fail before they could verify playback.
+
+### Completed
+
+- Added component-aware playable-result inspection using nested `videoId` /
+  `watchEndpoint` evidence and a real `/watch` anchor or YT Music play-control
+  fallback.
+- Skipped artist, album and generic navigation rows and ranked playable rows
+  by safe query-text relevance before selecting a candidate.
+- Replaced the stale SPA input/Enter search path with direct navigation inside
+  the same authenticated YT Music browser page and added a bounded render
+  settle before clicking.
+- Used the current YT Music watch anchor as the preferred click target because
+  the live overlay play control could load a selected track without starting
+  playback; the result remains verified only from YT Music player state.
+- Added structured `ytm_play` diagnostics for connection state, search method,
+  stage, candidate identity, delivery and verification. Connected search or
+  playback failures remain `connection_state=CONNECTED` and do not imply
+  login failure.
+- Corrected the real Playwright `wait_for_function(..., arg=...)` calls and
+  preserved strict player identity/playing verification for both successive
+  play requests.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/tools.py`
+- `jarvis/agent/prompts.py`
+- `tests/test_ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added component-shaped fixtures covering playable songs, artist/album
+  navigation, no-candidate structured failure, successive different queries,
+  connected playback failure and verified player state.
+- Added a tool regression proving a connected search failure preserves its
+  diagnostic state and does not become a login instruction.
+
+### Validation
+
+- `./.venv/bin/pytest -q tests/test_ytm_web.py tests/test_phase0_media_regressions.py` -> PASS (`49 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`147 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
+- `./.venv/bin/ruff check jarvis/media/ytm_web.py jarvis/agent/tools.py jarvis/agent/prompts.py tests/test_ytm_web.py tests/test_phase0_media_regressions.py` -> PASS
+- `./.venv/bin/ruff format --check` on changed YTM/Python test files -> PASS
+- `git diff --check` -> PASS
+- `cd web-ui && npm run typecheck` -> PASS
+- `cd web-ui && npm run test` -> PASS (`3 tests`)
+- `cd web-ui && npm run build` -> PASS
+- Real authenticated adapter check using `/Users/marko/.jarvis/ytm_profile` -> PASS for `Relja Popović` and `Vlado Georgiev`: `CONNECTED`, search submitted through `ytm_search_url`, playable candidate found/clicked, player `playing=true`, actual YT Music title/artist matched, `verified=true` for both successive requests.
+- Audible output was not independently measured; only the dedicated YT Music DOM player state was observed.
+- Full repository Ruff remains red on three pre-existing unused imports, and full format check remains red on six pre-existing documentation/unrelated files; no changed-file finding was introduced.
+
+### Manual validation still required
+
+Start JARVIS and repeat through chat with the logged-in dedicated browser:
+play one specific Relja song, play a different Vlado Georgiev song while it
+is active, pause, resume, next five times and previous three times. Confirm
+each successful result has `adapter=ytm_web`, `connection_state=CONNECTED`,
+`verified=true` and the actual YT Music title/artist. Confirm the audio is
+audible from the dedicated browser and repeat the check after a restart.
+
+### New issues discovered
+
+- The search-result selector issue is resolved in code and recorded here; no
+  separate out-of-scope issue was found. The known YT Music DOM/autoplay
+  variability remains a manual checkpoint.
+
+### Remaining risks
+
+- Audible output and the complete user-led pause/resume/next/previous matrix
+  still require manual confirmation on this macOS session.
+- YT Music may change its Polymer component data or click behavior again;
+  failures now remain explicit and include adapter/stage diagnostics.
+- Phase 2 `MediaService` and state-ownership work has not started.
+
+### Ready for next phase
+
+NO — the focused real adapter check passes, but the required user-led manual
+Phase 1 validation and audible playback checkpoint remain outstanding. Do not
+merge and do not start Phase 2.
 
 ---
 
@@ -1929,17 +2035,23 @@ results were explicit failures (`ok=false`, `delivered=false`,
 `verified=false`), so no false playback success was reported.
 
 **Root cause:**
-Not established by the connection-only validation. The connection path and
-auth probe were healthy; the failure is isolated to the subsequent YT Music
-search/result-control path and needs a focused real playback investigation.
+The selector assumed every playable result had an anchor whose href contained
+`/watch?v=...`. The real page used Polymer result components with nested
+`videoId`/`watchEndpoint` data and watch anchors whose href shape varied. A
+second search could also leave stale rows after the input/Enter SPA update.
+The focused correction initially passed Playwright `wait_for_function`
+payloads positionally, but the installed Playwright API accepts that argument
+only by keyword; the real readiness and player checks therefore failed until
+corrected.
 
 **Recommended phase:**
-Phase 1 — investigate in a separate playback-focused pass after the login
-handoff is manually revalidated. Do not broaden this correction into a
-playback rewrite.
+Phase 1 — fixed in the Phase 1 playback DOM correction update. The correction
+uses the same authenticated browser page, direct YTM search navigation,
+component-aware selection and strict DOM verification; it does not add a
+desktop or normal-YouTube fallback.
 
-**Blocks current phase:** yes — manual Phase 1 playback validation remains
-blocked; not fixed in this connection correction.
+**Blocks current phase:** yes — code and direct adapter validation are fixed,
+but user-led manual playback/audible validation remains required.
 
 ---
 

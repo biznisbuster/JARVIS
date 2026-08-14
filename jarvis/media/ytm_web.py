@@ -657,12 +657,199 @@ async (query) => {
 }
 """
 
-_PLAYABLE_RESULT_SELECTORS = (
-    "ytmusic-responsive-list-item-renderer a[href*='/watch?v=']",
-    "ytmusic-card-shelf-renderer a[href*='/watch?v=']",
-    "ytmusic-shelf-renderer a[href*='/watch?v=']",
-    "a[href*='/watch?v=']",
-)
+_SEARCH_RESULTS_STATE_JS = r"""
+() => {
+  const searchSurfaceState = true;
+  void searchSurfaceState;
+  const root = document.querySelector('ytmusic-search-page, ytmusic-section-list-renderer');
+  const rows = root && root.querySelector(
+    'ytmusic-responsive-list-item-renderer, ytmusic-two-row-item-renderer, ytmusic-item-renderer'
+  );
+  const params = new URL(location.href).searchParams;
+  return {
+    path: location.pathname,
+    query: params.get('q') || '',
+    surface_ready: !!root,
+    rows_ready: !!rows,
+    ready: location.pathname === '/search' && !!root && !!rows,
+  };
+}
+"""
+
+_SEARCH_RESULTS_READY_JS = r"""
+(expectedQuery) => {
+  const searchResultsReady = true;
+  void searchResultsReady;
+  const root = document.querySelector('ytmusic-search-page, ytmusic-section-list-renderer');
+  const currentQuery = new URL(location.href).searchParams.get('q') || '';
+  return location.pathname === '/search'
+    && currentQuery === String(expectedQuery || '')
+    && !!root;
+}
+"""
+
+_SEARCH_RESULTS_ROWS_READY_JS = r"""
+(expectedQuery) => {
+  const searchResultsRowsReady = true;
+  void searchResultsRowsReady;
+  const root = document.querySelector('ytmusic-search-page, ytmusic-section-list-renderer');
+  const rows = root && root.querySelector(
+    'ytmusic-responsive-list-item-renderer, ytmusic-two-row-item-renderer, ytmusic-item-renderer'
+  );
+  const currentQuery = new URL(location.href).searchParams.get('q') || '';
+  return location.pathname === '/search'
+    && currentQuery === String(expectedQuery || '')
+    && !!root
+    && !!rows;
+}
+"""
+
+_FIND_PLAYABLE_SEARCH_RESULT_JS = r"""
+(options) => {
+  const findPlayableSearchResult = true;
+  void findPlayableSearchResult;
+  const shouldClick = !!(options && options.click);
+  const expectedQuery = String((options && options.query) || '');
+  const searchRoot = document.querySelector('ytmusic-search-page, ytmusic-section-list-renderer') || document;
+  const rows = Array.from(searchRoot.querySelectorAll(
+    'ytmusic-responsive-list-item-renderer, ytmusic-two-row-item-renderer, ytmusic-item-renderer'
+  ));
+
+  const inspectData = (element) => {
+    const seen = new Set();
+    const data = {
+      video_id: '',
+      has_watch_endpoint: false,
+      has_play_navigation_endpoint: false,
+    };
+    const visit = (value, depth) => {
+      if (!value || typeof value !== 'object' || depth > 7 || seen.has(value)) return;
+      seen.add(value);
+      for (const key of Object.keys(value).slice(0, 160)) {
+        const child = value[key];
+        if (/^videoId$/i.test(key) && !data.video_id && (typeof child === 'string' || typeof child === 'number')) {
+          data.video_id = String(child);
+        }
+        if (key === 'watchEndpoint') data.has_watch_endpoint = true;
+        if (key === 'playNavigationEndpoint') data.has_play_navigation_endpoint = true;
+        if (child && typeof child === 'object') visit(child, depth + 1);
+      }
+    };
+    for (const key of ['data', '__data', 'item', 'song', 'video']) {
+      try { visit(element[key], 0); } catch (_) {}
+    }
+    return data;
+  };
+
+  const text = (value, limit = 160) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+  const normalize = (value) => String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/gi, 'd')
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  const queryTokens = normalize(expectedQuery).split(/\s+/).filter(Boolean);
+  const watchAnchorFor = (row) => Array.from(row.querySelectorAll('a[href]')).find((anchor) => {
+    try {
+      return new URL(anchor.href, location.href).pathname === '/watch';
+    } catch (_) {
+      return false;
+    }
+  }) || null;
+  const playButtonFor = (row) => Array.from(row.querySelectorAll('ytmusic-play-button-renderer'))
+    .find((button) => /^play\b/i.test(button.getAttribute('aria-label') || '')) || null;
+
+  let firstCandidate = null;
+  let bestCandidate = null;
+  let bestScore = -1;
+  for (const row of rows) {
+    const data = inspectData(row);
+    const playButton = playButtonFor(row);
+    const watchAnchor = watchAnchorFor(row);
+    if (!data.video_id || (!data.has_watch_endpoint && !watchAnchor)) continue;
+    if (!playButton && !watchAnchor) continue;
+
+    const titleAnchor = Array.from(row.querySelectorAll('a[href]')).find((anchor) => {
+      try {
+        const pathname = new URL(anchor.href, location.href).pathname;
+        return pathname === '/watch' && text(anchor.getAttribute('aria-label') || anchor.textContent);
+      } catch (_) {
+        return false;
+      }
+    });
+    const channelAnchor = Array.from(row.querySelectorAll('a[href]')).find((anchor) => {
+      try {
+        return new URL(anchor.href, location.href).pathname.startsWith('/channel/');
+      } catch (_) {
+        return false;
+      }
+    });
+    const playLabel = playButton ? (playButton.getAttribute('aria-label') || '') : '';
+    const selectedTitle = text(playLabel.replace(/^play\s*/i, ''))
+      || text(titleAnchor && (titleAnchor.getAttribute('aria-label') || titleAnchor.textContent))
+      || '';
+    const selectedArtist = text(channelAnchor && channelAnchor.textContent) || '';
+    // The watch endpoint is the most reliable click target on the current
+    // YTM search surface: the overlay play control can load a result without
+    // starting playback. Keep the play control as the bounded fallback for
+    // result shapes that expose no watch anchor.
+    const target = watchAnchor
+      || (playButton && playButton.querySelector('button, tp-yt-paper-icon-button'))
+      || playButton
+      || row;
+    const searchable = normalize(`${row.textContent || ''} ${selectedTitle} ${selectedArtist}`);
+    const score = queryTokens.reduce((total, token) => total + (searchable.includes(token) ? 1 : 0), 0);
+    const candidate = {
+      ok: true,
+      clicked: false,
+      selected_video_id: data.video_id,
+      selected_title: selectedTitle,
+      selected_artist: selectedArtist,
+      selection_method: watchAnchor ? 'watch_endpoint_anchor' : 'ytmusic_play_button_renderer',
+      component: row.tagName.toLowerCase(),
+      query_match_score: score,
+      target,
+    };
+    if (!firstCandidate) firstCandidate = candidate;
+    if (score > bestScore) {
+      bestCandidate = candidate;
+      bestScore = score;
+    }
+  }
+  const candidate = bestCandidate || firstCandidate;
+  if (candidate) {
+    if (shouldClick) candidate.target.click();
+    delete candidate.target;
+    candidate.clicked = shouldClick;
+    return candidate;
+  }
+  return {
+    ok: false,
+    clicked: false,
+    error_code: 'NO_PLAYABLE_SEARCH_RESULT',
+    error: 'no playable YT Music search result',
+  };
+}
+"""
+
+_PLAYER_MATCH_JS = r"""
+(expected) => {
+  const video = document.querySelector('video');
+  const titleElement = document.querySelector('.title.ytmusic-player-bar');
+  const artistElement = document.querySelector('.byline.ytmusic-player-bar');
+  const actualId = new URL(location.href).searchParams.get('v') || '';
+  const actualTitle = (titleElement && titleElement.textContent || '').trim().toLocaleLowerCase();
+  const actualArtist = (artistElement && artistElement.textContent || '').trim().toLocaleLowerCase();
+  const expectedTitle = String((expected && expected.title) || '').trim().toLocaleLowerCase();
+  const expectedArtist = String((expected && expected.artist) || '').trim().toLocaleLowerCase();
+  const playing = !!(video && !video.paused && video.currentTime > 0 && video.readyState >= 2);
+  const idMatches = !!(expected && expected.video_id && actualId === expected.video_id);
+  const titleMatches = !!(expectedTitle && actualTitle && (actualTitle === expectedTitle || actualTitle.includes(expectedTitle) || expectedTitle.includes(actualTitle)));
+  const artistMatches = !expectedArtist || !actualArtist || actualArtist.includes(expectedArtist) || expectedArtist.includes(actualArtist);
+  return playing && (idMatches || (!actualId && titleMatches && artistMatches));
+}
+"""
 
 
 def _video_id_from_href(href: str | None) -> str | None:
@@ -672,6 +859,89 @@ def _video_id_from_href(href: str | None) -> str | None:
         return urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("v", [None])[0]
     except (TypeError, ValueError):
         return None
+
+
+async def _find_playable_search_result(
+    *,
+    query: str = "",
+    click: bool = False,
+) -> dict[str, Any]:
+    """Find a real YTM result using component data, optionally clicking it."""
+    try:
+        result = await _ytm_page.evaluate(
+            _FIND_PLAYABLE_SEARCH_RESULT_JS,
+            {"click": click, "query": query},
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_code": "PLAYABLE_RESULT_INSPECTION_FAILED",
+            "error": str(exc),
+        }
+    if not isinstance(result, dict):
+        return {
+            "ok": False,
+            "error_code": "PLAYABLE_RESULT_INSPECTION_FAILED",
+            "error": "unexpected playable-result probe response",
+        }
+    return result
+
+
+def _play_query_result(query: str, **values: Any) -> dict[str, Any]:
+    """Build a diagnostic result while preserving the live connection state."""
+    status = _status_payload()
+    result: dict[str, Any] = {
+        "ok": False,
+        "query": query,
+        "adapter": "ytm_web",
+        "connection_state": status["state"],
+        "page_ready": status["page_ready"],
+        "search_ready": status["search_ready"],
+        "player_loaded": status["player_loaded"],
+        "playing": status["playing"],
+        "stage": "unknown",
+        "search_submitted": False,
+        "result_found": False,
+        "selected_video_id": None,
+        "selected_title": "",
+        "selected_artist": "",
+        "search_method": None,
+        "delivered": False,
+        "verified": False,
+        "verification": "not_attempted",
+        "degraded": False,
+        "error_code": "PLAY_QUERY_FAILED",
+        "error": None,
+    }
+    result.update(values)
+    return result
+
+
+def _playback_metadata_matches(
+    state: dict[str, Any] | None,
+    selected_title: str,
+    selected_artist: str,
+) -> bool:
+    if not isinstance(state, dict) or state.get("playing") is not True:
+        return False
+    actual_title = str(state.get("title") or "").strip().casefold()
+    actual_artist = str(state.get("artist") or "").strip().casefold()
+    expected_title = selected_title.strip().casefold()
+    expected_artist = selected_artist.strip().casefold()
+    title_matches = bool(
+        expected_title
+        and actual_title
+        and (
+            actual_title == expected_title or actual_title in expected_title or expected_title in actual_title
+        )
+    )
+    artist_matches = (
+        not expected_artist
+        or not actual_artist
+        or expected_artist in actual_artist
+        or actual_artist in expected_artist
+    )
+    return title_matches and artist_matches
 
 
 async def get_state() -> dict[str, Any]:
@@ -862,121 +1132,236 @@ async def control(action: str) -> dict[str, Any]:
 
 async def play_query(query: str) -> dict[str, Any]:
     """Search and play a real YTM video result in the connected browser."""
-    if not query.strip():
-        return {"ok": False, "error": "empty query"}
+    query = query.strip()
+    if not query:
+        return _play_query_result(
+            query,
+            stage="input",
+            error_code="INVALID_QUERY",
+            error="empty query",
+        )
     if not await ensure_ready():
         status = _status_payload()
-        return {
-            "ok": False,
-            "error": f"YT Music is {status['state'].lower()}",
-            "connection_state": status["state"],
-            "page_ready": status["page_ready"],
-            "search_ready": status["search_ready"],
-            "player_loaded": status["player_loaded"],
-            "playing": status["playing"],
-            "query": query,
-            "adapter": "ytm_web",
-        }
+        return _play_query_result(
+            query,
+            stage="connection",
+            error_code="CONNECTION_UNAVAILABLE",
+            error=f"YT Music is {status['state'].lower()}",
+        )
 
-    selected_video_id: str | None = None
-    selected_locator = None
+    before = await get_state()
+    search_submitted = False
+    selected: dict[str, Any] = {}
     clicked_result = False
+
+    async def result_failure(
+        *,
+        stage: str,
+        error_code: str,
+        error: str,
+        **values: Any,
+    ) -> dict[str, Any]:
+        return _play_query_result(
+            query,
+            stage=stage,
+            search_submitted=search_submitted,
+            result_found=bool(selected.get("ok") and selected.get("selected_video_id")),
+            selected_video_id=selected.get("selected_video_id"),
+            selected_title=selected.get("selected_title", ""),
+            selected_artist=selected.get("selected_artist", ""),
+            selection_method=selected.get("selection_method"),
+            query_match_score=selected.get("query_match_score"),
+            search_method="ytm_search_url" if search_submitted else None,
+            delivered=clicked_result,
+            verified=False,
+            verification="unavailable" if clicked_result else "not_attempted",
+            degraded=clicked_result,
+            before=before,
+            error_code=error_code,
+            error=error,
+            **values,
+        )
+
     try:
         home = await _ytm_page.evaluate(
             "() => ({ url: location.href, hasSearch: !!document.querySelector('ytmusic-search-box input') })"
         )
-        if not home.get("hasSearch"):
+        if not isinstance(home, dict) or not home.get("hasSearch"):
             if not await _navigate_to_ytm() or not await ensure_ready():
-                status = _status_payload()
-                return {
-                    "ok": False,
-                    "error": "YT Music search is not ready",
-                    "connection_state": status["state"],
-                    "query": query,
-                    "adapter": "ytm_web",
-                }
+                return await result_failure(
+                    stage="search_ready",
+                    error_code="SEARCH_NOT_READY",
+                    error="YT Music search is not ready",
+                )
 
-        r = await _ytm_page.evaluate(_SEARCH_INPUT_JS, query)
-        if not (r and r.get("ok")):
-            return {"ok": False, "error": (r or {}).get("error", "search input failed"), "query": query}
+        search_url = f"{YTM_URL}/search?q={urllib.parse.quote_plus(query)}"
+        try:
+            await _ytm_page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
+        except Exception as exc:
+            return await result_failure(
+                stage="search_submit",
+                error_code="SEARCH_SUBMIT_FAILED",
+                error=f"YT Music search could not be submitted: {exc}",
+            )
+        search_submitted = True
 
-        await _ytm_page.keyboard.press("Enter")
-        await _ytm_page.wait_for_url("**/search**", timeout=8000)
-        await _ytm_page.wait_for_selector(
-            ", ".join(_PLAYABLE_RESULT_SELECTORS),
-            timeout=12000,
-        )
+        try:
+            await _ytm_page.wait_for_url("**/search**", timeout=8000)
+        except Exception:
+            # The search surface probe below is authoritative. A URL wait can
+            # miss an SPA update or return immediately while an old search is
+            # still rendered.
+            pass
 
-        for sel in _PLAYABLE_RESULT_SELECTORS:
-            loc = _ytm_page.locator(sel).first
+        try:
+            await _ytm_page.wait_for_function(_SEARCH_RESULTS_READY_JS, arg=query, timeout=8000)
+        except Exception:
+            pass
+
+        try:
+            search_state = await _ytm_page.evaluate(_SEARCH_RESULTS_STATE_JS)
+        except Exception as exc:
+            return await result_failure(
+                stage="search_results",
+                error_code="SEARCH_RESULTS_NOT_LOADED",
+                error=f"could not inspect YT Music search results: {exc}",
+            )
+        if not isinstance(search_state, dict) or not (
+            search_state.get("surface_ready")
+            and search_state.get("path") == "/search"
+            and search_state.get("query") == query
+        ):
+            return await result_failure(
+                stage="search_results",
+                error_code="SEARCH_RESULTS_NOT_LOADED",
+                error="YT Music search results surface did not load",
+            )
+
+        if not search_state.get("rows_ready"):
             try:
-                await loc.wait_for(state="visible", timeout=3000)
-                href = await loc.get_attribute("href")
-                video_id = _video_id_from_href(href)
-                if not video_id:
-                    continue
-                selected_video_id = video_id
-                selected_locator = loc
-                break
+                await _ytm_page.wait_for_function(
+                    _SEARCH_RESULTS_ROWS_READY_JS,
+                    arg=query,
+                    timeout=4000,
+                )
             except Exception:
-                continue
-        if selected_locator is None or selected_video_id is None:
-            return {
-                "ok": False,
-                "error": "no playable YT Music search result",
-                "query": query,
-                "adapter": "ytm_web",
-            }
+                pass
+            try:
+                search_state = await _ytm_page.evaluate(_SEARCH_RESULTS_STATE_JS)
+            except Exception:
+                search_state = {}
 
-        await selected_locator.click()
-        clicked_result = True
+        if not isinstance(search_state, dict) or not search_state.get("rows_ready"):
+            return await result_failure(
+                stage="result_selection",
+                error_code="NO_PLAYABLE_SEARCH_RESULT",
+                error="no YT Music search result rows were available",
+            )
+
+        # YTM can expose the rows before the result anchors have their
+        # delegated click handlers attached, especially after a direct search
+        # navigation from an already-playing track.
+        await asyncio.sleep(0.8)
+        selected = await _find_playable_search_result(query=query, click=True)
+        if not selected.get("ok"):
+            return await result_failure(
+                stage="result_selection",
+                error_code=selected.get("error_code", "NO_PLAYABLE_SEARCH_RESULT"),
+                error=selected.get("error", "no playable YT Music search result"),
+            )
+        clicked_result = bool(selected.get("clicked"))
+        if not clicked_result:
+            return await result_failure(
+                stage="result_click",
+                error_code="RESULT_CLICK_FAILED",
+                error="playable YT Music result was found but not clicked",
+            )
 
         try:
             await _ytm_page.wait_for_function(
-                "() => { const v = document.querySelector('video'); return v && !v.paused && v.currentTime > 0; }",
+                _PLAYER_MATCH_JS,
+                arg={
+                    "video_id": selected.get("selected_video_id", ""),
+                    "title": selected.get("selected_title", ""),
+                    "artist": selected.get("selected_artist", ""),
+                },
                 timeout=12000,
             )
         except Exception:
             state = await get_state()
-            return {
-                "ok": False,
-                "query": query,
-                "selected_video_id": selected_video_id,
-                "adapter": "ytm_web",
-                "delivered": True,
-                "verified": False,
-                "verification": "unavailable",
-                "degraded": True,
-                "error": "player did not start in time",
-                "state": state,
-                "title": state.get("title", ""),
-                "artist": state.get("artist", ""),
-            }
+            actual_video_id = str((state or {}).get("track_id") or "").strip()
+            return await result_failure(
+                stage="playback",
+                error_code=(
+                    "PLAYBACK_DID_NOT_START"
+                    if not isinstance(state, dict) or state.get("playing") is not True
+                    else "PLAYBACK_VERIFICATION_FAILED"
+                ),
+                error=(
+                    "YT Music playback did not start"
+                    if not isinstance(state, dict) or state.get("playing") is not True
+                    else "selected YT Music result did not become the playing track"
+                ),
+                actual_video_id=actual_video_id,
+                state=state,
+                title=(state or {}).get("title", ""),
+                artist=(state or {}).get("artist", ""),
+            )
 
         state = await get_state()
         actual_video_id = str((state or {}).get("track_id") or "").strip()
-        state_identity = _track_identity(state)
+        selected_video_id = str(selected.get("selected_video_id") or "").strip()
         if actual_video_id:
-            verified = actual_video_id == selected_video_id and state.get("playing") is True
+            verified = bool(
+                isinstance(state, dict)
+                and state.get("playing") is True
+                and selected_video_id
+                and actual_video_id == selected_video_id
+            )
             verification = "verified" if verified else "failed"
         else:
-            verified = bool(state.get("playing") is True and state_identity is not None)
-            verification = "verified_metadata" if verified else "unavailable"
-        result = {
-            "ok": verified,
-            "query": query,
-            "selected_video_id": selected_video_id,
-            "actual_video_id": actual_video_id,
-            "adapter": "ytm_web",
-            "method": "dom_search_result",
-            "delivered": True,
-            "verified": verified,
-            "verification": verification,
-            "degraded": not verified and verification == "unavailable",
-            "state": state,
-            "title": state.get("title", ""),
-            "artist": state.get("artist", ""),
-        }
+            verified = _playback_metadata_matches(
+                state,
+                str(selected.get("selected_title") or ""),
+                str(selected.get("selected_artist") or ""),
+            )
+            verification = (
+                "verified_metadata"
+                if verified
+                else ("failed" if isinstance(state, dict) and state.get("playing") is True else "unavailable")
+            )
+        result = _play_query_result(
+            query,
+            ok=verified,
+            stage="playback",
+            search_submitted=True,
+            result_found=True,
+            selected_video_id=selected_video_id,
+            selected_title=selected.get("selected_title", ""),
+            selected_artist=selected.get("selected_artist", ""),
+            selection_method=selected.get("selection_method"),
+            query_match_score=selected.get("query_match_score"),
+            search_method="ytm_search_url",
+            actual_video_id=actual_video_id,
+            method="dom_search_result",
+            delivered=True,
+            verified=verified,
+            verification=verification,
+            degraded=not verified and verification == "unavailable",
+            before=before,
+            state=state,
+            player_loaded=bool(isinstance(state, dict) and state.get("player_loaded")),
+            playing=(state or {}).get("playing"),
+            title=(state or {}).get("title", ""),
+            artist=(state or {}).get("artist", ""),
+            error_code=(
+                None
+                if verified
+                else "PLAYBACK_VERIFICATION_FAILED"
+                if isinstance(state, dict) and state.get("playing") is True
+                else "PLAYBACK_DID_NOT_START"
+            ),
+        )
         if not verified:
             result["error"] = (
                 "selected YT Music result did not become the playing track"
@@ -986,17 +1371,11 @@ async def play_query(query: str) -> dict[str, Any]:
         return result
     except Exception as exc:
         log.warning("ytm_web.play_query failed: %s", exc)
-        return {
-            "ok": False,
-            "error": str(exc),
-            "query": query,
-            "adapter": "ytm_web",
-            "delivered": clicked_result,
-            "verified": False,
-            "verification": "unavailable" if clicked_result else "not_attempted",
-            "degraded": clicked_result,
-            **({"selected_video_id": selected_video_id} if selected_video_id else {}),
-        }
+        return await result_failure(
+            stage="playback" if clicked_result else "search",
+            error_code="PLAY_QUERY_EXCEPTION",
+            error=str(exc),
+        )
 
 
 async def shutdown() -> None:

@@ -908,13 +908,24 @@ async def ytm_play(args: dict[str, Any]) -> str:
     try:
         result = await _ytm_web.play_query(query)
     except Exception as exc:
+        status = await _ytm_web.connection_status()
         result = {
             "ok": False,
             "query": query,
             "adapter": "ytm_web",
+            "connection_state": status.get("state"),
+            "page_ready": status.get("page_ready"),
+            "search_ready": status.get("search_ready"),
+            "player_loaded": status.get("player_loaded"),
+            "playing": status.get("playing"),
+            "stage": "playback",
+            "search_submitted": False,
+            "result_found": False,
             "delivered": False,
             "verified": False,
             "verification": "not_attempted",
+            "degraded": False,
+            "error_code": "PLAY_QUERY_EXCEPTION",
             "error": str(exc),
         }
     state = result.get("state") or result.get("after")

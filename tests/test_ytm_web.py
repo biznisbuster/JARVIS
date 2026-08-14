@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import types
+import urllib.parse
 
 import pytest
 
@@ -26,6 +27,9 @@ class FakePage:
         surface_ready: bool = True,
         account_present: bool = False,
         playable_href: str = "/watch?v=test-track",
+        search_result_shape: str = "href",
+        component_candidates: list[dict[str, object]] | None = None,
+        playback_starts: bool = True,
     ) -> None:
         self.closed = closed
         self.url = url
@@ -35,7 +39,12 @@ class FakePage:
         self.surface_ready = surface_ready
         self.account_present = account_present
         self.playable_href = playable_href
+        self.search_result_shape = search_result_shape
+        self.component_candidates = component_candidates or []
+        self.playback_starts = playback_starts
+        self.last_query = ""
         self.bring_to_front_calls = 0
+        self.wait_for_selector_calls: list[str] = []
         self.state = {
             "ok": True,
             "playing": False,
@@ -82,6 +91,79 @@ class FakePage:
                 "playing": self.state.get("playing"),
                 "track_id": self.state.get("track_id", ""),
             }
+        if "searchSurfaceState" in script:
+            return {
+                "path": "/search" if self.last_query else "/",
+                "query": self.last_query,
+                "surface_ready": self.surface_ready,
+                "rows_ready": self.surface_ready,
+                "ready": self.surface_ready,
+            }
+        if "findPlayableSearchResult" in script:
+            if self.search_result_shape == "component":
+                candidate = next(
+                    (
+                        item
+                        for item in self.component_candidates
+                        if item.get("video_id") and item.get("watch_endpoint")
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    return {
+                        "ok": False,
+                        "clicked": False,
+                        "error_code": "NO_PLAYABLE_SEARCH_RESULT",
+                        "error": "no playable YT Music search result",
+                    }
+                clicked = bool(isinstance(arg, dict) and arg.get("click"))
+                if clicked:
+                    self.state.update(
+                        {
+                            "playing": self.playback_starts,
+                            "player_loaded": True,
+                            "track_id": candidate.get("video_id", ""),
+                            "title": candidate.get("title", ""),
+                            "artist": candidate.get("artist", ""),
+                        }
+                    )
+                return {
+                    "ok": True,
+                    "clicked": clicked,
+                    "selected_video_id": candidate.get("video_id", ""),
+                    "selected_title": candidate.get("title", ""),
+                    "selected_artist": candidate.get("artist", ""),
+                    "selection_method": candidate.get("selection_method", "watch_endpoint_anchor"),
+                    "component": candidate.get("component", "ytmusic-responsive-list-item-renderer"),
+                }
+            video_id = ytm_web._video_id_from_href(self.playable_href)
+            if not video_id:
+                return {
+                    "ok": False,
+                    "clicked": False,
+                    "error_code": "NO_PLAYABLE_SEARCH_RESULT",
+                    "error": "no playable YT Music search result",
+                }
+            clicked = bool(isinstance(arg, dict) and arg.get("click"))
+            if clicked:
+                self.state.update(
+                    {
+                        "playing": self.playback_starts,
+                        "player_loaded": True,
+                        "track_id": video_id,
+                        "title": "Selected Result",
+                        "artist": "Selected Artist",
+                    }
+                )
+            return {
+                "ok": True,
+                "clicked": clicked,
+                "selected_video_id": video_id,
+                "selected_title": "Selected Result",
+                "selected_artist": "Selected Artist",
+                "selection_method": "watch_endpoint_anchor",
+                "component": "ytmusic-responsive-list-item-renderer",
+            }
         if "document.querySelector('video')" in script and "title" in script:
             return dict(self.state)
         if "video.play" in script:
@@ -97,6 +179,8 @@ class FakePage:
                     self.state["track_id"] = f"{action}-track"
             return {"ok": True, "method": f"fake.{action}"}
         if "HTMLInputElement" in script:
+            self.last_query = str(arg or "")
+            self.url = f"https://music.youtube.com/search?q={urllib.parse.quote_plus(self.last_query)}"
             return {"ok": True}
         if "hasSearch" in script:
             return {"url": "https://music.youtube.com/", "hasSearch": True}
@@ -104,14 +188,16 @@ class FakePage:
 
     async def goto(self, url: str, **kwargs) -> None:  # noqa: ANN003
         self.url = url
+        self.last_query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("q", [""])[0]
 
     async def bring_to_front(self) -> None:
         self.bring_to_front_calls += 1
 
-    async def wait_for_function(self, expr: str, **kwargs) -> None:  # noqa: ANN003
+    async def wait_for_function(self, expr: str, arg: object = None, **kwargs) -> None:  # noqa: ANN003
         return None
 
     async def wait_for_selector(self, selector: str, **kwargs) -> None:  # noqa: ANN003
+        self.wait_for_selector_calls.append(selector)
         return None
 
     async def wait_for_url(self, pattern: str, **kwargs) -> None:  # noqa: ANN003
@@ -584,6 +670,109 @@ async def test_second_play_query_changes_track_in_same_session(monkeypatch) -> N
     assert first["actual_video_id"] == "first-track"
     assert second["ok"] is True
     assert second["actual_video_id"] == "second-track"
+
+
+async def test_play_query_selects_component_song_and_skips_artist_album_navigation(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        component_candidates=[
+            {"title": "Relja artist", "browse_id": "artist-1", "artist": "Relja"},
+            {"title": "Album navigation", "browse_id": "album-1", "artist": "Relja"},
+            {
+                "title": "Top Gun",
+                "artist": "Relja",
+                "video_id": "component-track",
+                "watch_endpoint": True,
+                "component": "ytmusic-two-row-item-renderer",
+            },
+        ],
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("Relja Popović")
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["selected_video_id"] == "component-track"
+    assert result["selected_title"] == "Top Gun"
+    assert result["selected_artist"] == "Relja"
+    assert result["selection_method"] == "watch_endpoint_anchor"
+    assert result["actual_video_id"] == "component-track"
+    assert result["error"] is None
+
+
+async def test_play_query_no_component_candidate_is_structured_connected_failure(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        component_candidates=[
+            {"title": "Artist navigation", "browse_id": "artist-1"},
+            {"title": "Album navigation", "browse_id": "album-1"},
+        ],
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("Unknown artist")
+
+    assert result["ok"] is False
+    assert result["connection_state"] == ytm_web.CONNECTED
+    assert result["stage"] == "result_selection"
+    assert result["search_submitted"] is True
+    assert result["result_found"] is False
+    assert result["delivered"] is False
+    assert result["verified"] is False
+    assert result["error_code"] == "NO_PLAYABLE_SEARCH_RESULT"
+    assert "timeout" not in result["error"].lower()
+    assert page.wait_for_selector_calls == []
+
+
+async def test_second_component_play_query_changes_track_in_same_session(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        component_candidates=[
+            {"title": "Relja song", "artist": "Relja", "video_id": "relja-track", "watch_endpoint": True},
+        ],
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    first = await ytm_web.play_query("Relja Popović")
+    page.component_candidates = [
+        {
+            "title": "Vlado song",
+            "artist": "Vlado Georgiev",
+            "video_id": "vlado-track",
+            "watch_endpoint": True,
+        },
+    ]
+    second = await ytm_web.play_query("Vlado Georgiev")
+
+    assert first["ok"] is True
+    assert first["actual_video_id"] == "relja-track"
+    assert second["ok"] is True
+    assert second["actual_video_id"] == "vlado-track"
+    assert second["before"]["track_id"] == "relja-track"
+
+
+async def test_play_query_connected_playback_failure_is_not_reported_as_login(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        playback_starts=False,
+        component_candidates=[
+            {"title": "Song", "artist": "Artist", "video_id": "song-track", "watch_endpoint": True},
+        ],
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("Song Artist")
+
+    assert result["ok"] is False
+    assert result["connection_state"] == ytm_web.CONNECTED
+    assert result["delivered"] is True
+    assert result["verified"] is False
+    assert result["error_code"] == "PLAYBACK_DID_NOT_START"
 
 
 async def test_transport_requires_loaded_player(monkeypatch) -> None:
