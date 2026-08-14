@@ -22,12 +22,18 @@ class FakePage:
         url: str = "https://music.youtube.com/",
         transition_changes_track: bool = True,
         authenticated: bool = True,
+        login_required: bool | None = None,
+        surface_ready: bool = True,
+        account_present: bool = False,
         playable_href: str = "/watch?v=test-track",
     ) -> None:
         self.closed = closed
         self.url = url
         self.transition_changes_track = transition_changes_track
         self.authenticated = authenticated
+        self.login_required = not authenticated if login_required is None else login_required
+        self.surface_ready = surface_ready
+        self.account_present = account_present
         self.playable_href = playable_href
         self.bring_to_front_calls = 0
         self.state = {
@@ -49,12 +55,29 @@ class FakePage:
         if self.state.get("error"):
             return {"ok": False, "error": self.state["error"], "playing": None, "title": "", "artist": ""}
         if "pageReady" in script:
+            page_ready = "music.youtube.com" in self.url
+            surface_ready = page_ready and self.surface_ready
+            authenticated = surface_ready and self.authenticated and not self.login_required
             return {
                 "ok": True,
-                "page_ready": "music.youtube.com" in self.url,
-                "search_ready": "music.youtube.com" in self.url,
-                "authenticated": self.authenticated,
-                "login_required": not self.authenticated,
+                "origin": "https://music.youtube.com" if page_ready else "https://accounts.google.com",
+                "page_ready": page_ready,
+                "search_ready": page_ready and self.surface_ready,
+                "ytm_surface_ready": surface_ready,
+                "authenticated": authenticated,
+                "login_required": self.login_required,
+                "auth_evidence": (
+                    "login_required"
+                    if self.login_required
+                    else "usable_surface"
+                    if authenticated
+                    else "unknown"
+                ),
+                "has_ytm_app": surface_ready,
+                "has_nav": surface_ready,
+                "has_search": surface_ready,
+                "has_account": self.account_present,
+                "has_explicit_login": self.login_required,
                 "player_loaded": self.state.get("player_loaded", True),
                 "playing": self.state.get("playing"),
                 "track_id": self.state.get("track_id", ""),
@@ -204,9 +227,10 @@ def _force_jarvis_profile(monkeypatch):
     monkeypatch.setattr(ytm_web, "_JARVIS_PROFILE_DIR", profile)
 
 
-def _set_connected_runtime(monkeypatch, page: FakePage) -> None:
+def _set_connected_runtime(monkeypatch, page: FakePage, *, pages: list[FakePage] | None = None) -> None:
     monkeypatch.setattr(ytm_web, "_ytm_page", page)
-    monkeypatch.setattr(ytm_web, "_context", object())
+    context = object() if pages is None else types.SimpleNamespace(pages=pages)
+    monkeypatch.setattr(ytm_web, "_context", context)
     monkeypatch.setattr(ytm_web, "_launched", True)
     monkeypatch.setattr(ytm_web, "_connection_state", ytm_web.CONNECTED)
     monkeypatch.setattr(ytm_web, "_page_ready", True)
@@ -255,6 +279,21 @@ async def test_connect_reuses_login_page_and_presents_it_without_duplicate_launc
     assert status["search_ready"] is True
     assert page.bring_to_front_calls == 1
     assert fake_pw.chromium.launch_persistent_context.calls == []
+    assert not ytm_web._connection_marker_path().exists()
+
+
+async def test_connect_does_not_navigate_away_from_google_login_page(monkeypatch) -> None:
+    fake_pw = _install_fake_playwright(monkeypatch)
+    page = FakePage(url="https://accounts.google.com/ServiceLogin", authenticated=False)
+    _set_connected_runtime(monkeypatch, page)
+    monkeypatch.setattr(ytm_web, "_connection_state", ytm_web.NEEDS_LOGIN)
+
+    status = await ytm_web.connect()
+
+    assert status["state"] == ytm_web.NEEDS_LOGIN
+    assert page.url == "https://accounts.google.com/ServiceLogin"
+    assert page.bring_to_front_calls == 1
+    assert fake_pw.chromium.launch_persistent_context.calls == []
 
 
 async def test_warm_up_does_not_launch_profile_without_connection_marker(monkeypatch) -> None:
@@ -288,6 +327,85 @@ async def test_login_required_state_is_distinct_from_disconnected(monkeypatch) -
     assert status["search_ready"] is True
 
 
+async def test_status_get_detects_login_completion_without_connect_call(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(authenticated=False)
+    _set_connected_runtime(monkeypatch, page)
+
+    before = await ytm_web.connection_status()
+    page.authenticated = True
+    page.login_required = False
+    after = await ytm_web.connection_status()
+
+    assert before["state"] == ytm_web.NEEDS_LOGIN
+    assert after["state"] == ytm_web.CONNECTED
+    assert after["connected"] is True
+    assert ytm_web._connection_marker_path().is_file()
+
+
+async def test_connected_ytm_surface_does_not_require_avatar_selector(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(authenticated=True, account_present=False)
+    _set_connected_runtime(monkeypatch, page)
+
+    status = await ytm_web.connection_status()
+
+    assert status["state"] == ytm_web.CONNECTED
+    assert status["connected"] is True
+
+
+async def test_status_adopts_authenticated_ytm_page_after_login_opens_second_tab(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    login_page = FakePage(url="https://accounts.google.com/ServiceLogin", authenticated=False)
+    ytm_page = FakePage(authenticated=True)
+    _set_connected_runtime(monkeypatch, login_page, pages=[login_page, ytm_page])
+    monkeypatch.setattr(ytm_web, "_connection_state", ytm_web.NEEDS_LOGIN)
+
+    status = await ytm_web.connection_status()
+
+    assert status["state"] == ytm_web.CONNECTED
+    assert ytm_web._ytm_page is ytm_page
+
+
+async def test_status_adopts_authenticated_second_ytm_page_over_stale_original(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    stale_page = FakePage(authenticated=False)
+    authenticated_page = FakePage(authenticated=True)
+    _set_connected_runtime(monkeypatch, stale_page, pages=[stale_page, authenticated_page])
+    monkeypatch.setattr(ytm_web, "_connection_state", ytm_web.NEEDS_LOGIN)
+
+    status = await ytm_web.connection_status()
+
+    assert status["state"] == ytm_web.CONNECTED
+    assert ytm_web._ytm_page is authenticated_page
+
+
+async def test_closed_tracked_page_is_replaced_by_live_ytm_page(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    closed_page = FakePage(closed=True)
+    live_page = FakePage(authenticated=True)
+    _set_connected_runtime(monkeypatch, closed_page, pages=[closed_page, live_page])
+    monkeypatch.setattr(ytm_web, "_connection_state", ytm_web.NEEDS_LOGIN)
+
+    status = await ytm_web.connection_status()
+
+    assert status["state"] == ytm_web.CONNECTED
+    assert ytm_web._ytm_page is live_page
+
+
+async def test_unverified_ytm_surface_is_not_reported_as_login_or_connected(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(authenticated=False, login_required=False)
+    _set_connected_runtime(monkeypatch, page)
+
+    status = await ytm_web.connection_status()
+
+    assert status["state"] == ytm_web.ERROR
+    assert status["connected"] is False
+    assert status["needs_login"] is False
+    assert not ytm_web._connection_marker_path().exists()
+
+
 async def test_connected_search_ready_page_without_track_is_valid(monkeypatch) -> None:
     _install_fake_playwright(monkeypatch)
     page = FakePage()
@@ -313,6 +431,7 @@ async def test_expired_session_becomes_needs_login(monkeypatch) -> None:
     assert (await ytm_web.connection_status())["state"] == ytm_web.CONNECTED
 
     page.authenticated = False
+    page.login_required = True
     status = await ytm_web.connection_status()
 
     assert status["state"] == ytm_web.NEEDS_LOGIN

@@ -493,6 +493,12 @@ YT Music related tool tests
       the front without launching a duplicate persistent browser.
 - [x] Do not auto-restore a profile directory until a prior authenticated
       YT Music connection has been observed.
+- [x] Re-scan all live persistent-context pages and adopt the usable
+      `music.youtube.com` page after Google login or tab replacement.
+- [x] Treat explicit Google/YT Music login evidence as `NEEDS_LOGIN` without
+      treating a missing avatar selector as proof of logout.
+- [x] Let normal connection polling detect login completion and persist the
+      marker only after the dedicated YT Music surface is verified usable.
 - [ ] Complete real macOS/YT Music connection and audible playback validation.
 
 ## Suggested verification semantics
@@ -886,6 +892,114 @@ the full Phase 1 playback sequence and restart JARVIS to verify persistence.
 
 NO — the correction is ready for a new manual validation attempt, but Phase 1
 is not complete and Phase 2 must not start.
+
+## Phase 1 login completion correction (2026-08-14)
+
+### Root cause
+
+The failed real login was performed in the intended dedicated profile and
+returned to a live `https://music.youtube.com` page, but the authentication
+probe required one narrow avatar/account selector. The real logged-in page
+had a usable YT Music app, navigation bar and search surface while that
+selector was absent, so every status poll incorrectly returned `NEEDS_LOGIN`.
+
+The adapter also retained only one tracked Playwright page. That made a
+Google login flow vulnerable to leaving `_ytm_page` on an accounts page or a
+stale/closed tab when the usable YT Music page was opened or replaced
+elsewhere in the same persistent context.
+
+The live diagnostic confirmed the profile and DOM evidence without exposing
+credentials: `/Users/marko/.jarvis/ytm_profile`, one active YT Music tab,
+`page_ready=true`, `search_ready=true`, `has_ytm_app=true`, `has_nav=true`,
+`has_search=true`, `has_account=false` and `has_explicit_login=false`.
+
+### Completed
+
+- Added live-page inventory and adoption across `_context.pages`, preferring
+  an authenticated, usable `music.youtube.com` page and recovering from a
+  stale or closed tracked page.
+- Reused the page-adoption path for status polling, connect/reconnect,
+  restore and navigation recovery.
+- Replaced the avatar-presence authentication decision with evidence-based
+  signals: usable YT Music app/search surface plus no explicit login
+  evidence; Google login pages and explicit YT Music sign-in controls remain
+  `NEEDS_LOGIN`.
+- Kept unknown authentication as an explicit error rather than silently
+  claiming `CONNECTED` or inventing a login failure.
+- Preserved automatic polling and marker creation only after verified
+  dedicated-page readiness.
+- Prevented a repeated Connect action from navigating away from an active
+  Google login page.
+- Confirmed the saved profile restored as `CONNECTED` after a JARVIS restart
+  without another login.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `tests/test_ytm_web.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added polling coverage for `NEEDS_LOGIN -> CONNECTED` after DOM/auth state
+  changes without another Connect call.
+- Added coverage proving a usable YT Music surface does not require an
+  avatar selector.
+- Added second-tab, stale-YT Music-tab and closed-page adoption tests.
+- Added coverage for unknown authentication, marker safety and preserving an
+  active Google login page on repeated Connect.
+
+### Validation
+
+- `./.venv/bin/pytest -q tests/test_ytm_web.py tests/test_ytm_connection_api.py` -> PASS (`37 passed`)
+- `./.venv/bin/pytest -q tests/test_phase0_media_regressions.py tests/test_ytm_web.py tests/test_ytm_connection_api.py tests/test_nowplaying.py tests/test_loop_tool_events.py` -> PASS (`58 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`142 passed, 3 xfailed`; known Phase 3 local-model regressions)
+- `./.venv/bin/ruff check jarvis/media/ytm_web.py tests/test_ytm_web.py` -> PASS
+- `./.venv/bin/ruff format --check jarvis/media/ytm_web.py tests/test_ytm_web.py` -> PASS
+- `./.venv/bin/ruff check .` -> FAIL (3 pre-existing findings in
+  `jarvis/audio/focus.py`, `jarvis/log.py` and `tests/test_web_ui_7b.py`)
+- `./.venv/bin/ruff format --check .` -> FAIL (6 pre-existing formatting
+  findings; changed files remain formatted)
+- `git diff --check` -> PASS
+- `cd web-ui && npm run typecheck` -> PASS
+- `cd web-ui && npm run test` -> PASS (`3 tests`)
+- `cd web-ui && npm run build` -> PASS
+- Real runtime before the correction: dedicated profile/page was confirmed,
+  but old code returned `NEEDS_LOGIN` despite YTM readiness.
+- Real runtime after the correction: `POST /api/ytm/connect` returned
+  `CONNECTED`; after shutdown/restart, automatic profile restore returned
+  `CONNECTED` again. Safe probe logs showed the real usable YTM surface and
+  no account selector.
+
+### Manual validation still required
+
+- Repeat the full connection-only sequence in the visible dedicated browser:
+  start JARVIS, click Connect, log in if needed, wait for automatic
+  `CONNECTED`, stop JARVIS, restart it, and confirm `CONNECTED` persists.
+- Only after that connection checkpoint, repeat the Phase 1 playback matrix:
+  different artist/song while another track plays, pause, resume, next five
+  times and previous three times. No manual playback success is claimed by
+  this correction.
+
+### New issues discovered
+
+- No unresolved additional issue was found. The missing-avatar probe and
+  multi-page login handoff were blocking Phase 1 issues and are fixed in this
+  correction; the manual playback checkpoint remains outstanding.
+
+### Remaining risks
+
+- YT Music DOM controls and browser autoplay/audio behavior still require the
+  user's real manual playback validation.
+- Full Ruff/format repository checks may still report unrelated pre-existing
+  findings; changed files are clean.
+- Phase 2 MediaService/state-ownership work has not started.
+
+### Ready for next phase
+
+NO — the connection correction passed real profile restore smoke validation,
+but the required user-led connection and audible playback checkpoint has not
+yet been repeated after this correction. Do not merge and do not start Phase 2.
 
 ---
 
@@ -1776,6 +1890,28 @@ every restart.
 
 **Recommended phase:**
 Phase 1 — fixed in the connection presentation correction.
+
+**Blocks current phase:** yes — resolved in code; manual retest required.
+
+## [P1] Logged-in YT Music page remained in NEEDS_LOGIN after Google login
+
+**Found in phase:** 1
+**Files:** `jarvis/media/ytm_web.py`, `tests/test_ytm_web.py`
+
+**Symptom:**
+After the user completed Google/YT Music login in the dedicated
+`~/.jarvis/ytm_profile` browser, status polling remained `NEEDS_LOGIN` and
+`ytm_play` returned a connection failure.
+
+**Root cause:**
+The probe treated a missing narrow avatar/account selector as proof of logout,
+even though the real page had a usable YT Music app, navigation bar and search
+surface. The adapter also tracked only one page and could miss a usable
+`music.youtube.com` page created or replacing the login tab.
+
+**Recommended phase:**
+Phase 1 — fixed with multi-page adoption and evidence-based login detection;
+manual connection and playback retest required.
 
 **Blocks current phase:** yes — resolved in code; manual retest required.
 

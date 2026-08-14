@@ -77,15 +77,55 @@ def _safe_is_connected(browser: Any) -> bool:
         return False
 
 
+def _context_runtime_alive() -> bool:
+    """Return whether the persistent Playwright context is still usable."""
+    if not _launched or _context is None:
+        return False
+    return _browser is None or _safe_is_connected(_browser)
+
+
+def _context_pages() -> list[Any]:
+    """Return live pages, falling back to the tracked page when needed."""
+    if _context is None:
+        return []
+    try:
+        raw_pages = getattr(_context, "pages", None)
+        pages = list(raw_pages) if raw_pages is not None else []
+    except Exception:
+        pages = []
+    if _ytm_page is not None and not _safe_is_closed(_ytm_page):
+        if not any(page is _ytm_page for page in pages):
+            pages.append(_ytm_page)
+    return [page for page in pages if not _safe_is_closed(page)]
+
+
+def _page_origin(page: Any) -> str:
+    """Return a safe page origin without query, fragment or credentials."""
+    try:
+        url = str(getattr(page, "url", "") or "")
+    except Exception:
+        return "<unavailable>"
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        return "<unavailable>"
+    try:
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        port = ""
+    return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{port}"
+
+
+def _is_ytm_page(page: Any) -> bool:
+    return _page_origin(page) == YTM_URL
+
+
 def _runtime_alive() -> bool:
     """Return whether the dedicated Playwright runtime still has a live tab."""
-    if not _launched or _context is None or _ytm_page is None:
+    if not _context_runtime_alive() or _ytm_page is None:
         return False
     if _safe_is_closed(_ytm_page):
         return False
-    # Persistent contexts may not expose a Browser object. The page/context
-    # itself is still a valid liveness signal in that case.
-    return _browser is None or _safe_is_connected(_browser)
+    return True
 
 
 def _connection_marker_path() -> Path:
@@ -135,8 +175,10 @@ def _resolve_profile() -> tuple[Path, list[str]]:
 async def _launch_browser() -> bool:
     """Launch the one headed, persistent browser used by all YTM actions."""
     global _pw, _context, _ytm_page, _launched, _active_profile, _browser
-    if _runtime_alive():
-        return True
+    if _context_runtime_alive():
+        await _find_or_adopt_ytm_page()
+        if _ytm_page is not None and not _safe_is_closed(_ytm_page):
+            return True
 
     user_data_dir, args = _resolve_profile()
     log.info("ytm_web: launching persistent browser profile=%s", user_data_dir)
@@ -189,7 +231,7 @@ async def _launch_browser() -> bool:
     _browser = _context.browser if hasattr(_context, "browser") else None
 
     pages = list(_context.pages or [])
-    ytm_pages = [page for page in pages if "music.youtube.com" in (getattr(page, "url", "") or "")]
+    ytm_pages = [page for page in pages if _is_ytm_page(page)]
     if ytm_pages:
         _ytm_page = ytm_pages[0]
     elif pages:
@@ -201,31 +243,46 @@ async def _launch_browser() -> bool:
             log.warning("ytm_web: new_page failed: %s", exc)
             return False
 
+    await _find_or_adopt_ytm_page()
     return True
 
 
-_PAGE_PROBE_JS = """
+_PAGE_PROBE_JS = r"""
 () => {
-  const pageReady = location.hostname === 'music.youtube.com';
+  const pageReady = location.origin === 'https://music.youtube.com';
   const search = document.querySelector('ytmusic-search-box input')
     || document.querySelector('input#input')
     || document.querySelector('input[name="search_query"]');
+  const ytmApp = document.querySelector('ytmusic-app');
+  const nav = document.querySelector('ytmusic-nav-bar');
   const account = document.querySelector('#avatar-btn, ytmusic-nav-bar #avatar-btn, ytmusic-nav-bar [aria-label*="Account" i], ytmusic-nav-bar a[href*="/channel/"]');
-  const signIn = document.querySelector('a[href*="ServiceLogin"], #sign-in-button, tp-yt-paper-button[aria-label*="Sign in" i], ytmusic-pivot-bar-item-renderer[tab-id="SIGN_IN"]');
+  const signIn = document.querySelector('a[href*="ServiceLogin"], #sign-in-button, tp-yt-paper-button[aria-label*="Sign in" i], ytmusic-pivot-bar-item-renderer[tab-id="SIGN_IN"], ytmusic-guide-entry-renderer[tab-id="SIGN_IN"]');
   const signInText = Array.from(document.querySelectorAll('button, a, tp-yt-paper-button'))
     .some((el) => /^(sign in|log in|prijavi se)$/i.test(
       (el.getAttribute('aria-label') || el.textContent || '').trim()
     ));
+  const googleLogin = /(^|\.)accounts\.google\.com$/i.test(location.hostname)
+    || /(^|\.)google\.com$/i.test(location.hostname) && /servicelogin|signin/i.test(location.pathname);
+  const explicitLoginRequired = googleLogin || !!signIn || signInText;
+  const ytmSurfaceReady = pageReady && !!search && (!!ytmApp || !!nav);
   const video = document.querySelector('video');
   const title = document.querySelector('.title.ytmusic-player-bar');
   const playerLoaded = !!(video && title && title.textContent && title.textContent.trim().length > 0);
   const trackId = new URL(location.href).searchParams.get('v') || '';
   return {
     ok: true,
+    origin: location.origin,
     page_ready: pageReady,
     search_ready: pageReady && !!search,
-    authenticated: !!account && !signIn && !signInText,
-    login_required: !account || !!signIn || signInText,
+    ytm_surface_ready: ytmSurfaceReady,
+    authenticated: ytmSurfaceReady && !explicitLoginRequired,
+    login_required: explicitLoginRequired,
+    auth_evidence: explicitLoginRequired ? 'login_required' : (ytmSurfaceReady ? 'usable_surface' : 'unknown'),
+    has_ytm_app: !!ytmApp,
+    has_nav: !!nav,
+    has_search: !!search,
+    has_account: !!account,
+    has_explicit_login: explicitLoginRequired,
     player_loaded: playerLoaded,
     playing: playerLoaded ? (!video.paused && video.currentTime > 0 && video.readyState >= 2) : null,
     track_id: trackId,
@@ -246,45 +303,154 @@ def _apply_probe(probe: dict[str, Any] | None) -> None:
     _playing = playing if isinstance(playing, bool) else None
 
 
-async def _probe_page() -> dict[str, Any] | None:
-    if not _runtime_alive():
-        _clear_runtime_state()
-        return None
+async def _evaluate_page_probe(page: Any) -> dict[str, Any] | None:
     try:
-        probe = await _ytm_page.evaluate(_PAGE_PROBE_JS)
+        probe = await page.evaluate(_PAGE_PROBE_JS)
     except Exception as exc:
-        log.debug("ytm_web: page probe failed: %s", exc)
-        _clear_runtime_state()
+        log.debug("ytm_web: page probe failed for origin=%s: %s", _page_origin(page), exc)
         return None
     if not isinstance(probe, dict):
+        return None
+    return probe
+
+
+def _probe_is_usable(probe: dict[str, Any] | None) -> bool:
+    return bool(
+        isinstance(probe, dict)
+        and probe.get("authenticated")
+        and probe.get("page_ready")
+        and probe.get("search_ready")
+    )
+
+
+def _log_probe(page: Any, probe: dict[str, Any]) -> None:
+    log.debug(
+        "ytm_web: probe profile=%s origin=%s page_ready=%s search_ready=%s "
+        "ytm_surface_ready=%s player_loaded=%s auth_evidence=%s "
+        "has_ytm_app=%s has_nav=%s has_search=%s has_account=%s "
+        "has_explicit_login=%s",
+        _active_profile or _JARVIS_PROFILE_DIR,
+        _page_origin(page),
+        bool(probe.get("page_ready")),
+        bool(probe.get("search_ready")),
+        bool(probe.get("ytm_surface_ready")),
+        bool(probe.get("player_loaded")),
+        probe.get("auth_evidence", "unknown"),
+        bool(probe.get("has_ytm_app")),
+        bool(probe.get("has_nav")),
+        bool(probe.get("has_search")),
+        bool(probe.get("has_account")),
+        bool(probe.get("has_explicit_login")),
+    )
+
+
+async def _find_or_adopt_ytm_page() -> Any | None:
+    """Find the usable YTM page and replace stale tracked-page references."""
+    global _ytm_page
+    if not _context_runtime_alive():
+        return None
+
+    pages = _context_pages()
+    log.debug(
+        "ytm_web: page inventory profile=%s count=%s origins=%s",
+        _active_profile or _JARVIS_PROFILE_DIR,
+        len(pages),
+        [_page_origin(page) for page in pages],
+    )
+    ytm_pages = [page for page in pages if _is_ytm_page(page)]
+    selected = None
+
+    if ytm_pages:
+        ordered = []
+        if any(page is _ytm_page for page in ytm_pages):
+            ordered.append(_ytm_page)
+        ordered.extend(page for page in reversed(ytm_pages) if all(page is not item for item in ordered))
+        for page in ordered:
+            probe = await _evaluate_page_probe(page)
+            if probe is not None:
+                _log_probe(page, probe)
+            if _probe_is_usable(probe):
+                selected = page
+                break
+        if selected is None:
+            selected = ordered[0]
+    elif _ytm_page is not None and not _safe_is_closed(_ytm_page):
+        # Keep an accounts.google.com page while the user is completing login,
+        # but replace it as soon as a live music.youtube.com page appears.
+        selected = _ytm_page
+    elif pages:
+        selected = pages[-1]
+
+    if selected is not _ytm_page:
+        log.info(
+            "ytm_web: selected page profile=%s origin=%s previous_origin=%s",
+            _active_profile or _JARVIS_PROFILE_DIR,
+            _page_origin(selected) if selected is not None else "<none>",
+            _page_origin(_ytm_page) if _ytm_page is not None else "<none>",
+        )
+    _ytm_page = selected
+    return selected
+
+
+async def _probe_page() -> dict[str, Any] | None:
+    page = await _find_or_adopt_ytm_page()
+    if page is None:
+        _clear_runtime_state()
+        return None
+    probe = await _evaluate_page_probe(page)
+    if probe is None:
         _clear_runtime_state()
         return None
     _apply_probe(probe)
+    _log_probe(page, probe)
     return probe
 
 
 def _set_connection_from_probe(probe: dict[str, Any] | None) -> None:
     global _connection_state, _connection_error
+    previous_state = _connection_state
     if probe is None:
         _connection_state = ERROR
         _connection_error = "YT Music browser page is unavailable"
-        return
-    if probe.get("authenticated") and probe.get("page_ready") and probe.get("search_ready"):
+    elif _probe_is_usable(probe):
         _connection_state = CONNECTED
         _connection_error = None
         _mark_profile_connected()
-        return
-    if probe.get("login_required") or not probe.get("authenticated"):
+    elif probe.get("login_required"):
         _connection_state = NEEDS_LOGIN
         _connection_error = None
-        return
-    _connection_state = ERROR
-    _connection_error = "YT Music page/search is not ready"
+    elif not probe.get("page_ready") or not probe.get("search_ready"):
+        _connection_state = ERROR
+        _connection_error = "YT Music page/search is not ready"
+    else:
+        _connection_state = ERROR
+        _connection_error = "YT Music session could not be verified"
+
+    if _connection_state != previous_state:
+        log.info(
+            "ytm_web: connection state %s -> %s profile=%s origin=%s "
+            "page_ready=%s search_ready=%s auth_evidence=%s "
+            "ytm_surface_ready=%s has_ytm_app=%s has_nav=%s has_search=%s "
+            "has_account=%s has_explicit_login=%s",
+            previous_state,
+            _connection_state,
+            _active_profile or _JARVIS_PROFILE_DIR,
+            probe.get("origin", _page_origin(_ytm_page)) if isinstance(probe, dict) else "<none>",
+            bool(probe.get("page_ready")) if isinstance(probe, dict) else False,
+            bool(probe.get("search_ready")) if isinstance(probe, dict) else False,
+            probe.get("auth_evidence", "unknown") if isinstance(probe, dict) else "unknown",
+            bool(probe.get("ytm_surface_ready")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_ytm_app")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_nav")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_search")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_account")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_explicit_login")) if isinstance(probe, dict) else False,
+        )
 
 
 async def _refresh_connection_status() -> dict[str, Any]:
     global _connection_state, _connection_error
-    if not _runtime_alive():
+    if not _context_runtime_alive():
         _clear_runtime_state()
         if _connection_state not in (DISCONNECTED, CONNECTING):
             _connection_state = ERROR
@@ -296,10 +462,11 @@ async def _refresh_connection_status() -> dict[str, Any]:
 
 
 async def _present_ytm_page() -> bool:
-    if not _runtime_alive():
+    page = await _find_or_adopt_ytm_page()
+    if page is None:
         return False
     try:
-        await _ytm_page.bring_to_front()
+        await page.bring_to_front()
         log.info("ytm_web: presented dedicated YT Music page")
         return True
     except Exception as exc:
@@ -309,14 +476,15 @@ async def _present_ytm_page() -> bool:
 
 async def _navigate_to_ytm(*, present: bool = False) -> bool:
     global _connection_state, _connection_error
-    if not _runtime_alive():
+    page = await _find_or_adopt_ytm_page()
+    if page is None:
         return False
     try:
         if present and not await _present_ytm_page():
             _connection_state = ERROR
             _connection_error = "YT Music login page could not be presented"
             return False
-        await _ytm_page.goto(YTM_URL, wait_until="domcontentloaded", timeout=15000)
+        await page.goto(YTM_URL, wait_until="domcontentloaded", timeout=15000)
         # Give the SPA a short opportunity to render. Login itself remains a
         # user action in the headed browser and is never automated here.
         await asyncio.sleep(0.5)
@@ -333,12 +501,16 @@ async def connect() -> dict[str, Any]:
     """Open the dedicated headed profile for a user-driven Google login."""
     global _connection_state, _connection_error
     async with _get_lock():
-        if _connection_state == CONNECTED and _runtime_alive():
-            if not await _present_ytm_page():
-                _connection_state = ERROR
-                _connection_error = "YT Music page could not be presented"
-                return _status_payload()
-            return await _refresh_connection_status()
+        if _context_runtime_alive():
+            page = await _find_or_adopt_ytm_page()
+            if page is not None and _page_origin(page) != "<unavailable>":
+                # Re-present an existing YTM/Google login page without
+                # navigating it away while the user is completing login.
+                if not await _present_ytm_page():
+                    _connection_state = ERROR
+                    _connection_error = "YT Music page could not be presented"
+                    return _status_payload()
+                return await _refresh_connection_status()
         _connection_state = CONNECTING
         _connection_error = None
         if not await _launch_browser():
@@ -380,7 +552,7 @@ def warm_up() -> None:
 
 async def connection_status() -> dict[str, Any]:
     """Return safe connection and runtime/player state from the YTM page."""
-    if _runtime_alive() and _connection_state != CONNECTING:
+    if _context_runtime_alive() and _connection_state != CONNECTING:
         await _refresh_connection_status()
     return _status_payload()
 
