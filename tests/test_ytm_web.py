@@ -15,14 +15,22 @@ from jarvis.media import ytm_web
 
 
 class FakePage:
-    def __init__(self, *, closed: bool = False, url: str = "https://music.youtube.com/") -> None:
+    def __init__(
+        self,
+        *,
+        closed: bool = False,
+        url: str = "https://music.youtube.com/",
+        transition_changes_track: bool = True,
+    ) -> None:
         self.closed = closed
         self.url = url
+        self.transition_changes_track = transition_changes_track
         self.state = {
             "ok": True,
             "playing": False,
             "title": "Test Song",
             "artist": "Test Artist",
+            "track_id": "test-track",
             "ariaLabel": "Play",
             "currentTime": 0,
             "duration": 200,
@@ -45,7 +53,9 @@ class FakePage:
                 self.state["playing"] = False
             elif action in ("next", "previous"):
                 self.state["playing"] = True
-                self.state["title"] = f"After {action}"
+                if self.transition_changes_track:
+                    self.state["title"] = f"After {action}"
+                    self.state["track_id"] = f"{action}-track"
             return {"ok": True, "method": f"fake.{action}"}
         if "HTMLInputElement" in script:
             return {"ok": True}
@@ -207,6 +217,43 @@ async def test_get_state_reads_dom(monkeypatch) -> None:
     assert result["playing"] is True
     assert result["title"] == "Foo"
     assert result["artist"] == "Bar"
+
+
+async def test_control_next_verifies_track_transition(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    page.state["playing"] = True
+    monkeypatch.setattr(ytm_web, "_ytm_page", page)
+    monkeypatch.setattr(ytm_web, "_launched", True)
+    monkeypatch.setattr(ytm_web, "_ready", True)
+    monkeypatch.setattr(ytm_web, "_browser", types.SimpleNamespace(is_connected=lambda: True))
+
+    result = await ytm_web.control("next")
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["delivered"] is True
+    assert result["track_changed"] is True
+    assert result["before"]["track_id"] == "test-track"
+    assert result["after"]["track_id"] == "next-track"
+
+
+async def test_control_next_does_not_use_playing_as_track_verification(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(transition_changes_track=False)
+    page.state["playing"] = True
+    monkeypatch.setattr(ytm_web, "_ytm_page", page)
+    monkeypatch.setattr(ytm_web, "_launched", True)
+    monkeypatch.setattr(ytm_web, "_ready", True)
+    monkeypatch.setattr(ytm_web, "_browser", types.SimpleNamespace(is_connected=lambda: True))
+
+    result = await ytm_web.control("next")
+
+    assert result["ok"] is False
+    assert result["verified"] is False
+    assert result["delivered"] is True
+    assert result["verification"] == "failed"
+    assert result["track_changed"] is False
 
 
 async def test_play_query_empty(monkeypatch) -> None:

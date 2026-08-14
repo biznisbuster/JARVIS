@@ -268,11 +268,13 @@ _STATE_JS = """
   }
   const ariaLabel = playPause ? (playPause.getAttribute('aria-label') || '') : '';
   const isPlaying = !video.paused && video.currentTime > 0 && video.readyState >= 2;
+  const trackId = new URL(location.href).searchParams.get('v') || '';
   return {
     ok: true,
     playing: isPlaying,
     title: (titleEl && titleEl.textContent ? titleEl.textContent.trim() : ''),
     artist: (bylineEl && bylineEl.textContent ? bylineEl.textContent.trim() : ''),
+    track_id: trackId,
     ariaLabel,
     currentTime: video.currentTime,
     duration: isFinite(video.duration) ? video.duration : 0,
@@ -347,6 +349,44 @@ async def get_state() -> dict[str, Any]:
     return result
 
 
+def _track_identity(state: dict[str, Any] | None) -> tuple[str, ...] | None:
+    """Return the strongest available identity for a loaded track."""
+    if not isinstance(state, dict) or not state.get("ok"):
+        return None
+    track_id = str(state.get("track_id") or state.get("trackId") or "").strip()
+    if track_id:
+        return ("id", track_id)
+    title = str(state.get("title") or "").strip().casefold()
+    artist = str(state.get("artist") or "").strip().casefold()
+    if title or artist:
+        return ("metadata", title, artist)
+    return None
+
+
+def _verify_action(
+    action: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    """Verify an action from observed state, never from command delivery."""
+    if not isinstance(after, dict) or not after.get("ok"):
+        return False, "unavailable"
+    if action == "pause":
+        if after.get("playing") is False:
+            return True, "verified"
+        return False, "unavailable" if after.get("playing") is None else "failed"
+    if action == "play":
+        if after.get("playing") is True:
+            return True, "verified"
+        return False, "unavailable" if after.get("playing") is None else "failed"
+
+    before_identity = _track_identity(before)
+    after_identity = _track_identity(after)
+    if before_identity is None or after_identity is None:
+        return False, "unavailable"
+    return (before_identity != after_identity, "verified" if before_identity != after_identity else "failed")
+
+
 async def control(action: str) -> dict[str, Any]:
     """Transport komanda (play/pause/next/previous) na web tabu.
     Verifikuje stanje posle akcije. Vraca ``{"ok", "action", "method",
@@ -354,33 +394,90 @@ async def control(action: str) -> dict[str, Any]:
     if action not in ("play", "pause", "next", "previous"):
         return {"ok": False, "error": f"unknown action: {action}", "action": action}
     if not await ensure_ready():
-        return {"ok": False, "error": "ytm_web not ready", "action": action}
+        return {
+            "ok": False,
+            "error": "ytm_web not ready",
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+        }
+
+    before = await get_state()
     try:
         send_result = await _ytm_page.evaluate(_CONTROL_JS, action)
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "action": action}
+        return {
+            "ok": False,
+            "error": str(exc),
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "before": before,
+        }
+
+    delivered = bool(send_result and send_result.get("ok"))
+    if not delivered:
+        return {
+            "ok": False,
+            "action": action,
+            "method": (send_result or {}).get("method"),
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "before": before,
+            "after": None,
+            "state": before,
+            "error": (send_result or {}).get("error", "command was not delivered"),
+        }
 
     await asyncio.sleep(0.4)
     state = await get_state()
-    verified = bool(state.get("ok")) and (
-        (action in ("play", "next", "previous") and state.get("playing") is True)
-        or (action == "pause" and state.get("playing") is False)
-    )
+    verified, verification = _verify_action(action, before, state)
 
     if not verified and action in ("next", "previous"):
         await asyncio.sleep(0.5)
         state = await get_state()
-        verified = bool(state.get("ok")) and (
-            (action in ("next", "previous") and state.get("playing") is True)
+        verified, verification = _verify_action(action, before, state)
+
+    track_changed = None
+    if action in ("next", "previous"):
+        before_identity = _track_identity(before)
+        after_identity = _track_identity(state)
+        track_changed = (
+            before_identity != after_identity
+            if before_identity is not None and after_identity is not None
+            else None
         )
 
-    return {
-        "ok": bool(send_result and send_result.get("ok") and verified),
+    result = {
+        "ok": bool(delivered and verified),
         "action": action,
         "method": (send_result or {}).get("method"),
+        "adapter": "ytm_web",
+        "delivered": delivered,
         "verified": verified,
+        "verification": verification,
+        "degraded": delivered and not verified and verification == "unavailable",
+        "before": before,
+        "after": state,
         "state": state,
     }
+    if track_changed is not None or action in ("next", "previous"):
+        result["track_changed"] = track_changed
+    if not verified:
+        result["error"] = (
+            "track transition could not be verified"
+            if action in ("next", "previous") and verification == "unavailable"
+            else "track did not change"
+            if action in ("next", "previous")
+            else f"playback state did not reach {'playing' if action == 'play' else 'paused'}"
+        )
+    return result
 
 
 async def play_query(query: str) -> dict[str, Any]:

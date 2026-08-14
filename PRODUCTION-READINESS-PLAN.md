@@ -460,17 +460,17 @@ YT Music related tool tests
 
 ## Tasks
 
-- [ ] Remove unconditional Space/play toggle after `next`.
-- [ ] Remove unconditional Space/play toggle after `previous`.
-- [ ] Capture state before transition.
-- [ ] Verify next/previous using changed track identity when possible.
-- [ ] If track identity is unavailable, use a clearly documented degraded
+- [x] Remove unconditional Space/play toggle after `next`.
+- [x] Remove unconditional Space/play toggle after `previous`.
+- [x] Capture state before transition.
+- [x] Verify next/previous using changed track identity when possible.
+- [x] If track identity is unavailable, use a clearly documented degraded
       verification strategy.
-- [ ] Do not set mirrored state to playing merely because a key event was
+- [x] Do not set mirrored state to playing merely because a key event was
       delivered.
-- [ ] Return `ok=False` when no channel can verify the intended effect.
-- [ ] Add adapter/method metadata to diagnostic result.
-- [ ] Preserve current working play/pause behavior while strengthening
+- [x] Return `ok=False` when no channel can verify the intended effect.
+- [x] Add adapter/method metadata to diagnostic result.
+- [x] Preserve current working play/pause behavior while strengthening
       verification.
 
 ## Suggested verification semantics
@@ -533,6 +533,96 @@ previous x3
 No random pause after track changes.
 
 STOP before architectural extraction.
+
+---
+
+## Phase 1 report (2026-08-14)
+
+### Root cause
+
+The desktop YT Music fallback treated Quartz/AppleScript key delivery as
+proof that playback changed, then sent Space after `next` and `previous`.
+Space is a play/pause toggle, so a successfully started next/previous track
+could be paused immediately. The Playwright adapter had a related verification
+gap: it treated `playing=True` as proof of a track transition. The generic
+now-playing fallback also accepted `playing=True` when no before/after track
+identity existed.
+
+### Completed
+
+- Removed the unconditional play/pause key after desktop `next` and
+  `previous`.
+- Added before/after verification using track ID first and title/artist
+  metadata as the documented degraded identity fallback.
+- Made delivered-but-unverified actions return `ok=False` with explicit
+  `delivered`, `verified`, `verification`, `degraded`, `adapter` and `method`
+  metadata.
+- Updated the mirrored playing state only from observed verified state.
+- Preserved pause/resume no-op behavior when an observed state already matches
+  the requested result, while verifying all delivered commands.
+- Hardened the existing desktop YT Music play fallbacks against the same
+  command-delivery false-success behavior.
+- Converted the Phase 0 strict YT Music xfails into passing regressions and
+  added web/generic transport verification coverage.
+
+### Files changed
+
+- `jarvis/agent/tools.py`
+- `jarvis/media/nowplaying.py`
+- `jarvis/media/ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `tests/test_ytm_web.py`
+- `tests/test_nowplaying.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Converted `test_next_does_not_send_unconditional_toggle` and
+  `test_previous_does_not_send_unconditional_toggle` from strict xfails to
+  passing tests with before/after state.
+- Added delivered-without-state failure coverage and verified pause/resume
+  transport coverage.
+- Added web-adapter track-transition success/failure coverage.
+- Added generic now-playing coverage proving a transition requires an
+  observed identity change.
+
+### Validation
+
+- `./.venv/bin/pytest tests/test_phase0_media_regressions.py tests/test_ytm_web.py tests/test_nowplaying.py -q` -> PASS (`21 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`105 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
+- `./.venv/bin/ruff check .` -> FAIL (4 pre-existing findings in `jarvis/audio/focus.py`, `jarvis/log.py`, `jarvis/media/ytm_web.py` and `tests/test_web_ui_7b.py`)
+- `./.venv/bin/ruff format --check .` -> FAIL (8 pre-existing formatted files; no added Phase 1 formatting issue)
+- `git diff --check` -> PASS
+- `cd web-ui && npm run typecheck` -> PASS
+- `cd web-ui && npm run test` -> PASS (1 test)
+- `cd web-ui && npm run build` -> PASS
+
+### Manual validation still required
+
+- Real macOS/YT Music validation was not run by the agent. On macOS, start
+  JARVIS with `./scripts/start.sh`, ensure YT Music is installed and logged
+  in, then issue `play`, `pause`, `resume`, `next` five times and `previous`
+  three times through the UI. Confirm every transition changes the track and
+  that no `next`/`previous` action pauses playback unexpectedly. Repeat with
+  the browser adapter unavailable if desktop fallback coverage is required.
+
+### New issues discovered
+
+- None. Existing Phase 3 xfails, the Phase 0 frontend dependency advisory and
+  the deferred MediaService world-state test remain outside this phase.
+
+### Remaining risks
+
+- The desktop fallback still relies on generic macOS now-playing evidence when
+  the dedicated YTM web state is unavailable; YTM-specific manual validation
+  is required to confirm what MediaRemote exposes on this machine.
+- Full Ruff validation remains red on pre-existing repository findings.
+- Phase 2 MediaService/state-ownership work has intentionally not started.
+
+### Ready for next phase
+
+YES — Phase 1 is complete and ready for review/merge. Stop here; Phase 2 has
+not been started.
 
 ---
 

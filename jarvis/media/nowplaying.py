@@ -125,6 +125,20 @@ _NPC_ACTIONS = {"pause": "pause", "play": "play", "next": "next", "previous": "p
 _MR_ACTIONS = {"pause": _MR_PAUSE, "play": _MR_PLAY, "next": _MR_NEXT_TRACK, "previous": _MR_PREVIOUS_TRACK}
 
 
+def _track_identity(state: dict[str, Any] | None) -> tuple[str, ...] | None:
+    """Return track metadata suitable for before/after comparison."""
+    if not isinstance(state, dict) or not state.get("ok"):
+        return None
+    track_id = str(state.get("track_id") or state.get("trackId") or "").strip()
+    if track_id:
+        return ("id", track_id)
+    title = str(state.get("title") or "").strip().casefold()
+    artist = str(state.get("artist") or "").strip().casefold()
+    if title or artist:
+        return ("metadata", title, artist)
+    return None
+
+
 def _verified(action: str, before: dict[str, Any], after: dict[str, Any]) -> bool:
     if not after.get("ok"):
         return False
@@ -133,14 +147,9 @@ def _verified(action: str, before: dict[str, Any], after: dict[str, Any]) -> boo
         return playing is False
     if action == "play":
         return playing is True
-    if playing is False:
-        return False
-    if before.get("ok") and (before.get("title") or before.get("artist")):
-        return (after.get("title"), after.get("artist")) != (
-            before.get("title"),
-            before.get("artist"),
-        )
-    return playing is True
+    before_identity = _track_identity(before)
+    after_identity = _track_identity(after)
+    return before_identity is not None and after_identity is not None and before_identity != after_identity
 
 
 async def control(action: str) -> dict[str, Any]:

@@ -940,7 +940,12 @@ async def ytm_play(args: dict[str, Any]) -> str:
                     "ok": True,
                     "query": query,
                     "method": "ytm_web",
+                    "adapter": "ytm_web",
                     "action": "play",
+                    "delivered": True,
+                    "verified": True,
+                    "verification": "verified",
+                    "degraded": False,
                     "note": "YTM desktop će se pauzirati jer Google dozvoljava samo jednog aktivnog igrača po nalogu (Spotify Connect).",
                     "state": {
                         "playing": state.get("playing"),
@@ -972,18 +977,39 @@ async def ytm_play(args: dict[str, Any]) -> str:
         watch_url = f"https://music.youtube.com/watch?v={video_id}"
         if await _ytm_open_url(watch_url):
             await asyncio.sleep(1.6)
-            pid = await _ytm_pid()
-            sent = await _ytm_post_keycode(pid, _YTM_KEY_CODES["play"])
-            log.info("ytm_play(fallback): opened %s, sent space=%s", video_id, sent)
-            _YTM_STATE.mark_playing()
+            before = await _ytm_read_transport_state()
+            sent = False
+            if before is not None and before.get("playing") is True:
+                after = before
+                verified, verification = True, "verified"
+            else:
+                pid = await _ytm_pid()
+                sent = await _ytm_post_keycode(pid, _YTM_KEY_CODES["play"])
+                await asyncio.sleep(0.45)
+                after = await _ytm_read_transport_state()
+                verified, verification = _ytm_verify_transport("play", before, after)
+                verified = sent and verified
+            log.info("ytm_play(fallback): opened %s, sent space=%s verified=%s", video_id, sent, verified)
+            if verified:
+                _ytm_update_mirrored_state(after)
+            else:
+                _YTM_STATE.mark_unknown()
             return json.dumps(
                 {
-                    "ok": True,
+                    "ok": verified,
                     "query": query,
                     "video_id": video_id,
-                    "method": "video_id+space",
+                    "method": "video_id+space" if sent else "video_id+state",
                     "action": "play",
+                    "delivered": sent,
+                    "verified": verified,
+                    "verification": verification,
+                    "degraded": sent and not verified and verification == "unavailable",
+                    "before": before,
+                    "after": after,
+                    "state": after,
                     "expected_state": "playing",
+                    **({} if verified else {"error": "playback state did not reach playing"}),
                 },
                 ensure_ascii=False,
             )
@@ -997,11 +1023,23 @@ async def ytm_play(args: dict[str, Any]) -> str:
         ("key code 36", 1.2),
     ]
     await _ytm_activate()
-    await _ytm_send_keystrokes(search_steps)
+    rc, _, err = await _ytm_send_keystrokes(search_steps)
+    if rc != 0:
+        return json.dumps(
+            {
+                "ok": False,
+                "query": query,
+                "method": "search",
+                "delivered": False,
+                "verified": False,
+                "error": err or "could not search YT Music",
+            },
+            ensure_ascii=False,
+        )
 
     click_script = (
         'tell application "System Events"\n'
-        f'  tell process "Web App"\n'
+        '  tell process "Web App"\n'
         "    if not (exists window 1) then\n"
         '      return "no window"\n'
         "    end if\n"
@@ -1018,11 +1056,33 @@ async def ytm_play(args: dict[str, Any]) -> str:
     rc, _, err = await _osascript(click_script, timeout=10)
     if rc != 0:
         log.warning("ytm_play(fallback): click failed: %s", err)
-        return json.dumps({"ok": False, "error": err or "could not click first song", "query": query}, ensure_ascii=False)
-    _YTM_STATE.mark_playing()
+        return json.dumps(
+            {"ok": False, "error": err or "could not click first song", "query": query},
+            ensure_ascii=False,
+        )
+
+    await asyncio.sleep(0.45)
+    after = await _ytm_read_transport_state()
+    verified, verification = _ytm_verify_transport("play", None, after)
+    if verified:
+        _ytm_update_mirrored_state(after)
+    else:
+        _YTM_STATE.mark_unknown()
     return json.dumps(
-        {"ok": True, "query": query, "method": "click", "action": "play",
-         "expected_state": "playing"},
+        {
+            "ok": verified,
+            "query": query,
+            "method": "click",
+            "action": "play",
+            "delivered": True,
+            "verified": verified,
+            "verification": verification,
+            "degraded": not verified and verification == "unavailable",
+            "after": after,
+            "state": after,
+            "expected_state": "playing",
+            **({} if verified else {"error": "playback state did not reach playing"}),
+        },
         ensure_ascii=False,
     )
 
@@ -1037,7 +1097,76 @@ async def _ytm_read_state_via_dom() -> dict[str, Any] | None:
         return None
 
 
-async def _ytm_post_keycode(pid: int, key_code: int) -> bool:
+async def _ytm_read_transport_state() -> dict[str, Any] | None:
+    """Read transport state from the strongest currently available channel.
+
+    The desktop fallback has no dedicated YTM DOM, so generic now-playing
+    state is only treated as evidence when it returns a real state object.
+    The mirrored state is intentionally not used as verification evidence.
+    """
+    web_state = await _ytm_read_state_via_dom()
+    if web_state is not None and web_state.get("ok"):
+        return {**web_state, "source": "ytm_web"}
+
+    try:
+        system_state = await _np.get_state()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("ytm transport state read failed: %s", exc)
+        return None
+    if system_state.get("ok"):
+        return {**system_state, "source": "nowplaying"}
+    return None
+
+
+def _ytm_track_identity(state: dict[str, Any] | None) -> tuple[str, ...] | None:
+    """Return track id first, then title/artist metadata as a fallback."""
+    if not isinstance(state, dict) or not state.get("ok"):
+        return None
+    track_id = str(state.get("track_id") or state.get("trackId") or "").strip()
+    if track_id:
+        return ("id", track_id)
+    title = str(state.get("title") or "").strip().casefold()
+    artist = str(state.get("artist") or "").strip().casefold()
+    if title or artist:
+        return ("metadata", title, artist)
+    return None
+
+
+def _ytm_verify_transport(
+    action: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    """Verify the requested effect from observed state, not delivery."""
+    if not isinstance(after, dict) or not after.get("ok"):
+        return False, "unavailable"
+    if action == "pause":
+        if after.get("playing") is False:
+            return True, "verified"
+        return False, "unavailable" if after.get("playing") is None else "failed"
+    if action == "play":
+        if after.get("playing") is True:
+            return True, "verified"
+        return False, "unavailable" if after.get("playing") is None else "failed"
+
+    before_identity = _ytm_track_identity(before)
+    after_identity = _ytm_track_identity(after)
+    if before_identity is None or after_identity is None:
+        return False, "unavailable"
+    return (before_identity != after_identity, "verified" if before_identity != after_identity else "failed")
+
+
+def _ytm_update_mirrored_state(state: dict[str, Any] | None) -> None:
+    """Update the non-authoritative mirror only from observed playback state."""
+    if isinstance(state, dict) and state.get("playing") is True:
+        _YTM_STATE.mark_playing()
+    elif isinstance(state, dict) and state.get("playing") is False:
+        _YTM_STATE.mark_paused()
+    else:
+        _YTM_STATE.mark_unknown()
+
+
+async def _ytm_post_keycode(pid: int | None, key_code: int) -> bool:
     """Šalje keycode u YTM proces. Quartz primarno, AppleScript fallback.
     Vraca True ako je event isporučen YTM-u (ne garantuje da je YTM
     reagovao kako treba — YTM ponekad ignoriše input kad UI nije
@@ -1065,79 +1194,129 @@ async def _ytm_send_transport(action: str) -> dict[str, Any]:
     if _ytm_web.is_available():
         try:
             result = await _ytm_web.control(action)
-            log.info("ytm transport %s → web: ok=%s verified=%s",
-                     action, result.get("ok"), result.get("verified"))
-            if result.get("ok"):
-                state = result.get("state") or {}
-                if state.get("playing") is True:
-                    _YTM_STATE.mark_playing()
-                elif state.get("playing") is False:
-                    _YTM_STATE.mark_paused()
-                return {
-                    "ok": True,
-                    "action": action,
-                    "method": result.get("method", "ytm_web"),
-                    "verified": bool(result.get("verified")),
-                    "state": {
-                        "playing": state.get("playing"),
-                        "title": state.get("title", ""),
-                        "artist": state.get("artist", ""),
-                    },
-                }
+            log.info(
+                "ytm transport %s → web: ok=%s verified=%s", action, result.get("ok"), result.get("verified")
+            )
+            if result.get("ok") or result.get("delivered"):
+                if result.get("verified"):
+                    _ytm_update_mirrored_state(result.get("after") or result.get("state"))
+                else:
+                    _YTM_STATE.mark_unknown()
+                return {**result, "adapter": result.get("adapter", "ytm_web")}
         except Exception as exc:
             log.warning("ytm transport %s: web failed (%s)", action, exc)
 
     if not _ytm_app_installed():
-        return {"ok": False, "error": "ytm_web not ready and YT Music app not installed"}
+        return {
+            "ok": False,
+            "action": action,
+            "adapter": "ytm_desktop",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "error": "ytm_web not ready and YT Music app not installed",
+        }
     if not await _ytm_is_running():
         if not await _ytm_ensure_running():
-            return {"ok": False, "error": "YT Music not running and could not start"}
+            return {
+                "ok": False,
+                "action": action,
+                "adapter": "ytm_desktop",
+                "delivered": False,
+                "verified": False,
+                "verification": "not_attempted",
+                "error": "YT Music not running and could not start",
+            }
 
-    state = _YTM_STATE.is_playing()
+    before = await _ytm_read_transport_state()
+    desired_playing = {"pause": False, "play": True}.get(action)
+    if desired_playing is not None and before is not None and before.get("playing") is desired_playing:
+        _ytm_update_mirrored_state(before)
+        return {
+            "ok": True,
+            "action": action,
+            "method": "state_read",
+            "adapter": "ytm_desktop",
+            "delivered": False,
+            "verified": True,
+            "verification": "verified",
+            "degraded": False,
+            "state": desired_playing,
+            "before": before,
+            "after": before,
+            "ytm_running": True,
+        }
+
     pid = await _ytm_pid()
-    log.info("ytm transport %s (quartz fallback): state=%s pid=%s", action, state, pid)
+    log.info("ytm transport %s (quartz fallback): before=%s pid=%s", action, before, pid)
 
-    noop_result = {
-        "ok": True,
+    sent = await _ytm_post_keycode(pid, _YTM_KEY_CODES[action])
+    if not sent:
+        _YTM_STATE.mark_unknown()
+        return {
+            "ok": False,
+            "action": action,
+            "method": "quartz_or_as",
+            "adapter": "ytm_desktop",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "degraded": False,
+            "state": None,
+            "before": before,
+            "after": None,
+            "ytm_running": True,
+            "error": "YT Music command was not delivered",
+        }
+
+    await asyncio.sleep(0.45)
+    after = await _ytm_read_transport_state()
+    verified, verification = _ytm_verify_transport(action, before, after)
+    if not verified and action in ("next", "previous"):
+        await asyncio.sleep(0.5)
+        after = await _ytm_read_transport_state()
+        verified, verification = _ytm_verify_transport(action, before, after)
+
+    if verified:
+        _ytm_update_mirrored_state(after)
+    else:
+        _YTM_STATE.mark_unknown()
+
+    track_changed = None
+    if action in ("next", "previous"):
+        before_identity = _ytm_track_identity(before)
+        after_identity = _ytm_track_identity(after)
+        track_changed = (
+            before_identity != after_identity
+            if before_identity is not None and after_identity is not None
+            else None
+        )
+
+    result = {
+        "ok": verified,
         "action": action,
-        "method": "noop",
-        "ytm_running": await _ytm_is_running(),
-        "state": state,
+        "method": "quartz_or_as",
+        "adapter": "ytm_desktop",
+        "delivered": True,
+        "verified": verified,
+        "verification": verification,
+        "degraded": not verified and verification == "unavailable",
+        "ytm_running": True,
+        "state": after.get("playing") if isinstance(after, dict) else None,
+        "before": before,
+        "after": after,
     }
-
-    if action == "pause":
-        if state is False:
-            return noop_result
-        await _ytm_post_keycode(pid, _YTM_KEY_CODES["pause"])
-        _YTM_STATE.mark_paused()
-        return {"ok": True, "action": action, "method": "quartz_or_as",
-                "ytm_running": True, "state": False}
-
-    if action == "play":
-        if state is True:
-            return noop_result
-        await _ytm_post_keycode(pid, _YTM_KEY_CODES["play"])
-        _YTM_STATE.mark_playing()
-        return {"ok": True, "action": action, "method": "quartz_or_as",
-                "ytm_running": True, "state": True}
-
-    if action == "next":
-        await _ytm_post_keycode(pid, _YTM_KEY_CODES["next"])
-        await asyncio.sleep(0.15)
-        await _ytm_post_keycode(pid, _YTM_KEY_CODES["play"])
-        _YTM_STATE.mark_playing()
-        return {"ok": True, "action": action, "method": "quartz_or_as",
-                "ytm_running": True, "state": True}
-
-    if action == "previous":
-        await _ytm_post_keycode(pid, _YTM_KEY_CODES["previous"])
-        await asyncio.sleep(0.15)
-        await _ytm_post_keycode(pid, _YTM_KEY_CODES["play"])
-        _YTM_STATE.mark_playing()
-        return {"ok": True, "action": action, "method": "quartz_or_as",
-                "ytm_running": True, "state": True}
-
-    return {"ok": False, "error": f"unknown action: {action}"}
+    if action in ("next", "previous"):
+        result["track_changed"] = track_changed
+    if not verified:
+        result["error"] = (
+            "track transition could not be verified"
+            if action in ("next", "previous") and verification == "unavailable"
+            else "track did not change"
+            if action in ("next", "previous")
+            else f"playback state did not reach {'playing' if action == 'play' else 'paused'}"
+        )
+    return result
 
 
 async def ytm_pause(args: dict[str, Any]) -> str:
