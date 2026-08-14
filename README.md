@@ -46,6 +46,15 @@ Alati `open_url(url, browser)` i `play_youtube(query)` koriste Playwright
 otvore Chrome, ukucaju u YouTube pretragu i puste prvi rezultat. Pitanje
 za `ask` dozvolu pre izvršenja.
 
+## YouTube Music
+
+YT Music koristi namensku, vidljivu persistent browser sesiju u
+`~/.jarvis/ytm_profile`. Na novom uređaju otvori tab *Konekcije* i klikni
+*Poveži YouTube Music*; prijava se obavlja direktno na Google/YT Music stranici.
+JARVIS ne prima, ne upisuje i ne čuva Google lozinku. Ista browser sesija se
+zatim koristi za pretragu, reprodukciju i DOM verifikaciju pause/resume/next/
+previous akcija. Ako sesija istekne, status prelazi u *Potrebna prijava*.
+
 ## Šta imaš odmah
 
 - 🧠 **LLM** — `MiniMax-M3` (MiniMax Token Plan, `https://api.minimax.io/v1`).
@@ -168,6 +177,8 @@ postojeći setup.
 | `GET  /api/permissions/pending` | Trenutno otvoreni zahtevi |
 | `POST /api/permissions/resolve` | `{request_id, action, remember}` |
 | `GET  /api/connections` | Status svih konekcija |
+| `GET  /api/ytm/connection` | Bezbedan status YT Music browser konekcije |
+| `POST /api/ytm/connect` | Otvori namenski headed YT Music browser za ručnu prijavu |
 | `POST /api/audio/stt` | multipart `audio` → `{text}` |
 | `POST /api/audio/tts` | `{text}` → WAV fajl (TTS) |
 | `WS   /ws` | Živi event stream |

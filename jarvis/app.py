@@ -49,19 +49,13 @@ async def lifespan(app: FastAPI):
     agent_loop.load_sessions()
     BUS.attach(asyncio.get_running_loop())
     await BUS.publish("status", {"ready": True, "ts": time.time()})
-    # Best-effort: pokreni YT Music u pozadini da bude uvek upaljen.
-    try:
-        from .agent.tools import _ytm_ensure_running
-
-        asyncio.create_task(_ytm_ensure_running())
-    except Exception:
-        pass
-    # Best-effort: warm up odvojeni YTM web browser (jedan persistent
-    # Playwright tab na music.youtube.com) za pouzdano state + search.
+    # Restore an existing dedicated YTM browser profile if one was connected
+    # before. A fresh install remains DISCONNECTED until the user clicks the
+    # explicit Connect YouTube Music action in the UI.
     try:
         from .media import ytm_web as _ytm_web
 
-        asyncio.create_task(_ytm_web.warm_up())
+        _ytm_web.warm_up()
     except Exception:
         pass
     # Best-effort: warm up the STT model in the background so the first
@@ -84,6 +78,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         await BUS.publish("ptt_status", {"enabled": False, "error": str(exc)})
     yield
+    # Close the dedicated YT Music context cleanly while retaining its
+    # persistent on-device profile for the next server start.
+    try:
+        from .media import ytm_web as _ytm_web
+
+        await _ytm_web.shutdown()
+    except Exception:
+        pass
     # Teardown: stop the listener so we don't leave a key tap dangling.
     try:
         from .hotkey import PTT
@@ -222,6 +224,20 @@ async def api_permissions_pending() -> JSONResponse:
 # ---- REST: connections / status --------------------------------------------
 
 
+@app.get("/api/ytm/connection")
+async def api_ytm_connection() -> JSONResponse:
+    from .media import ytm_web
+
+    return JSONResponse(await ytm_web.connection_status())
+
+
+@app.post("/api/ytm/connect")
+async def api_ytm_connect() -> JSONResponse:
+    from .media import ytm_web
+
+    return JSONResponse(await ytm_web.connect())
+
+
 @app.get("/api/connections")
 async def api_connections() -> JSONResponse:
     return JSONResponse(await _connections_payload())
@@ -231,6 +247,7 @@ async def _connections_payload() -> dict:
     from .audio import tts as tts_mod
     from .audio.focus import FOCUS
     from .hotkey import PTT
+    from .media import ytm_web
 
     voice_info = await asyncio.to_thread(tts_mod.current_voice_info)
     return {
@@ -274,6 +291,7 @@ async def _connections_payload() -> dict:
         },
         "ptt": PTT.status(),
         "listen": FOCUS.status(),
+        "ytm": await ytm_web.connection_status(),
     }
 
 

@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { jfetch, jpost } from '../lib/api';
 import { store, useApp } from '../store';
 import type { PttState } from '../store';
+import { isYtmConnected, ytmStatusLabel } from '../lib/ytm-connection';
+import type { YtmConnectionStatus } from '../lib/ytm-connection';
 
 interface ConnectionsPayload {
   llm: {
@@ -33,6 +35,7 @@ interface ConnectionsPayload {
   };
   ptt: PttState | null;
   listen: { active: boolean; reasons: string[]; prev_volume: number | null; restore_pending: boolean };
+  ytm: YtmConnectionStatus;
 }
 
 const LISTEN_HINT = 'sav zvuk na macOS-u se utiše na 0 dok snimaš i vraća posle 0.6 s';
@@ -40,11 +43,14 @@ const LISTEN_HINT = 'sav zvuk na macOS-u se utiše na 0 dok snimaš i vraća pos
 export default function ConnectionsTab() {
   const [data, setData] = useState<ConnectionsPayload | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [ytmBusy, setYtmBusy] = useState(false);
   const ptt = useApp((s) => s.ptt);
   const listenReasons = useApp((s) => s.listenReasons);
 
   useEffect(() => {
     void load();
+    const id = setInterval(() => void loadYtm(), 5000);
+    return () => clearInterval(id);
   }, []);
 
   useEffect(() => {
@@ -65,6 +71,27 @@ export default function ConnectionsTab() {
       if (c.ptt) store.set({ ptt: c.ptt });
     } catch (e) {
       setErr((e as Error).message);
+    }
+  }
+
+  async function loadYtm() {
+    try {
+      const ytm = await jfetch<YtmConnectionStatus>('/api/ytm/connection');
+      setData((current) => (current ? { ...current, ytm } : current));
+    } catch {
+      // The main connections request owns the visible error state.
+    }
+  }
+
+  async function connectYtm() {
+    setYtmBusy(true);
+    try {
+      const ytm = await jpost<YtmConnectionStatus>('/api/ytm/connect', {});
+      setData((current) => (current ? { ...current, ytm } : current));
+    } catch (e) {
+      store.addTool(`⚠ YouTube Music: ${(e as Error).message}`);
+    } finally {
+      setYtmBusy(false);
     }
   }
 
@@ -114,6 +141,29 @@ export default function ConnectionsTab() {
         <KV k="piper" v={`${data.tts.piper.voice}  ·  fallback say: ${data.tts.piper.say_voice || 'auto'} ${data.tts.piper.loaded ? '✓' : '○'}`} />
         <KV k="xtts" v={`${data.tts.xtts.model} (${data.tts.xtts.language}, gpu=${data.tts.xtts.use_gpu}) ${data.tts.xtts.loaded ? '✓' : '○'}`} />
         <KV k="active" v={`${data.tts.active.backend} / ${data.tts.active.voice}`} />
+      </ConnCard>
+
+      <ConnCard title="YouTube Music">
+        <KV k="status" v={ytmStatusLabel(data.ytm)} />
+        <KV k="stranica" v={data.ytm.page_ready ? '✓ spremna' : '○ nije spremna'} />
+        <KV k="pretraga" v={data.ytm.search_ready ? '✓ spremna' : '○ nije spremna'} />
+        <KV k="player" v={data.ytm.player_loaded ? '✓ učitan' : '○ nema učitane pesme'} />
+        {data.ytm.error && <p className="hint err">⚠ {data.ytm.error}</p>}
+        {data.ytm.state === 'NEEDS_LOGIN' && (
+          <p className="hint">Prijavi se direktno u otvorenom Google/YT Music prozoru. JARVIS ne prima niti čuva lozinku.</p>
+        )}
+        <div className="row">
+          <button
+            type="button"
+            className="primary"
+            disabled={ytmBusy || data.ytm.state === 'CONNECTING'}
+            onClick={() => void connectYtm()}
+          >
+            {isYtmConnected(data.ytm) || data.ytm.state === 'NEEDS_LOGIN'
+              ? 'Ponovo poveži YouTube Music'
+              : 'Poveži YouTube Music'}
+          </button>
+        </div>
       </ConnCard>
 
       <ConnCard title="Global Push-to-Talk">

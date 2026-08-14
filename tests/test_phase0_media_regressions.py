@@ -1,4 +1,4 @@
-"""Regression tests for desktop YTM transport verification."""
+"""Regression tests for YTM verification provenance and fallback policy."""
 
 from __future__ import annotations
 
@@ -9,192 +9,105 @@ import pytest
 from jarvis.agent import tools
 
 
-async def _true() -> bool:
-    return True
-
-
-async def _pid() -> int:
-    return 123
-
-
 @pytest.fixture(autouse=True)
 def _reset_mirrored_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tools._YTM_STATE, "_playing", None)
 
 
-async def test_next_does_not_send_unconditional_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
-    sent: list[int] = []
+@pytest.mark.parametrize("action", ["pause", "play", "next", "previous"])
+async def test_ytm_transport_uses_only_web_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    desktop_calls: list[str] = []
 
-    async def fake_post(pid: int, key_code: int) -> bool:
-        sent.append(key_code)
+    async def fake_control(requested: str) -> dict[str, object]:
+        assert requested == action
+        return {
+            "ok": False,
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "error": "YT Music is needs_login",
+        }
+
+    async def forbidden_desktop(*args, **kwargs) -> bool:  # noqa: ANN002, ANN003
+        desktop_calls.append(action)
         return True
 
-    monkeypatch.setattr(tools._ytm_web, "is_available", lambda: False)
-    monkeypatch.setattr(tools, "_ytm_app_installed", lambda: True)
-    monkeypatch.setattr(tools, "_ytm_is_running", _true)
-    monkeypatch.setattr(tools, "_ytm_pid", _pid)
-    monkeypatch.setattr(tools, "_ytm_post_keycode", fake_post)
-    states = iter(
-        [
-            {
-                "ok": True,
-                "playing": True,
-                "title": "Before",
-                "artist": "Artist",
-                "track_id": "a",
-                "source": "ytm_web",
-            },
-            {
-                "ok": True,
-                "playing": True,
-                "title": "After",
-                "artist": "Artist",
-                "track_id": "b",
-                "source": "ytm_web",
-            },
-        ]
-    )
+    monkeypatch.setattr(tools._ytm_web, "control", fake_control)
+    monkeypatch.setattr(tools, "_ytm_post_keycode", forbidden_desktop)
 
-    async def read_state() -> dict[str, object]:
-        return next(states)
+    result = await tools._ytm_send_transport(action)
 
-    monkeypatch.setattr(tools, "_ytm_read_transport_state", read_state)
-
-    result = await tools._ytm_send_transport("next")
-
-    assert result["ok"] is True
-    assert result["verified"] is True
-    assert result["delivered"] is True
-    assert result["track_changed"] is True
-    assert sent == [tools._YTM_KEY_CODES["next"]]
+    assert result["ok"] is False
+    assert result["adapter"] == "ytm_web"
+    assert result["delivered"] is False
+    assert desktop_calls == []
 
 
-async def test_previous_does_not_send_unconditional_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
-    sent: list[int] = []
+async def test_ytm_play_does_not_use_desktop_deeplink_when_web_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    desktop_calls: list[str] = []
 
-    async def fake_post(pid: int, key_code: int) -> bool:
-        sent.append(key_code)
+    async def fake_play_query(query: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "query": query,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "error": "YT Music is needs_login",
+        }
+
+    async def forbidden_open_url(url: str) -> bool:
+        desktop_calls.append(url)
         return True
 
-    monkeypatch.setattr(tools._ytm_web, "is_available", lambda: False)
-    monkeypatch.setattr(tools, "_ytm_app_installed", lambda: True)
-    monkeypatch.setattr(tools, "_ytm_is_running", _true)
-    monkeypatch.setattr(tools, "_ytm_pid", _pid)
-    monkeypatch.setattr(tools, "_ytm_post_keycode", fake_post)
-    states = iter(
-        [
-            {
-                "ok": True,
-                "playing": True,
-                "title": "Before",
-                "artist": "Artist",
-                "track_id": "a",
-                "source": "ytm_web",
-            },
-            {
-                "ok": True,
-                "playing": False,
-                "title": "After",
-                "artist": "Artist",
-                "track_id": "b",
-                "source": "ytm_web",
-            },
-        ]
-    )
+    monkeypatch.setattr(tools._ytm_web, "play_query", fake_play_query)
+    monkeypatch.setattr(tools, "_ytm_open_url", forbidden_open_url)
 
-    async def read_state() -> dict[str, object]:
-        return next(states)
+    result = json.loads(await tools.ytm_play({"query": "Vlado Georgiev"}))
 
-    monkeypatch.setattr(tools, "_ytm_read_transport_state", read_state)
-
-    result = await tools._ytm_send_transport("previous")
-
-    assert result["ok"] is True
-    assert result["verified"] is True
-    assert result["state"] is False
-    assert sent == [tools._YTM_KEY_CODES["previous"]]
+    assert result["ok"] is False
+    assert result["verified"] is False
+    assert result["adapter"] == "ytm_web"
+    assert desktop_calls == []
 
 
-async def test_delivery_without_state_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    sent: list[int] = []
+async def test_missing_loaded_player_does_not_fall_back_to_desktop_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    desktop_calls: list[str] = []
 
-    async def fake_post(pid: int, key_code: int) -> bool:
-        sent.append(key_code)
+    async def no_loaded_player(action: str) -> dict[str, object]:
+        return {
+            "ok": False,
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "error": "YT Music player has no loaded track",
+        }
+
+    async def forbidden_desktop(*args, **kwargs) -> bool:  # noqa: ANN002, ANN003
+        desktop_calls.append("desktop")
         return True
 
-    async def no_state() -> None:
-        return None
-
-    monkeypatch.setattr(tools._ytm_web, "is_available", lambda: False)
-    monkeypatch.setattr(tools, "_ytm_app_installed", lambda: True)
-    monkeypatch.setattr(tools, "_ytm_is_running", _true)
-    monkeypatch.setattr(tools, "_ytm_pid", _pid)
-    monkeypatch.setattr(tools, "_ytm_post_keycode", fake_post)
-    monkeypatch.setattr(tools, "_ytm_read_transport_state", no_state)
+    monkeypatch.setattr(tools._ytm_web, "control", no_loaded_player)
+    monkeypatch.setattr(tools, "_ytm_post_keycode", forbidden_desktop)
 
     result = await tools._ytm_send_transport("next")
 
     assert result["ok"] is False
-    assert result["delivered"] is True
-    assert result["verified"] is False
-    assert result["degraded"] is True
-    assert tools._YTM_STATE.is_playing() is None
-    assert sent == [tools._YTM_KEY_CODES["next"]]
-
-
-@pytest.mark.parametrize(
-    ("action", "before_playing", "after_playing"),
-    [("pause", True, False), ("play", False, True)],
-)
-async def test_pause_resume_remain_verified_transports(
-    monkeypatch: pytest.MonkeyPatch,
-    action: str,
-    before_playing: bool,
-    after_playing: bool,
-) -> None:
-    sent: list[int] = []
-
-    async def fake_post(pid: int, key_code: int) -> bool:
-        sent.append(key_code)
-        return True
-
-    states = iter(
-        [
-            {
-                "ok": True,
-                "playing": before_playing,
-                "title": "Song",
-                "artist": "Artist",
-                "track_id": "a",
-                "source": "ytm_web",
-            },
-            {
-                "ok": True,
-                "playing": after_playing,
-                "title": "Song",
-                "artist": "Artist",
-                "track_id": "a",
-                "source": "ytm_web",
-            },
-        ]
-    )
-
-    async def read_state() -> dict[str, object]:
-        return next(states)
-
-    monkeypatch.setattr(tools._ytm_web, "is_available", lambda: False)
-    monkeypatch.setattr(tools, "_ytm_app_installed", lambda: True)
-    monkeypatch.setattr(tools, "_ytm_is_running", _true)
-    monkeypatch.setattr(tools, "_ytm_pid", _pid)
-    monkeypatch.setattr(tools, "_ytm_post_keycode", fake_post)
-    monkeypatch.setattr(tools, "_ytm_read_transport_state", read_state)
-
-    result = await tools._ytm_send_transport(action)
-
-    assert result["ok"] is True
-    assert result["verified"] is True
-    assert result["state"] is after_playing
-    assert sent == [tools._YTM_KEY_CODES[action]]
+    assert result["delivered"] is False
+    assert "no loaded track" in result["error"]
+    assert desktop_calls == []
 
 
 async def test_transport_state_refuses_generic_nowplaying_fallback(
@@ -210,7 +123,7 @@ async def test_transport_state_refuses_generic_nowplaying_fallback(
         }
 
     monkeypatch.setattr(tools._ytm_web, "is_available", lambda: False)
-    monkeypatch.setattr(tools._np, "get_state", generic_state)
+    monkeypatch.setattr(tools._ytm_web, "get_state", generic_state)
 
     assert await tools._ytm_read_transport_state() is None
 
@@ -234,94 +147,25 @@ def test_generic_nowplaying_cannot_verify_ytm_transition() -> None:
     assert tools._ytm_verify_transport("next", before, after) == (False, "unavailable")
 
 
-@pytest.mark.parametrize("action", ["next", "previous"])
-async def test_unrelated_nowplaying_transition_does_not_verify_ytm_action(
-    monkeypatch: pytest.MonkeyPatch,
-    action: str,
-) -> None:
-    sent: list[int] = []
-
-    async def fake_post(pid: int, key_code: int) -> bool:
-        sent.append(key_code)
-        return True
-
-    states = iter(
-        [
-            {
-                "ok": True,
-                "playing": True,
-                "title": "Top Gun",
-                "artist": "Relja",
-                "source": "nowplaying",
-            },
-            {
-                "ok": True,
-                "playing": True,
-                "title": "Jarvis — lični AI asistent",
-                "artist": "JARVIS",
-                "source": "nowplaying",
-            },
-            {
-                "ok": True,
-                "playing": True,
-                "title": "Jarvis — lični AI asistent",
-                "artist": "JARVIS",
-                "source": "nowplaying",
-            },
-        ]
-    )
-
-    async def read_state() -> dict[str, object]:
-        return next(states)
-
-    monkeypatch.setattr(tools._ytm_web, "is_available", lambda: False)
-    monkeypatch.setattr(tools, "_ytm_app_installed", lambda: True)
-    monkeypatch.setattr(tools, "_ytm_is_running", _true)
-    monkeypatch.setattr(tools, "_ytm_pid", _pid)
-    monkeypatch.setattr(tools, "_ytm_post_keycode", fake_post)
-    monkeypatch.setattr(tools, "_ytm_read_transport_state", read_state)
-
-    result = await tools._ytm_send_transport(action)
-
-    assert result["ok"] is False
-    assert result["verified"] is False
-    assert result["degraded"] is True
-    assert result["track_changed"] is None
-    assert sent == [tools._YTM_KEY_CODES[action]]
-
-
-async def test_ytm_play_does_not_verify_existing_generic_playback_as_new_track(
+async def test_ytm_status_does_not_report_generic_audio_as_ytm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sent: list[int] = []
-
-    async def fake_read_state() -> dict[str, object]:
+    async def disconnected() -> dict[str, object]:
         return {
-            "ok": True,
-            "playing": True,
-            "title": "Top Gun",
-            "artist": "Relja",
-            "source": "nowplaying",
+            "state": "NEEDS_LOGIN",
+            "connected": False,
+            "needs_login": True,
+            "page_ready": True,
+            "search_ready": True,
+            "player_loaded": False,
+            "playing": None,
+            "error": None,
         }
 
-    async def fake_post(pid: int | None, key_code: int) -> bool:
-        sent.append(key_code)
-        return True
+    monkeypatch.setattr(tools._ytm_web, "connection_status", disconnected)
 
-    async def fake_search(query: str) -> str:
-        return "eW-X8mEvMRY"
-
-    monkeypatch.setattr(tools._ytm_web, "is_available", lambda: False)
-    monkeypatch.setattr(tools, "_ytm_app_installed", lambda: True)
-    monkeypatch.setattr(tools, "_ytm_ensure_running", _true)
-    monkeypatch.setattr(tools, "_search_ytm_video_id", fake_search)
-    monkeypatch.setattr(tools, "_ytm_open_url", lambda url: _true())
-    monkeypatch.setattr(tools, "_ytm_read_transport_state", fake_read_state)
-    monkeypatch.setattr(tools, "_ytm_post_keycode", fake_post)
-
-    result = json.loads(await tools.ytm_play({"query": "Vlado Georgiev"}))
+    result = json.loads(await tools.ytm_status({}))
 
     assert result["ok"] is False
-    assert result["verified"] is False
-    assert result["degraded"] is True
-    assert sent == []
+    assert result["source"] == "ytm_web"
+    assert "Jarvis" not in json.dumps(result, ensure_ascii=False)

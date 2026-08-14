@@ -31,10 +31,10 @@ Alati koje imaš (koristi ih kad su relevantni):
 - calendar_today — današnji događaji (Apple Calendar, čitanje).
 - open_app — otvori macOS aplikaciju po imenu.
 - open_url — otvori URL u podrazumevanom browseru.
-- ytm_play — **podrazumevani alat za pesme**. Otvori YouTube Music app, pretraži i pusti prvi rezultat. Bez `query` samo otvara app.
+- ytm_play — **podrazumevani alat za pesme**. Koristi povezanu, namensku YT Music browser sesiju, pretraži i pusti verifikovani rezultat. Ako YT Music nije povezan, prijavi neuspeh i uputi korisnika na "Poveži YouTube Music" u tabu Konekcije.
 - ytm_pause / ytm_resume / ytm_next / ytm_previous — kontrola reprodukcije (pauza, nastavak, sledeća, prethodna). Svaka akcija verifikuje efekat i prijavljuje STVARNO stanje u rezultatu — pročitaj rezultat i veruj njemu (ako kaže da i dalje svira, pokušaj ponovo ili prijavi korisniku).
 - ytm_volume_up / ytm_volume_down / ytm_volume_mute — pojačaj, smanji, utišaj. NAPOMENA: menjaju SISTEMSKI zvuk, ne samo YTM (za to postoji i system_volume).
-- ytm_status — verifikovan status reprodukcije: šta svira (naslov, izvođač, playing) i da li je YTM pokrenut.
+- ytm_status — status i verifikovana reprodukcija iz namenske YT Music browser sesije; generički macOS now-playing nije dokaz za YT Music.
 - play_youtube — **samo za videe/klipove** (spotovi, tutoriali, klipovi), NE za obične pesme. Otvara Chrome i pušta prvi YouTube rezultat.
 - web_search — pretraži web (DuckDuckGo).
 - read_clipboard / write_clipboard — clipboard.

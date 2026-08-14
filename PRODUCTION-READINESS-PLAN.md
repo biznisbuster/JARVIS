@@ -478,6 +478,18 @@ YT Music related tool tests
 - [x] Make `tool_done` reflect structured tool result status when available.
 - [x] Preserve current working play/pause behavior while strengthening
       verification.
+- [x] Add explicit per-device YT Music connection states separate from page,
+      search and player readiness.
+- [x] Add a headed persistent-profile Connect YT Music flow with safe backend
+      status APIs and frontend backend-truth display.
+- [x] Allow connected/search-ready pages without a loaded player to start the
+      first `ytm_play` request.
+- [x] Route normal YT Music play/pause/resume/next/previous through the same
+      dedicated web session and remove desktop deep-link fallback from the
+      normal playback path.
+- [x] Select a playable YT Music watch result and verify the resulting DOM
+      player state.
+- [ ] Complete real macOS/YT Music connection and audible playback validation.
 
 ## Suggested verification semantics
 
@@ -685,12 +697,123 @@ NO — manual Phase 1 validation failed. The corrected branch requires a new
 real macOS/YT Music validation pass before merge. Phase 2 has not been
 started.
 
+## Phase 1 correction update (2026-08-14)
+
+### Root cause
+
+The first Phase 1 correction correctly rejected generic now-playing evidence,
+but it still had no usable per-device authentication flow. The web adapter
+used a single player-bar readiness gate, so a connected YT Music home page
+with no current track was treated as unavailable. `ytm_play` then fell back to
+desktop deep links/keystrokes, which could reopen the installed web app and
+could not reliably produce audible, verifiable playback.
+
+### Completed
+
+- Added explicit `DISCONNECTED`, `NEEDS_LOGIN`, `CONNECTING`, `CONNECTED` and
+  `ERROR` states with separate page, search, player and playing state.
+- Added headed persistent-profile connection flow using the per-device
+  `~/.jarvis/ytm_profile` profile; Google authentication remains entirely in
+  the visible Google/YT Music page.
+- Added `GET /api/ytm/connection`, `POST /api/ytm/connect` and a minimal
+  Connections-tab card driven by backend status.
+- Separated page/search readiness from player readiness so first play can start
+  from an authenticated page with no loaded track.
+- Made the dedicated YTM browser the only normal play/transport path and
+  removed desktop deep-link/Quartz fallback from those actions.
+- Restricted status and verification evidence to the dedicated YTM DOM; the
+  generic macOS now-playing stream cannot provide YTM success evidence.
+- Selects a watch/video identity from YTM search results and verifies the
+  resulting player state, including a second different play request.
+- Added clean browser shutdown while retaining the local persistent profile
+  for restart.
+- Updated the Phase 2 handoff so `MediaService` must consume this connected
+  browser adapter rather than recreate authentication.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/tools.py`
+- `jarvis/agent/prompts.py`
+- `jarvis/app.py`
+- `web-ui/src/components/ConnectionsTab.tsx`
+- `web-ui/src/lib/ytm-connection.ts`
+- `tests/test_ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `tests/test_ytm_connection_api.py`
+- `web-ui/src/lib/ytm-connection.test.ts`
+- `README.md`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added disconnected/login-required/connected-without-player/expired-session
+  connection state coverage.
+- Added headed launch, first play from an empty player, second different play,
+  player-required transport, DOM pause/resume, launch-error and no-desktop-
+  fallback coverage, plus playable-result metadata coverage.
+- Added API and frontend regressions proving backend confirmation is required
+  before the UI shows Connected.
+- Reworked the previous desktop-fallback regressions to prove normal YTM
+  actions do not call the deep-link or desktop transport path.
+
+### Validation
+
+- `./.venv/bin/pytest tests/test_ytm_web.py tests/test_phase0_media_regressions.py tests/test_ytm_connection_api.py tests/test_nowplaying.py tests/test_loop_tool_events.py -q` -> PASS (`48 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`132 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
+- `./.venv/bin/ruff check jarvis/media/ytm_web.py jarvis/agent/tools.py jarvis/app.py jarvis/agent/prompts.py tests/test_ytm_web.py tests/test_phase0_media_regressions.py tests/test_ytm_connection_api.py` -> PASS
+- `./.venv/bin/ruff check .` -> FAIL (3 pre-existing findings in `jarvis/audio/focus.py`, `jarvis/log.py` and `tests/test_web_ui_7b.py`)
+- `./.venv/bin/ruff format --check .` -> FAIL (6 pre-existing formatting findings; changed YTM/connection test files are formatted)
+- `git diff --check` -> PASS
+- `cd web-ui && npm run typecheck` -> PASS
+- `cd web-ui && npm run test` -> PASS (3 tests)
+- `cd web-ui && npm run build` -> PASS
+- `curl -sS http://127.0.0.1:7777/api/ytm/connection` -> PASS runtime smoke; current real profile reports `NEEDS_LOGIN`, `page_ready=true`, `search_ready=true`, `player_loaded=false`
+
+### Manual validation still required
+
+No real Google login or audible playback has been claimed. In the open headed
+YT Music window, click **Poveži YouTube Music** if needed, log in directly on
+Google, then validate: play artist/song A; play different artist/song B while
+A is active; pause; resume; next five times; previous three times; play a
+specific different song; restart JARVIS and confirm the profile reconnects.
+Confirm every successful tool result reports `adapter=ytm_web` and
+`verified=true`, and confirm audio is audible from the same browser session.
+
+### New issues discovered
+
+- No additional out-of-scope issue was found. Real browser DOM/audio behavior
+  remains the required manual checkpoint.
+
+### Remaining risks
+
+- Authentication/account selectors and YT Music DOM control selectors need
+  confirmation against the user's logged-in account.
+- Browser autoplay/audio policy and macOS Accessibility permissions may still
+  affect real playback or unrelated PTT functionality.
+- Full Ruff and format checks remain red on unrelated pre-existing files.
+- Phase 2 MediaService has not started.
+
+### Ready for next phase
+
+NO — automated validation passes, but real connection/authentication and
+audible YT Music manual validation are still required. Do not merge and do not
+start Phase 2.
+
 ---
 
 # 5. Phase 2 — Introduce authoritative MediaService
 
 **Priority:** P0/P1  
 **Goal:** remove competing media truths.
+
+### Phase 1 handoff constraint
+
+Phase 1 now provides a per-device authenticated, persistent `ytm_web` browser
+adapter and connection status. When Phase 2 introduces `MediaService`, its
+authoritative YT Music adapter must consume this existing connected browser
+session and authentication flow; it must not recreate login, copy cookies or
+reintroduce the desktop deep-link path.
 
 ## Target files
 

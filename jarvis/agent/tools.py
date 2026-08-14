@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any
 
 from .. import state as runtime_state
-from ..media import nowplaying as _np
 from ..media import ytm_web as _ytm_web
 from .kilo_bridge import run_kilo
 
@@ -836,16 +835,6 @@ _YTM_KEY_LINE_FOR_CODE = {
 }
 
 
-async def _ytm_keystroke_fallback(action: str) -> bool:
-    key = _YTM_KEY_FOR_ACTION.get(action)
-    if not key:
-        return False
-    return await _ytm_send_keys_quiet([(key, 0.0)])
-
-
-_np.register_keystroke_fallback(_ytm_keystroke_fallback)
-
-
 def _ytm_unavailable() -> str:
     return json.dumps({"ok": False, "error": f"'{_YTM_APP_NAME}' app not installed"})
 
@@ -901,195 +890,39 @@ async def _search_ytm_video_id(query: str) -> str | None:
 
 
 async def ytm_play(args: dict[str, Any]) -> str:
-    """Pusti pesmu u YT Music.
-
-    Primarni put je **ytm_web** (persistent Chrome tab na
-    music.youtube.com). Pretraži, klikni prvi rezultat, sačekaj
-    da player krene. Reprodukuje se u našem browser tabu, NE
-    aktivira YTM desktop — nema leave page dialog, nema sandbox
-    problema, nema key guessing. YTM desktop automatski pauzira
-    jer Google dozvoljava samo jednog aktivnog igrača po nalogu
-    (Spotify Connect model).
-
-    Ako ytm_web nije spreman (browser još nije podignut), pada
-    na Quartz fallback ka YTM desktop app-u.
-    """
+    """Play a query in the authenticated, dedicated YTM browser session."""
     query = (args.get("query") or "").strip()
 
     if not query:
-        if _ytm_web.is_available():
-            return json.dumps(
-                {"ok": True, "action": "opened", "app": "ytm_web"},
-                ensure_ascii=False,
-            )
-        if not _ytm_app_installed():
-            return _ytm_unavailable()
-        ok = await _ytm_ensure_running()
-        _YTM_STATE.mark_unknown()
-        return json.dumps(
-            {"ok": ok, "action": "opened", "app": _YTM_APP_NAME},
-            ensure_ascii=False,
-        )
+        status = await _ytm_web.connection_status()
+        result = {
+            **status,
+            "ok": bool(status.get("connected")),
+            "action": "opened" if status.get("connected") else "connect",
+            "adapter": "ytm_web",
+            "error": None if status.get("connected") else "YouTube Music connection is required",
+        }
+        return _ytm_play_result("ytm_web", result)
 
     log.info("ytm_play: query=%r", query)
-
-    if _ytm_web.is_available():
+    try:
         result = await _ytm_web.play_query(query)
-        log.info(
-            "ytm_play: path=ytm_web adapter=ytm_web result=%s",
-            json.dumps(result, ensure_ascii=False, default=str),
-        )
-        state = result.get("state") or {}
-        if result.get("ok") and state.get("ok") is True and state.get("playing") is True:
-            _YTM_STATE.mark_playing()
-            return _ytm_play_result(
-                "ytm_web",
-                {
-                    "ok": True,
-                    "query": query,
-                    "method": "ytm_web",
-                    "adapter": "ytm_web",
-                    "action": "play",
-                    "delivered": True,
-                    "verified": True,
-                    "verification": "verified",
-                    "degraded": False,
-                    "note": "YTM desktop će se pauzirati jer Google dozvoljava samo jednog aktivnog igrača po nalogu (Spotify Connect).",
-                    "state": {
-                        "playing": state.get("playing"),
-                        "title": state.get("title", ""),
-                        "artist": state.get("artist", ""),
-                        "track_id": state.get("track_id") or state.get("trackId", ""),
-                    },
-                },
-            )
-        log.warning(
-            "ytm_play: web failed; falling back to desktop YT Music result=%s",
-            json.dumps(result, ensure_ascii=False, default=str),
-        )
-
-    if not _ytm_app_installed():
-        return json.dumps(
-            {"ok": False, "error": "ytm_web not ready and YT Music app not installed",
-             "query": query},
-            ensure_ascii=False,
-        )
-
-    scrape_task = asyncio.create_task(_search_ytm_video_id(query))
-    ensure_task = asyncio.create_task(_ytm_ensure_running())
-    video_id = await scrape_task
-    ytm_ok = await ensure_task
-    log.info("ytm_play(fallback): video_id=%s ytm_ok=%s", video_id, ytm_ok)
-
-    if not ytm_ok:
-        return json.dumps({"ok": False, "error": "YT Music could not start", "query": query})
-
-    if video_id:
-        watch_url = f"https://music.youtube.com/watch?v={video_id}"
-        if await _ytm_open_url(watch_url):
-            await asyncio.sleep(1.6)
-            after = await _ytm_read_transport_state()
-            track_id = str((after or {}).get("track_id") or (after or {}).get("trackId") or "").strip()
-            verified = _ytm_state_is_specific(after) and after.get("playing") is True and track_id == video_id
-            verification = (
-                "verified" if verified else "unavailable" if not _ytm_state_is_specific(after) else "failed"
-            )
-            if verified:
-                _ytm_update_mirrored_state(after)
-            else:
-                _YTM_STATE.mark_unknown()
-            return _ytm_play_result(
-                "desktop_video_id",
-                {
-                    "ok": verified,
-                    "query": query,
-                    "video_id": video_id,
-                    "method": "video_id+ytm_state" if verified else "video_id",
-                    "adapter": "ytm_desktop",
-                    "action": "play",
-                    "delivered": True,
-                    "verified": verified,
-                    "verification": verification,
-                    "degraded": not verified and verification == "unavailable",
-                    "after": after,
-                    "state": after,
-                    "expected_state": "playing",
-                    "expected_video_id": video_id,
-                    **({} if verified else {"error": "requested YT Music track could not be verified"}),
-                },
-            )
-
-    q = _ytm_escape(query)
-    search_steps = [
-        ('keystroke "/"', 0.4),
-        ('keystroke "a" using {command down}', 0.2),
-        ("key code 51", 0.2),
-        (f'keystroke "{q}"', 0.4),
-        ("key code 36", 1.2),
-    ]
-    await _ytm_activate()
-    rc, _, err = await _ytm_send_keystrokes(search_steps)
-    if rc != 0:
-        return json.dumps(
-            {
-                "ok": False,
-                "query": query,
-                "method": "search",
-                "delivered": False,
-                "verified": False,
-                "error": err or "could not search YT Music",
-            },
-            ensure_ascii=False,
-        )
-
-    click_script = (
-        'tell application "System Events"\n'
-        '  tell process "Web App"\n'
-        "    if not (exists window 1) then\n"
-        '      return "no window"\n'
-        "    end if\n"
-        "    set wp to position of window 1\n"
-        "    set ws to size of window 1\n"
-        "    set wx to (item 1 of wp) as integer\n"
-        "    set wy to (item 2 of wp) as integer\n"
-        "    set ww to (item 1 of ws) as integer\n"
-        "    set wh to (item 2 of ws) as integer\n"
-        "    click at {wx + (ww div 4), wy + (wh * 3 div 10)}\n"
-        "  end tell\n"
-        "end tell"
-    )
-    rc, _, err = await _osascript(click_script, timeout=10)
-    if rc != 0:
-        log.warning("ytm_play(fallback): click failed: %s", err)
-        return json.dumps(
-            {"ok": False, "error": err or "could not click first song", "query": query},
-            ensure_ascii=False,
-        )
-
-    await asyncio.sleep(0.45)
-    after = await _ytm_read_transport_state()
-    verified, verification = _ytm_verify_transport("play", None, after)
-    if verified:
-        _ytm_update_mirrored_state(after)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "query": query,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "error": str(exc),
+        }
+    state = result.get("state") or result.get("after")
+    if result.get("verified"):
+        _ytm_update_mirrored_state(state)
     else:
         _YTM_STATE.mark_unknown()
-    return json.dumps(
-        {
-            "ok": verified,
-            "query": query,
-            "method": "click",
-            "action": "play",
-            "delivered": True,
-            "verified": verified,
-            "verification": verification,
-            "degraded": not verified and verification == "unavailable",
-            "after": after,
-            "state": after,
-            "expected_state": "playing",
-            **({} if verified else {"error": "playback state did not reach playing"}),
-        },
-        ensure_ascii=False,
-    )
+    return _ytm_play_result("ytm_web", {"query": query, **result, "adapter": "ytm_web"})
 
 
 async def _ytm_read_state_via_dom() -> dict[str, Any] | None:
@@ -1188,155 +1021,32 @@ async def _ytm_post_keycode(pid: int | None, key_code: int) -> bool:
 
 
 async def _ytm_send_transport(action: str) -> dict[str, Any]:
-    """Pošalji transport komandu (pause/play/next/previous) u YTM.
-
-    Primarni put je ytm_web (DOM click) — pouzdano, bez fokusiranja
-    YTM desktop app-a, bez sandbox problema. Ako browser nije spreman,
-    pada na Quartz ka YTM desktop.
-    """
+    """Send and verify transport only through the connected YTM DOM session."""
     if action not in _YTM_KEY_CODES:
         return {"ok": False, "error": f"unknown action: {action}"}
 
-    if _ytm_web.is_available():
-        try:
-            result = await _ytm_web.control(action)
-            log.info(
-                "ytm transport %s → web: result=%s",
-                action,
-                json.dumps(result, ensure_ascii=False, default=str),
-            )
-            if result.get("ok") or result.get("delivered"):
-                if result.get("verified"):
-                    _ytm_update_mirrored_state(result.get("after") or result.get("state"))
-                else:
-                    _YTM_STATE.mark_unknown()
-                return {**result, "adapter": result.get("adapter", "ytm_web")}
-        except Exception as exc:
-            log.warning("ytm transport %s: web failed (%s)", action, exc)
-
-    if not _ytm_app_installed():
-        return {
+    try:
+        result = await _ytm_web.control(action)
+    except Exception as exc:
+        result = {
             "ok": False,
             "action": action,
-            "adapter": "ytm_desktop",
+            "adapter": "ytm_web",
             "delivered": False,
             "verified": False,
             "verification": "not_attempted",
-            "error": "ytm_web not ready and YT Music app not installed",
+            "error": str(exc),
         }
-    if not await _ytm_is_running():
-        if not await _ytm_ensure_running():
-            return {
-                "ok": False,
-                "action": action,
-                "adapter": "ytm_desktop",
-                "delivered": False,
-                "verified": False,
-                "verification": "not_attempted",
-                "error": "YT Music not running and could not start",
-            }
-
-    before = await _ytm_read_transport_state()
-    desired_playing = {"pause": False, "play": True}.get(action)
-    if (
-        desired_playing is not None
-        and _ytm_state_is_specific(before)
-        and before.get("playing") is desired_playing
-    ):
-        _ytm_update_mirrored_state(before)
-        return {
-            "ok": True,
-            "action": action,
-            "method": "state_read",
-            "adapter": "ytm_desktop",
-            "delivered": False,
-            "verified": True,
-            "verification": "verified",
-            "degraded": False,
-            "state": desired_playing,
-            "before": before,
-            "after": before,
-            "ytm_running": True,
-        }
-
-    pid = await _ytm_pid()
-    log.info("ytm transport %s (quartz fallback): before=%s pid=%s", action, before, pid)
-
-    sent = await _ytm_post_keycode(pid, _YTM_KEY_CODES[action])
-    if not sent:
-        _YTM_STATE.mark_unknown()
-        return {
-            "ok": False,
-            "action": action,
-            "method": "quartz_or_as",
-            "adapter": "ytm_desktop",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "degraded": False,
-            "state": None,
-            "before": before,
-            "after": None,
-            "ytm_running": True,
-            "error": "YT Music command was not delivered",
-        }
-
-    await asyncio.sleep(0.45)
-    after = await _ytm_read_transport_state()
-    verified, verification = _ytm_verify_transport(action, before, after)
-    if not verified and action in ("next", "previous"):
-        await asyncio.sleep(0.5)
-        after = await _ytm_read_transport_state()
-        verified, verification = _ytm_verify_transport(action, before, after)
-
-    if verified:
-        _ytm_update_mirrored_state(after)
-    else:
-        _YTM_STATE.mark_unknown()
-
-    track_changed = None
-    if action in ("next", "previous"):
-        before_identity = _ytm_track_identity(before)
-        after_identity = _ytm_track_identity(after)
-        track_changed = (
-            before_identity != after_identity
-            if _ytm_state_is_specific(before)
-            and _ytm_state_is_specific(after)
-            and before_identity is not None
-            and after_identity is not None
-            else None
-        )
-
-    result = {
-        "ok": verified,
-        "action": action,
-        "method": "quartz_or_as",
-        "adapter": "ytm_desktop",
-        "delivered": True,
-        "verified": verified,
-        "verification": verification,
-        "degraded": not verified and verification == "unavailable",
-        "ytm_running": True,
-        "state": after.get("playing") if isinstance(after, dict) else None,
-        "before": before,
-        "after": after,
-    }
-    if action in ("next", "previous"):
-        result["track_changed"] = track_changed
-    if not verified:
-        result["error"] = (
-            "track transition could not be verified"
-            if action in ("next", "previous") and verification == "unavailable"
-            else "track did not change"
-            if action in ("next", "previous")
-            else f"playback state did not reach {'playing' if action == 'play' else 'paused'}"
-        )
     log.info(
-        "ytm transport %s → desktop result=%s",
+        "ytm transport %s → web result=%s",
         action,
         json.dumps(result, ensure_ascii=False, default=str),
     )
-    return result
+    if result.get("verified"):
+        _ytm_update_mirrored_state(result.get("after") or result.get("state"))
+    else:
+        _YTM_STATE.mark_unknown()
+    return {**result, "adapter": result.get("adapter", "ytm_web")}
 
 
 async def ytm_pause(args: dict[str, Any]) -> str:
@@ -1389,108 +1099,47 @@ async def ytm_volume_mute(args: dict[str, Any]) -> str:
 
 
 async def ytm_status(args: dict[str, Any]) -> str:
-    """Status YTM reprodukcije. Primarni izvor je ytm_web (čita
-    ``video.paused`` + DOM direktno — stvarno stanje). Fallback: naslov
-    prozora YTM desktop app + mirrored state. MediaRemote/nowplaying-cli
-    NE rade za YTM (Safari Web App), pa se ne oslanjamo na njih."""
-    web_state = await _ytm_read_state_via_dom()
-    if web_state is not None and web_state.get("ok"):
-        playing = web_state.get("playing")
-        if playing is True:
-            _YTM_STATE.mark_playing()
-        elif playing is False:
-            _YTM_STATE.mark_paused()
+    """Return only dedicated YTM connection and DOM player state."""
+    status = await _ytm_web.connection_status()
+    if not status.get("connected"):
         return json.dumps(
             {
-                "ok": True,
+                "ok": False,
                 "source": "ytm_web",
-                "playing": playing,
-                "title": web_state.get("title", ""),
-                "artist": web_state.get("artist", ""),
-                "currentTime": web_state.get("currentTime", 0),
-                "duration": web_state.get("duration", 0),
-                "tracked_state": (
-                    "playing" if _YTM_STATE.is_playing() is True
-                    else "paused" if _YTM_STATE.is_playing() is False
-                    else "unknown"
-                ),
+                **status,
+                "error": status.get("error") or "YouTube Music is not connected",
             },
             ensure_ascii=False,
         )
 
-    bid = await _ytm_bundle_id()
-    ytm_running = await _ytm_is_running()
-    window_title = ""
-    title = ""
-    artist = ""
-    if bid:
-        script = (
-            'tell application "System Events"\n'
-            f'  set procList to (every process whose bundle identifier is "{bid}")\n'
-            "  if (count of procList) = 0 then\n"
-            '    return "no_window"\n'
-            "  end if\n"
-            "  set p to item 1 of procList\n"
-            "  if (count of windows of p) = 0 then\n"
-            '    return "no_window"\n'
-            "  end if\n"
-            "  set w to front window of p\n"
-            "  set wname to name of w\n"
-            "  set out to wname\n"
-            "  try\n"
-            '    set desc to (entire contents of w as string)\n'
-            "  end try\n"
-            "  return out\n"
-            "end tell"
+    web_state = await _ytm_web.get_state()
+    if not web_state.get("ok"):
+        return json.dumps(
+            {
+                "ok": False,
+                "source": "ytm_web",
+                **status,
+                "error": web_state.get("error") or "YT Music state is unavailable",
+            },
+            ensure_ascii=False,
         )
-        rc, out, _ = await _osascript(script, timeout=5)
-        if rc == 0 and out.strip() and out.strip() != "no_window":
-            window_title = out.strip()
-            log.debug("ytm_status: window title=%r", window_title)
 
-    st = await _np.get_state()
-    sys_title = st.get("title", "")
-    sys_artist = st.get("artist", "")
-    sys_playing = st.get("playing")
-    if window_title:
-        cleaned = (
-            window_title
-            .replace(" · YT Music", "")
-            .replace(" | YT Music", "")
-            .replace(" | YouTube Music", "")
-            .replace(" - YouTube Music", "")
-            .replace("YouTube Music", "")
-            .strip(" |·-")
-        )
-        for sep in (" - ", " | "):
-            if sep in cleaned:
-                title, artist = cleaned.split(sep, 1)
-                break
-        if not title and cleaned:
-            title = cleaned
-    if not title:
-        title = sys_title
-    if not artist:
-        artist = sys_artist
-
+    playing = web_state.get("playing")
+    if playing is True:
+        _YTM_STATE.mark_playing()
+    elif playing is False:
+        _YTM_STATE.mark_paused()
     return json.dumps(
         {
             "ok": True,
-            "source": "ytm_window+np",
-            "ytm_running": ytm_running,
-            "ytm_window_title": window_title,
-            "tracked_state": (
-                "playing" if _YTM_STATE.is_playing() is True
-                else "paused" if _YTM_STATE.is_playing() is False
-                else "unknown"
-            ),
-            "playing": sys_playing if sys_playing is not None else ytm_running,
-            "title": title,
-            "artist": artist,
-            "note": (
-                "ytm_web unavailable — čitam naslov YTM prozora + mirrored state. "
-                "playing može biti nepouzdano jer MediaRemote ne vidi Safari Web App."
-            ),
+            "source": "ytm_web",
+            **status,
+            "playing": playing,
+            "title": web_state.get("title", ""),
+            "artist": web_state.get("artist", ""),
+            "track_id": web_state.get("track_id", ""),
+            "currentTime": web_state.get("currentTime", 0),
+            "duration": web_state.get("duration", 0),
         },
         ensure_ascii=False,
     )
@@ -1672,11 +1321,15 @@ def build_registry() -> list[ToolDef]:
         ),
         ToolDef(
             "ytm_play",
-            "Otvori YouTube Music app, pretraži i pusti prvi rezultat. Ako nema `query`, samo otvara app.",
+            "Pretraži i pusti verifikovani rezultat u povezanoj namenskoj YT Music browser sesiji. Ako nije povezana, vrati zahtev za prijavu.",
             _schema(
                 "ytm_play",
                 "YouTube Music reprodukcija. Podrazumevani izbor kad korisnik traži pesmu.",
-                {"query": _str_prop("Naziv pesme / izvođača (opciono — bez toga samo otvara app).")},
+                {
+                    "query": _str_prop(
+                        "Naziv pesme / izvođača (opciono — bez toga samo proverava/povezuje YT Music)."
+                    )
+                },
                 [],
             ),
             ytm_play,
@@ -1725,7 +1378,7 @@ def build_registry() -> list[ToolDef]:
         ),
         ToolDef(
             "ytm_status",
-            "Šta trenutno svira (verifikovano: naslov, izvođač, playing) i da li je YT Music pokrenut.",
+            "Prikaži samo stanje iz namenske YT Music browser sesije; generički macOS now-playing nije dokaz.",
             _schema("ytm_status", "Status reprodukcije.", {}, []),
             ytm_status,
         ),
