@@ -22,3 +22,9 @@ export function ytmStatusLabel(status: YtmConnectionStatus): string {
   if (status.state === 'ERROR') return 'Greška';
   return 'Nije povezan';
 }
+
+export function ytmConnectLabel(status: YtmConnectionStatus): string {
+  if (isYtmConnected(status)) return 'Ponovo poveži YouTube Music';
+  if (status.state === 'NEEDS_LOGIN') return 'Otvori YouTube Music prijavu';
+  return 'Poveži YouTube Music';
+}

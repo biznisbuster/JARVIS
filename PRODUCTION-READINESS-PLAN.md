@@ -489,6 +489,10 @@ YT Music related tool tests
       normal playback path.
 - [x] Select a playable YT Music watch result and verify the resulting DOM
       player state.
+- [x] Explicit Connect brings the existing dedicated headed YT Music page to
+      the front without launching a duplicate persistent browser.
+- [x] Do not auto-restore a profile directory until a prior authenticated
+      YT Music connection has been observed.
 - [ ] Complete real macOS/YT Music connection and audible playback validation.
 
 ## Suggested verification semantics
@@ -799,6 +803,89 @@ Confirm every successful tool result reports `adapter=ytm_web` and
 NO — automated validation passes, but real connection/authentication and
 audible YT Music manual validation are still required. Do not merge and do not
 start Phase 2.
+
+## Phase 1 connection presentation correction (2026-08-14)
+
+### Root cause
+
+When the server already had a live headed Playwright page in
+`~/.jarvis/ytm_profile`, `POST /api/ytm/connect` reused it and navigated to
+YT Music but never brought that page to the front. The endpoint returned the
+same `NEEDS_LOGIN` state, while the Connections card had no inline action
+feedback, so the user could not see where to authenticate. Startup also
+treated the existence of the profile directory as proof that the profile had
+previously been authenticated, so an incomplete profile was launched again on
+every restart.
+
+### Completed
+
+- Explicit `connect()` now calls Playwright `Page.bring_to_front()` on the
+  existing dedicated page before navigation and does not create a duplicate
+  persistent context.
+- Added a local `.connected` marker written only after backend probe evidence
+  establishes `CONNECTED`; `warm_up()` and implicit readiness restoration now
+  require that marker.
+- Added immediate inline Connections-card feedback for opening/login errors
+  and login progress, while preserving backend-confirmed `CONNECTED` truth.
+- Changed the `NEEDS_LOGIN` button label to **Otvori YouTube Music prijavu**.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `web-ui/src/components/ConnectionsTab.tsx`
+- `web-ui/src/lib/ytm-connection.ts`
+- `tests/test_ytm_web.py`
+- `web-ui/src/lib/ytm-connection.test.ts`
+- `README.md`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added a regression proving an existing `NEEDS_LOGIN` page is brought to the
+  front exactly once and no second persistent context is launched.
+- Added coverage proving an unconnected profile directory is not warmed up
+  automatically.
+- Added frontend pure-state coverage for the explicit login button label.
+
+### Validation
+
+- Targeted connection/YTM backend tests -> PASS (`40 passed`)
+- Targeted Ruff for changed Python files -> PASS
+- Frontend typecheck -> PASS
+- Frontend tests -> PASS (`3 tests`)
+- Frontend build -> PASS
+- Full backend suite -> PASS (`135 passed, 3 xfailed`; known Phase 3 local-model regressions)
+- Changed Python format check -> PASS
+- Full Ruff -> FAIL on 3 pre-existing findings in `jarvis/audio/focus.py`,
+  `jarvis/log.py` and `tests/test_web_ui_7b.py`
+- Full format check -> FAIL on 6 pre-existing files/findings; changed YTM
+  files remain formatted
+- `git diff --check` -> PASS
+
+### Manual validation still required
+
+After restart, open the Connections tab and click **Otvori YouTube Music
+prijavu**. The existing/new dedicated headed browser must become visible. Log
+in directly through Google/YT Music, wait for backend `CONNECTED`, then run
+the full Phase 1 playback sequence and restart JARVIS to verify persistence.
+
+### New issues discovered
+
+- No additional issue beyond the connection-presentation bug recorded in
+  Appendix A.
+
+### Remaining risks
+
+- macOS window-manager behavior may still vary; `bring_to_front()` is scoped
+  to the dedicated Playwright page and does not activate unrelated Chrome
+  profiles.
+- Real Google login, audible playback and YT Music DOM controls remain
+  unvalidated until the user repeats the manual sequence.
+
+### Ready for next phase
+
+NO — the correction is ready for a new manual validation attempt, but Phase 1
+is not complete and Phase 2 must not start.
 
 ---
 
@@ -1669,6 +1756,28 @@ Phase 10 — CI and quality gates, with dependency remediation as a separate
 focused change.
 
 **Blocks current phase:** no
+
+## [P1] Explicit YT Music connect did not present the existing login page
+
+**Found in phase:** 1
+**Files:** `jarvis/media/ytm_web.py`, `web-ui/src/components/ConnectionsTab.tsx`
+
+**Symptom:**
+With a live dedicated headed YT Music page in `NEEDS_LOGIN`, clicking the
+connection button returned `NEEDS_LOGIN` but did not visibly present the page
+or provide inline feedback explaining where to log in.
+
+**Root cause:**
+`connect()` reused the live runtime and navigated it without calling
+`Page.bring_to_front()`. The frontend displayed the same status after the
+request and only surfaced request exceptions through the global tool log.
+Profile-directory existence also caused incomplete profiles to warm up on
+every restart.
+
+**Recommended phase:**
+Phase 1 — fixed in the connection presentation correction.
+
+**Blocks current phase:** yes — resolved in code; manual retest required.
 
 ---
 

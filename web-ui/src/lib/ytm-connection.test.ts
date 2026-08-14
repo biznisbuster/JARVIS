@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isYtmConnected, ytmStatusLabel } from './ytm-connection';
+import { isYtmConnected, ytmConnectLabel, ytmStatusLabel } from './ytm-connection';
 import type { YtmConnectionStatus } from './ytm-connection';
 
 const base: YtmConnectionStatus = {
@@ -22,6 +22,7 @@ describe('YouTube Music connection UI state', () => {
     expect(ytmStatusLabel(connecting)).toBe('Povezivanje…');
     expect(isYtmConnected(loginRequired)).toBe(false);
     expect(ytmStatusLabel(loginRequired)).toBe('Potrebna prijava');
+    expect(ytmConnectLabel(loginRequired)).toBe('Otvori YouTube Music prijavu');
   });
 
   it('shows connected only for a confirmed connected response', () => {
@@ -35,5 +36,6 @@ describe('YouTube Music connection UI state', () => {
 
     expect(isYtmConnected(connected)).toBe(true);
     expect(ytmStatusLabel(connected)).toBe('Povezan');
+    expect(ytmConnectLabel(connected)).toBe('Ponovo poveži YouTube Music');
   });
 });

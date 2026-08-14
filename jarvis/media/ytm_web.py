@@ -88,8 +88,21 @@ def _runtime_alive() -> bool:
     return _browser is None or _safe_is_connected(_browser)
 
 
-def _profile_exists() -> bool:
-    return _JARVIS_PROFILE_DIR.is_dir()
+def _connection_marker_path() -> Path:
+    return _JARVIS_PROFILE_DIR / ".connected"
+
+
+def _profile_is_connected() -> bool:
+    return _connection_marker_path().is_file()
+
+
+def _mark_profile_connected() -> None:
+    try:
+        marker = _connection_marker_path()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+    except OSError as exc:
+        log.warning("ytm_web: could not persist connection marker: %s", exc)
 
 
 def _clear_runtime_state() -> None:
@@ -259,6 +272,7 @@ def _set_connection_from_probe(probe: dict[str, Any] | None) -> None:
     if probe.get("authenticated") and probe.get("page_ready") and probe.get("search_ready"):
         _connection_state = CONNECTED
         _connection_error = None
+        _mark_profile_connected()
         return
     if probe.get("login_required") or not probe.get("authenticated"):
         _connection_state = NEEDS_LOGIN
@@ -281,10 +295,27 @@ async def _refresh_connection_status() -> dict[str, Any]:
     return _status_payload()
 
 
-async def _navigate_to_ytm() -> bool:
+async def _present_ytm_page() -> bool:
     if not _runtime_alive():
         return False
     try:
+        await _ytm_page.bring_to_front()
+        log.info("ytm_web: presented dedicated YT Music page")
+        return True
+    except Exception as exc:
+        log.warning("ytm_web: could not present dedicated YT Music page: %s", exc)
+        return False
+
+
+async def _navigate_to_ytm(*, present: bool = False) -> bool:
+    global _connection_state, _connection_error
+    if not _runtime_alive():
+        return False
+    try:
+        if present and not await _present_ytm_page():
+            _connection_state = ERROR
+            _connection_error = "YT Music login page could not be presented"
+            return False
         await _ytm_page.goto(YTM_URL, wait_until="domcontentloaded", timeout=15000)
         # Give the SPA a short opportunity to render. Login itself remains a
         # user action in the headed browser and is never automated here.
@@ -292,7 +323,6 @@ async def _navigate_to_ytm() -> bool:
         await _refresh_connection_status()
         return True
     except Exception as exc:
-        global _connection_state, _connection_error
         _connection_state = ERROR
         _connection_error = "YT Music page could not be opened"
         log.warning("ytm_web: navigate failed: %s", exc)
@@ -304,6 +334,10 @@ async def connect() -> dict[str, Any]:
     global _connection_state, _connection_error
     async with _get_lock():
         if _connection_state == CONNECTED and _runtime_alive():
+            if not await _present_ytm_page():
+                _connection_state = ERROR
+                _connection_error = "YT Music page could not be presented"
+                return _status_payload()
             return await _refresh_connection_status()
         _connection_state = CONNECTING
         _connection_error = None
@@ -311,13 +345,14 @@ async def connect() -> dict[str, Any]:
             _connection_state = ERROR
             _connection_error = "Could not launch the dedicated YT Music browser"
             return _status_payload()
-        await _navigate_to_ytm()
+        if not await _navigate_to_ytm(present=True):
+            return _status_payload()
         return await _refresh_connection_status()
 
 
 async def _restore_existing_connection() -> None:
     global _connection_state, _connection_error
-    if not _profile_exists():
+    if not _profile_is_connected():
         return
     _connection_state = CONNECTING
     _connection_error = None
@@ -336,7 +371,7 @@ async def _restore_existing_connection() -> None:
 def warm_up() -> None:
     """Restore a previously connected profile without creating a new one."""
     global _warmup_task
-    if not _profile_exists():
+    if not _profile_is_connected():
         return
     if _warmup_task is not None and not _warmup_task.done():
         return
@@ -357,7 +392,7 @@ async def ensure_ready() -> bool:
         await _refresh_connection_status()
         return is_available()
     if not _launched:
-        if not _profile_exists():
+        if not _profile_is_connected():
             return False
         _connection_state = CONNECTING
         if not await _launch_browser():

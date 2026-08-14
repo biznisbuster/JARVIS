@@ -53,7 +53,9 @@ YT Music koristi namensku, vidljivu persistent browser sesiju u
 *Poveži YouTube Music*; prijava se obavlja direktno na Google/YT Music stranici.
 JARVIS ne prima, ne upisuje i ne čuva Google lozinku. Ista browser sesija se
 zatim koristi za pretragu, reprodukciju i DOM verifikaciju pause/resume/next/
-previous akcija. Ako sesija istekne, status prelazi u *Potrebna prijava*.
+previous akcija. Nepotvrđen profil se ne otvara automatski pri restartu; dugme
+za povezivanje ga prikaže radi prijave. Ako sesija istekne, status prelazi u
+*Potrebna prijava*.
 
 ## Šta imaš odmah
 

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { jfetch, jpost } from '../lib/api';
 import { store, useApp } from '../store';
 import type { PttState } from '../store';
-import { isYtmConnected, ytmStatusLabel } from '../lib/ytm-connection';
+import { ytmConnectLabel, ytmStatusLabel } from '../lib/ytm-connection';
 import type { YtmConnectionStatus } from '../lib/ytm-connection';
 
 interface ConnectionsPayload {
@@ -44,6 +44,7 @@ export default function ConnectionsTab() {
   const [data, setData] = useState<ConnectionsPayload | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [ytmBusy, setYtmBusy] = useState(false);
+  const [ytmNotice, setYtmNotice] = useState<string | null>(null);
   const ptt = useApp((s) => s.ptt);
   const listenReasons = useApp((s) => s.listenReasons);
 
@@ -78,18 +79,33 @@ export default function ConnectionsTab() {
     try {
       const ytm = await jfetch<YtmConnectionStatus>('/api/ytm/connection');
       setData((current) => (current ? { ...current, ytm } : current));
-    } catch {
-      // The main connections request owns the visible error state.
+      setYtmNotice((current) => {
+        if (!current) return null;
+        if (ytm.state === 'CONNECTED') return 'YouTube Music je povezan.';
+        if (ytm.state === 'NEEDS_LOGIN') return 'Prijavi se u otvorenom YouTube Music prozoru.';
+        if (ytm.state === 'ERROR' && ytm.error) return ytm.error;
+        return current;
+      });
+    } catch (e) {
+      setYtmNotice(`YouTube Music status nije dostupan: ${(e as Error).message}`);
     }
   }
 
   async function connectYtm() {
     setYtmBusy(true);
+    setYtmNotice('Otvaram YouTube Music prijavu…');
     try {
       const ytm = await jpost<YtmConnectionStatus>('/api/ytm/connect', {});
       setData((current) => (current ? { ...current, ytm } : current));
+      if (ytm.state === 'CONNECTED') {
+        setYtmNotice('YouTube Music je povezan.');
+      } else if (ytm.state === 'NEEDS_LOGIN') {
+        setYtmNotice('Prijavi se u otvorenom YouTube Music prozoru.');
+      } else if (ytm.state === 'ERROR') {
+        setYtmNotice(ytm.error || 'YouTube Music prijava nije mogla da se otvori.');
+      }
     } catch (e) {
-      store.addTool(`⚠ YouTube Music: ${(e as Error).message}`);
+      setYtmNotice(`YouTube Music greška: ${(e as Error).message}`);
     } finally {
       setYtmBusy(false);
     }
@@ -149,8 +165,9 @@ export default function ConnectionsTab() {
         <KV k="pretraga" v={data.ytm.search_ready ? '✓ spremna' : '○ nije spremna'} />
         <KV k="player" v={data.ytm.player_loaded ? '✓ učitan' : '○ nema učitane pesme'} />
         {data.ytm.error && <p className="hint err">⚠ {data.ytm.error}</p>}
+        {ytmNotice && <p className="hint" aria-live="polite">{ytmNotice}</p>}
         {data.ytm.state === 'NEEDS_LOGIN' && (
-          <p className="hint">Prijavi se direktno u otvorenom Google/YT Music prozoru. JARVIS ne prima niti čuva lozinku.</p>
+          <p className="hint">Prijavi se direktno u Google/YT Music prozoru. JARVIS ne prima niti čuva lozinku.</p>
         )}
         <div className="row">
           <button
@@ -159,9 +176,7 @@ export default function ConnectionsTab() {
             disabled={ytmBusy || data.ytm.state === 'CONNECTING'}
             onClick={() => void connectYtm()}
           >
-            {isYtmConnected(data.ytm) || data.ytm.state === 'NEEDS_LOGIN'
-              ? 'Ponovo poveži YouTube Music'
-              : 'Poveži YouTube Music'}
+            {ytmConnectLabel(data.ytm)}
           </button>
         </div>
       </ConnCard>

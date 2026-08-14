@@ -29,6 +29,7 @@ class FakePage:
         self.transition_changes_track = transition_changes_track
         self.authenticated = authenticated
         self.playable_href = playable_href
+        self.bring_to_front_calls = 0
         self.state = {
             "ok": True,
             "playing": False,
@@ -80,6 +81,9 @@ class FakePage:
 
     async def goto(self, url: str, **kwargs) -> None:  # noqa: ANN003
         self.url = url
+
+    async def bring_to_front(self) -> None:
+        self.bring_to_front_calls += 1
 
     async def wait_for_function(self, expr: str, **kwargs) -> None:  # noqa: ANN003
         return None
@@ -195,7 +199,9 @@ def _reset_ytm_web(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _force_jarvis_profile(monkeypatch):
-    monkeypatch.setattr(ytm_web, "_JARVIS_PROFILE_DIR", ytm_web.Path("/tmp/jarvis_ytm_test_profile"))
+    profile = ytm_web.Path("/tmp/jarvis_ytm_test_profile")
+    (profile / ".connected").unlink(missing_ok=True)
+    monkeypatch.setattr(ytm_web, "_JARVIS_PROFILE_DIR", profile)
 
 
 def _set_connected_runtime(monkeypatch, page: FakePage) -> None:
@@ -231,6 +237,42 @@ async def test_connect_launches_a_headed_persistent_profile(monkeypatch) -> None
     launch = fake_pw.chromium.launch_persistent_context
     assert launch.calls[0]["headless"] is False
     assert launch.calls[0]["user_data_dir"].endswith("ytm_test_profile")
+    assert ytm_web._connection_marker_path().is_file()
+
+
+async def test_connect_reuses_login_page_and_presents_it_without_duplicate_launch(
+    monkeypatch,
+) -> None:
+    fake_pw = _install_fake_playwright(monkeypatch)
+    page = FakePage(authenticated=False)
+    _set_connected_runtime(monkeypatch, page)
+    monkeypatch.setattr(ytm_web, "_connection_state", ytm_web.NEEDS_LOGIN)
+
+    status = await ytm_web.connect()
+
+    assert status["state"] == ytm_web.NEEDS_LOGIN
+    assert status["page_ready"] is True
+    assert status["search_ready"] is True
+    assert page.bring_to_front_calls == 1
+    assert fake_pw.chromium.launch_persistent_context.calls == []
+
+
+async def test_warm_up_does_not_launch_profile_without_connection_marker(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    ytm_web._JARVIS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    ytm_web.warm_up()
+
+    assert ytm_web._warmup_task is None
+    assert ytm_web._launched is False
+
+
+async def test_ensure_ready_does_not_restore_unconnected_profile(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    ytm_web._JARVIS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    assert await ytm_web.ensure_ready() is False
+    assert ytm_web._launched is False
 
 
 async def test_login_required_state_is_distinct_from_disconnected(monkeypatch) -> None:
@@ -442,6 +484,7 @@ async def test_transport_requires_loaded_player(monkeypatch) -> None:
 async def test_ensure_ready_launches_once(monkeypatch) -> None:
     _install_fake_playwright(monkeypatch)
     ytm_web._JARVIS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    ytm_web._connection_marker_path().touch()
     result = await ytm_web.ensure_ready()
     assert result is True
     assert ytm_web._launched is True
@@ -456,6 +499,7 @@ async def test_ensure_ready_returns_false_when_chrome_missing(monkeypatch) -> No
 async def test_ensure_ready_idempotent(monkeypatch) -> None:
     _install_fake_playwright(monkeypatch)
     ytm_web._JARVIS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    ytm_web._connection_marker_path().touch()
     await ytm_web.ensure_ready()
     first = ytm_web._context
     await ytm_web.ensure_ready()
@@ -465,6 +509,7 @@ async def test_ensure_ready_idempotent(monkeypatch) -> None:
 async def test_warm_up_runs_in_background(monkeypatch) -> None:
     _install_fake_playwright(monkeypatch)
     ytm_web._JARVIS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    ytm_web._connection_marker_path().touch()
     ytm_web.warm_up()
     assert ytm_web._warmup_task is not None
     await ytm_web._warmup_task
@@ -474,6 +519,7 @@ async def test_warm_up_runs_in_background(monkeypatch) -> None:
 async def test_shutdown_clears_state(monkeypatch) -> None:
     _install_fake_playwright(monkeypatch)
     ytm_web._JARVIS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    ytm_web._connection_marker_path().touch()
     await ytm_web.ensure_ready()
     await ytm_web.shutdown()
     assert ytm_web._ytm_page is None
