@@ -14,6 +14,7 @@ real voice message doesn't pay the model-load cost.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import struct
 import tempfile
@@ -31,6 +32,74 @@ _TRANSCRIBE_LOCK = asyncio.Lock()
 # Whisper jobs are long-running and CPU/GPU-heavy; they must not starve the
 # default executor that serves short osascript/clipboard calls.
 _EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="whisper")
+
+_PCM_RMS_THRESHOLD = 0.01
+_PCM_FRAME_SAMPLES = 320  # 20 ms at the default 16 kHz capture rate
+
+
+def pcm_has_speech_energy(
+    data: bytes,
+    *,
+    sample_width: int = 2,
+    frame_samples: int = _PCM_FRAME_SAMPLES,
+    threshold: float = _PCM_RMS_THRESHOLD,
+    min_active_frames: int = 2,
+) -> bool:
+    """Return whether 16-bit PCM contains enough non-silent frames.
+
+    This is deliberately a cheap pre-filter, not a replacement for Whisper's
+    VAD. It prevents empty/near-silent PTT captures from reaching STT and
+    being turned into hallucinated commands.
+    """
+    if sample_width != 2 or frame_samples <= 0 or min_active_frames <= 0:
+        return False
+    usable = len(data) - (len(data) % sample_width)
+    if usable <= 0:
+        return False
+    samples = struct.unpack(f"<{usable // sample_width}h", data[:usable])
+    active = 0
+    for start in range(0, len(samples), frame_samples):
+        frame = samples[start : start + frame_samples]
+        if not frame:
+            continue
+        rms = math.sqrt(sum(sample * sample for sample in frame) / len(frame)) / 32768.0
+        if rms >= threshold:
+            active += 1
+            if active >= min_active_frames:
+                return True
+    return False
+
+
+def wav_has_speech_energy(path: str | Path) -> bool | None:
+    """Check speech energy for a PCM WAV, or return ``None`` if unsupported."""
+    try:
+        with wave.open(str(path), "rb") as wav:
+            if wav.getsampwidth() != 2:
+                return None
+            return pcm_has_speech_energy(
+                wav.readframes(wav.getnframes()),
+                sample_width=wav.getsampwidth(),
+            )
+    except (OSError, wave.Error):
+        return None
+
+
+def _mlx_result_has_speech(result: dict[str, Any]) -> bool:
+    """Use mlx-whisper segment metadata when it is present."""
+    segments = result.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return bool(str(result.get("text") or "").strip())
+    evidence = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text") or "").strip()
+        probability = segment.get("no_speech_prob")
+        if text and isinstance(probability, (int, float)):
+            evidence.append(float(probability) < 0.8)
+        elif text:
+            evidence.append(True)
+    return any(evidence)
 
 
 async def _get_model() -> tuple[str, Any]:
@@ -85,25 +154,40 @@ async def _get_model() -> tuple[str, Any]:
 
 
 async def transcribe_file(path: str | Path, *, language: str = "sr") -> str:
+    energy = wav_has_speech_energy(path)
+    if energy is False:
+        await BUS.publish(
+            "whisper_result",
+            {"language": language, "text": "", "skipped": "no_speech"},
+        )
+        return ""
     backend, model = await _get_model()
     async with _TRANSCRIBE_LOCK:
         loop = asyncio.get_running_loop()
         if backend == "mlx_whisper":
             model_name = SETTINGS.whisper.model
 
-            def _run_mlx() -> str:
+            def _run_mlx() -> dict[str, Any]:
                 import mlx_whisper  # type: ignore
 
-                result = mlx_whisper.transcribe(
+                return mlx_whisper.transcribe(
                     str(path),
                     path_or_hf_repo=model_name,
                     language=language,
                 )
-                return (result.get("text") or "").strip()
 
-            text = await loop.run_in_executor(_EXECUTOR, _run_mlx)
+            result = await loop.run_in_executor(_EXECUTOR, _run_mlx)
+            text = (result.get("text") or "").strip() if isinstance(result, dict) else ""
+            if isinstance(result, dict) and not _mlx_result_has_speech(result):
+                text = ""
             await BUS.publish(
-                "whisper_result", {"backend": "mlx_whisper", "language": language, "text": text}
+                "whisper_result",
+                {
+                    "backend": "mlx_whisper",
+                    "language": language,
+                    "text": text,
+                    "segments": len(result.get("segments") or []) if isinstance(result, dict) else 0,
+                },
             )
             return text
 
@@ -153,6 +237,10 @@ async def warmup() -> None:
             f.setframerate(rate)
             f.writeframes(struct.pack("<h", 0) * (rate // 4))
         try:
+            # The silence gate intentionally returns before model loading.
+            # Warmup must still preserve its purpose: load the configured
+            # backend before the first real utterance arrives.
+            await _get_model()
             await transcribe_file(tmp.name, language="sr")
         finally:
             try:

@@ -154,6 +154,8 @@ tab *Konekcije* (prikazuje šta je učitano). Najbitnije:
 | `JARVIS_KILO_BIN` | Putanja do `kilo` binarija. |
 | `JARVIS_KILO_AUTO` | `true` = koristi `kilo run --auto` (allowlist). |
 | `JARVIS_TTS_OUTPUT` | `ui` = browser reprodukuje audio; `say` = server igra afplay. |
+| `JARVIS_PTT_MIN_DURATION_MS` | Minimalna dužina PTT snimka; kraći tap se odbacuje (default 350 ms). |
+| `JARVIS_PTT_MAX_DURATION_S` | Maksimalna dužina PTT snimka (default 30 s). |
 | `JARVIS_DEFAULT_POLICY` | `allow` / `ask` / `deny` za nove alate. |
 
 Napomena: env varijable `JARVIS_MINIMAX_BASE_URL` i `JARVIS_MINIMAX_API_KEY`

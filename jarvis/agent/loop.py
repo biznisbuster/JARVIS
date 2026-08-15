@@ -90,6 +90,7 @@ def _trim_history(messages: list[dict[str, Any]]) -> None:
 class _TurnRequest:
     text: str
     model: str | None = None
+    source: str = "text"
 
 
 @dataclass
@@ -214,6 +215,7 @@ async def chat(
     store: perm_mod.PermissionStore,
     model: str | None = None,
     interrupt: bool = False,
+    source: str = "text",
 ) -> str:
     """Enqueue a user turn for the session and return the session id.
 
@@ -227,7 +229,8 @@ async def chat(
         _cancel_turn(sess)
         _drain_queue(sess)
         await SPEECH.cancel(sess.id)
-    sess.queue.put_nowait(_TurnRequest(text=user_text, model=model))
+    turn_source = "ptt" if source == "ptt" else "text"
+    sess.queue.put_nowait(_TurnRequest(text=user_text, model=model, source=turn_source))
     _ensure_worker(sess, store)
     await _publish_busy(sess)
     return sess.id
@@ -281,7 +284,9 @@ async def _session_worker(sess: Session, store: perm_mod.PermissionStore) -> Non
                 if sess.queue.empty():
                     return
                 continue
-            sess.turn_task = asyncio.create_task(run_turn(sess, req.text, model=req.model, store=store))
+            sess.turn_task = asyncio.create_task(
+                run_turn(sess, req.text, model=req.model, source=req.source, store=store)
+            )
             try:
                 await sess.turn_task
             except asyncio.CancelledError:
@@ -343,6 +348,7 @@ async def run_turn(
     user_text: str,
     *,
     model: str | None = None,
+    source: str = "text",
     max_iterations: int = 8,
     store: perm_mod.PermissionStore,
 ) -> str:
@@ -355,7 +361,7 @@ async def run_turn(
     _trim_history(session.messages)
     await save_sessions()
 
-    SPEECH.begin_turn(session.id)
+    SPEECH.begin_turn(session.id, source=source)
     try:
         world_state = await build_world_state()
     except Exception:  # noqa: BLE001

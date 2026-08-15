@@ -76,6 +76,7 @@ def _take_sentence(buf: str) -> tuple[str | None, str]:
 class _SessionSpeech:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
+        self.source = "text"
         self._buf = ""
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
@@ -103,9 +104,10 @@ class _SessionSpeech:
             self._queue.put_nowait(tail)
         self._ensure_worker()
 
-    def begin_turn(self) -> None:
+    def begin_turn(self, source: str = "text") -> None:
         self._suppressed = False
         self._seq = 0
+        self.source = "ptt" if source == "ptt" else "text"
 
     def end_turn(self) -> None:
         self.end_message()
@@ -158,7 +160,7 @@ class _SessionSpeech:
             return
         self._seq += 1
         rel = Path(path).name
-        server_play = SETTINGS.audio.output == "say"
+        server_play = SETTINGS.audio.output == "say" or self.source == "ptt"
         await BUS.publish(
             "tts_speak",
             {
@@ -205,8 +207,8 @@ class SpeechScheduler:
             self._sessions[session_id] = ss
         return ss
 
-    def begin_turn(self, session_id: str) -> None:
-        self._get(session_id).begin_turn()
+    def begin_turn(self, session_id: str, *, source: str = "text") -> None:
+        self._get(session_id).begin_turn(source)
 
     def feed(self, session_id: str, delta: str) -> None:
         self._get(session_id).feed(delta)

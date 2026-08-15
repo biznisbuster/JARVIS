@@ -58,7 +58,7 @@ export async function deleteSession(id: string): Promise<void> {
 
 export async function sendText(
   text: string,
-  opts?: { interrupt?: boolean; userLabel?: string },
+  opts?: { interrupt?: boolean; userLabel?: string; source?: 'text' | 'ptt' },
 ): Promise<boolean> {
   stopSpeech();
   try {
@@ -67,6 +67,7 @@ export async function sendText(
       session_id: store.state.sessionId,
       model: store.state.currentModel || null,
       interrupt: !!opts?.interrupt,
+      source: opts?.source || 'text',
     });
     if (opts?.userLabel) store.addUser(opts.userLabel);
     store.set({ sessionId: data.session_id });
@@ -234,7 +235,11 @@ export async function toggleMic(): Promise<void> {
       const blob = new Blob(micChunks, { type: mediaRecorder?.mimeType });
       stream.getTracks().forEach((t) => t.stop());
       store.set({ recording: false });
-      jpost('/api/audio/listen/stop', { reason: 'browser' }).catch(() => {});
+      try {
+        await jpost('/api/audio/listen/stop', { reason: 'browser' });
+      } catch {
+        store.addTool('⚠ audio focus: vraćanje zvuka nije potvrđeno');
+      }
       const fd = new FormData();
       fd.append('audio', blob, 'mic.webm');
       try {
@@ -252,7 +257,7 @@ export async function toggleMic(): Promise<void> {
         store.addTool(`⚠ STT: ${(e as Error).message}`);
       }
     };
-    jpost('/api/audio/listen/start', { reason: 'browser' }).catch(() => {});
+    await jpost('/api/audio/listen/start', { reason: 'browser' });
     mediaRecorder.start();
     stopSpeech();
     store.set({ recording: true });

@@ -106,6 +106,7 @@ class ChatIn(BaseModel):
     session_id: str | None = None
     model: str | None = None
     interrupt: bool = False
+    source: str = "text"
 
 
 class ChatOut(BaseModel):
@@ -123,6 +124,7 @@ async def api_chat(body: ChatIn) -> ChatOut:
         store=permission_store,
         model=body.model,
         interrupt=body.interrupt,
+        source=body.source,
     )
     return ChatOut(session_id=sid)
 

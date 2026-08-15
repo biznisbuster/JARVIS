@@ -1343,6 +1343,169 @@ checkpoint remains outstanding. Do not merge and do not start Phase 2.
 
 ---
 
+## Phase 1 final focused correction pass (2026-08-15)
+
+### Root cause
+
+The normal YT Music search path still used top-level `page.goto()` navigation.
+That navigation could make the dedicated headed Chrome window visible during a
+normal play request and did not provide enough evidence to diagnose a flash or
+stale successive-search result. The correction now drives the existing
+authenticated YT Music search box, waits for the exact query/route/rows, and
+records the dedicated CDP window state at each search and verification stage.
+
+Global PTT also still had an unsafe lifecycle: focus acquisition and recorder
+startup were scheduled independently, while recorder output used shared mutable
+state. A quick release or delayed worker completion could publish recording
+events too early, lose an utterance, or leave a temporary WAV behind. There was
+no bounded duration or cheap speech-energy gate, and PTT-originated chat turns
+did not carry their source into server-side speech routing.
+
+### Completed
+
+- Replaced normal YT Music top-level search navigation with authenticated SPA
+  search-box input plus Enter, exact query/route/row readiness checks and stale
+  result filtering. Normal YTM actions do not call `bring_to_front()`.
+- Added bounded, secret-free CDP window-state tracing for before search,
+  submit/route, result click, playback verification and final result; only the
+  explicit Connect path presents the dedicated page.
+- Preserved strict YT Music delivery-versus-verification semantics and the
+  already-fixed single-delivery safety for non-idempotent next/previous.
+- Added an explicit PTT `IDLE -> ARMING -> RECORDING -> IDLE` lifecycle.
+  Focus or TTS cancellation completes before capture begins, and
+  `mute_while_held=false` does not change system output volume.
+- Added documented/testable PTT minimum and maximum durations, a PCM energy
+  gate, MLX segment/no-speech evidence handling, diagnostic skipped events and
+  a per-utterance worker completion handoff with cleanup.
+- Preserved accepted PTT auto-send and added `source=ptt` through `/api/chat`
+  and the agent/speech scheduler. PTT replies publish
+  `tts_speak(server_played=true)` and use the existing server player after
+  focus restoration; ordinary text remains browser/UI-routed by default.
+- Kept rejected/no-speech PTT results out of chat execution and added concise
+  frontend diagnostics.
+
+### Phase 1 focused correction checklist
+
+- [x] Normal YTM search uses the existing authenticated SPA surface.
+- [x] Normal YTM actions remain backgrounded and emit window-state traces.
+- [x] PTT focus, capture start, release, cleanup and timeout are explicit and
+  bounded.
+- [x] PTT speech/no-speech validation and rejected-result UI behavior are
+  covered by regression tests.
+- [x] PTT source reaches server-side speech playback without changing normal
+  text behavior.
+- [ ] User-led real macOS/YT Music and global PTT manual checkpoint.
+
+### Files changed
+
+- `.env.example`
+- `README.md`
+- `jarvis/agent/loop.py`
+- `jarvis/app.py`
+- `jarvis/audio/speech.py`
+- `jarvis/audio/stt.py`
+- `jarvis/config.py`
+- `jarvis/hotkey.py`
+- `jarvis/media/ytm_web.py`
+- `tests/test_hotkey.py`
+- `tests/test_integration_chat.py`
+- `tests/test_ptt_lifecycle.py`
+- `tests/test_speech.py`
+- `tests/test_stt.py`
+- `tests/test_ytm_web.py`
+- `web-ui/src/lib/actions.ts`
+- `web-ui/src/lib/bus.test.ts`
+- `web-ui/src/lib/bus.ts`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added YT Music SPA-search, no-top-level-navigation and CDP window-trace
+  coverage.
+- Replaced shallow PTT callback tests with lifecycle, mute-policy, delayed
+  worker, rapid-utterance, duration and state-diagnostic coverage.
+- Added PCM/WAV silence gate, MLX result-evidence and warmup-preservation
+  tests.
+- Added server-side PTT speech/source propagation and frontend rejected-result
+  coverage.
+- Retained the strict YT Music transition and single-delivery regressions.
+
+### Validation
+
+- `pytest -q --ignore=tests/test_web_ui_7b.py` -> PASS (`205 passed, 3
+  xfailed`); the xfails are the existing Phase 3 local-model defects.
+- `pytest -q` -> PASS (`205 passed, 3 xfailed`).
+- `pytest -q tests/test_ytm_web.py tests/test_hotkey.py
+  tests/test_ptt_lifecycle.py tests/test_stt.py tests/test_speech.py
+  tests/test_loop_tool_events.py tests/test_audio_focus.py
+  tests/test_ptt_status.py tests/test_integration_chat.py` -> PASS (`114
+  passed`).
+- `cd web-ui && npm run test` -> PASS (`8 tests`); `npm run typecheck` ->
+  PASS; `npm run build` -> PASS.
+- `.venv/bin/ruff check .` -> FAIL only on the three pre-existing findings in
+  `jarvis/audio/focus.py`, `jarvis/log.py` and `tests/test_web_ui_7b.py`.
+- `.venv/bin/ruff format --check .` -> FAIL on the pre-existing repository
+  formatting findings. Changed implementation/test files pass the focused
+  format check; `jarvis/app.py` still has its pre-existing blank-line finding.
+- `git diff --check` -> PASS.
+- Codex real-profile YTM pre-check (not the final user-led checkpoint) used the
+  `ytm_web` adapter with the persistent authenticated profile. The dedicated
+  CDP target stayed `minimized` at every `play_query` trace point for a
+  successful `Relja Popović Top Gun` request. A successive `Vlado Georgiev`
+  request selected a Vlado result and returned explicit
+  `PLAYBACK_DID_NOT_START` (`ok=false`, `delivered=true`, `verified=false`),
+  rather than claiming success; no normal-YouTube fallback was used.
+- Real PTT capture, audible server playback with zero WebSocket clients,
+  barge-in and duplicate-audio behavior -> NOT RUN by Codex; the required
+  user-led checkpoint remains open.
+
+### Manual validation still required
+
+- In the logged-in dedicated profile, play a specific Relja song, then a
+  different artist/song, pause, resume, next, previous, status and volume.
+  Confirm the dedicated window does not visibly flash during normal actions,
+  the trace stays on the YT Music target, success requires verified YTM state,
+  and investigate the explicit `PLAYBACK_DID_NOT_START` result if it recurs.
+- Hold Fn+Shift for a normal utterance, a too-short tap, silence and a held
+  timeout; confirm only accepted speech is sent and PTT replies are audible
+  through macOS output.
+- Test pause/next/previous commands through PTT, two rapid utterances and
+  barge-in while JARVIS is speaking. Confirm system volume restores before the
+  reply starts and no duplicate browser/server playback occurs.
+- Repeat with the browser window not frontmost; note that the deeper
+  no-WebSocket PTT transcript/session ownership issue remains Appendix A.
+
+### New issues discovered
+
+- The supported one-client PTT flow still relies on the frontend WebSocket to
+  consume `voice_ptt_transcribed`, choose a session and call `/api/chat`.
+  Multiple tabs or zero clients therefore remain a deeper ownership problem;
+  it is recorded in Appendix A and was not expanded into a Phase 1 redesign.
+- A real successive artist change can select the correct YT Music result but
+  fail to start the player; the adapter returns an explicit failure and does
+  not fall back to normal YouTube. This is recorded in Appendix A.
+
+### Remaining risks
+
+- Real minimized-window behavior, YT Music search/play/transport reliability,
+  audible output, PTT capture quality and barge-in still require the user's
+  live macOS checkpoint.
+- YT Music playback can still be unstable after a successive artist change;
+  the current safe behavior is a verified false/degraded result, not a false
+  success or a cross-provider fallback.
+- Browser/DOM and `nowplaying-cli` metadata can change outside automated fake
+  coverage; YTM results remain explicit failure/degraded when verification is
+  unavailable.
+- Phase 2 `MediaService` and state-ownership work has not started.
+
+### Ready for next phase
+
+NO — automated correction and regression coverage are complete, but the user
+manual Phase 1 checkpoint is still required. Do not merge and do not start
+Phase 2.
+
+---
+
 # 5. Phase 2 — Introduce authoritative MediaService
 
 **Priority:** P0/P1  
@@ -2279,9 +2442,9 @@ corrected.
 
 **Recommended phase:**
 Phase 1 — fixed in the Phase 1 playback DOM correction update. The correction
-uses the same authenticated browser page, direct YTM search navigation,
-component-aware selection and strict DOM verification; it does not add a
-desktop or normal-YouTube fallback.
+uses the same authenticated browser page, the existing YTM search-box SPA
+surface, component-aware selection and strict DOM verification; it does not
+add a desktop or normal-YouTube fallback.
 
 **Blocks current phase:** yes — code and direct adapter validation are fixed,
 but user-led manual playback/audible validation remains required.
@@ -2311,6 +2474,59 @@ background audio mode is needed later.
 
 **Blocks current phase:** no — headed minimized restore is the selected
 fallback; manual focus and audible behavior remain required.
+
+## [P1] Global PTT transcript execution depends on frontend ownership
+
+**Found in phase:** 1 correction pass
+**Files:** `jarvis/hotkey.py`, `jarvis/bus.py`, `web-ui/src/lib/bus.ts`,
+`jarvis/agent/loop.py`
+
+**Symptom:**
+The global listener can capture and transcribe outside the browser, but the
+current supported auto-send path publishes `voice_ptt_transcribed` to the bus
+and relies on one frontend WebSocket client to choose the active session and
+call `/api/chat`. With zero clients there is no chat turn; with multiple tabs,
+more than one client could react to the same transcript.
+
+**Root cause:**
+PTT capture ownership and transcript execution ownership are split between the
+backend listener and browser UI state. This is broader than the focused Phase 1
+lifecycle/source correction.
+
+**Recommended phase:**
+Phase 7 lifecycle/concurrency plus Phase 8 frontend async/event ownership.
+Define one backend-owned PTT session/dispatch authority before making
+zero-client and multi-tab behavior guarantees.
+
+**Blocks current phase:** no — the documented supported manual configuration
+uses one JARVIS UI client; the issue remains a known risk and is not silently
+treated as resolved.
+
+## [P1] YT Music result can load without starting playback after a successive search
+
+**Found in phase:** 1 final focused correction pass
+**Files:** `jarvis/media/ytm_web.py`, `tests/test_ytm_web.py`
+
+**Symptom:**
+In a real authenticated profile, `Relja Popović Top Gun` played and verified,
+but a subsequent `Vlado Georgiev` search selected a Vlado result and left the
+player loaded without entering a verified playing state. The adapter returned
+`ok=false`, `delivered=true`, `verified=false`, `error_code=PLAYBACK_DID_NOT_START`.
+
+**Root cause:**
+The YT Music SPA accepted the new search and exposed a playable result, but the
+result-to-player transition/autoplay behavior was not reliable while another
+track was already playing. The current pass can prove the selected result and
+detect the missing playback, but does not add an unbounded retry or a provider
+fallback.
+
+**Recommended phase:**
+A focused YT Music adapter follow-up, or the Phase 2 media boundary once it is
+authorized. Preserve the current strict false result until the player effect
+can be verified.
+
+**Blocks current phase:** yes — the final user-led YT Music playback checkpoint
+remains open.
 
 ---
 

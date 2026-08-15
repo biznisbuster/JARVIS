@@ -47,7 +47,7 @@ describe('PTT transcript delivery', () => {
     await vi.waitFor(() => expect(store.state.transcript).toHaveLength(1));
     expect(store.state.transcript[0]).toMatchObject({ role: 'user', text: '🎙 koliko je sati' });
     expect(chatBodies).toEqual([
-      { text: 'koliko je sati', session_id: null, model: null, interrupt: true },
+      { text: 'koliko je sati', session_id: null, model: null, interrupt: true, source: 'ptt' },
     ]);
   });
 
@@ -85,6 +85,20 @@ describe('PTT transcript delivery', () => {
       role: 'tool',
       text: '🎙 PTT transkript je u input polju — pritisni Pošalji.',
     });
+  });
+
+  it('does not auto-send rejected or no-speech PTT results', () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    handleEvent({
+      kind: 'voice_ptt_transcribed',
+      t: 1,
+      payload: { ok: true, skipped: 'no_speech', auto_send: true },
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.state.transcript.at(-1)).toMatchObject({ role: 'tool', text: '… PTT: nisam jasno čuo' });
   });
 
   it('falls back to system playback when browser audio is blocked', async () => {

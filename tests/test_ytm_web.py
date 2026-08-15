@@ -55,6 +55,9 @@ class FakePage:
         self.volume_available = volume_available
         self.last_query = ""
         self.bring_to_front_calls = 0
+        self.goto_calls: list[str] = []
+        self.fill_calls: list[str] = []
+        self.keyboard_presses: list[str] = []
         self.wait_for_selector_calls: list[str] = []
         self.transport_commands: list[str] = []
         self.volume_commands: list[str] = []
@@ -72,6 +75,7 @@ class FakePage:
             "volume": 0.5,
             "muted": False,
         }
+        self.keyboard = FakeKeyboard(self)
 
     def is_closed(self) -> bool:
         return self.closed
@@ -117,14 +121,37 @@ class FakePage:
             }
         if "findPlayableSearchResult" in script:
             if self.search_result_shape == "component":
-                candidate = next(
-                    (
-                        item
-                        for item in self.component_candidates
-                        if item.get("video_id") and item.get("watch_endpoint")
-                    ),
-                    None,
-                )
+                request = arg if isinstance(arg, dict) else {}
+                query_tokens = str(request.get("query") or "").casefold().replace("đ", "d").split()
+
+                def matches_query(item: dict[str, object]) -> bool:
+                    searchable = f"{item.get('title', '')} {item.get('artist', '')}".casefold().replace(
+                        "đ", "d"
+                    )
+                    if not query_tokens:
+                        return True
+                    identity_match = any(token in searchable for token in query_tokens)
+                    if len(query_tokens) < 3:
+                        return identity_match
+                    title = str(item.get("title", "")).casefold().replace("đ", "d")
+                    return all(token in searchable for token in query_tokens) and bool(title)
+
+                candidates = [
+                    item
+                    for item in self.component_candidates
+                    if item.get("video_id") and item.get("watch_endpoint") and matches_query(item)
+                ]
+
+                def rank(item: dict[str, object]) -> tuple[int, int, int]:
+                    title = str(item.get("title", "")).casefold().replace("đ", "d")
+                    artist = str(item.get("artist", "")).casefold().replace("đ", "d")
+                    searchable = f"{title} {artist}"
+                    score = sum(token in searchable for token in query_tokens)
+                    artist_score = sum(token in artist for token in query_tokens)
+                    title_score = sum(token in title for token in query_tokens)
+                    return score, artist_score, title_score
+
+                candidate = max(candidates, key=rank, default=None)
                 if candidate is None:
                     return {
                         "ok": False,
@@ -132,7 +159,7 @@ class FakePage:
                         "error_code": "NO_PLAYABLE_SEARCH_RESULT",
                         "error": "no playable YT Music search result",
                     }
-                clicked = bool(isinstance(arg, dict) and arg.get("click"))
+                clicked = bool(request.get("click"))
                 if clicked:
                     self.state.update(
                         {
@@ -246,15 +273,12 @@ class FakePage:
                     self.state["track_id"] = f"{action}-track"
                     self.state["currentTime"] = 0.0
             return {"ok": True, "method": f"fake.{action}"}
-        if "HTMLInputElement" in script:
-            self.last_query = str(arg or "")
-            self.url = f"https://music.youtube.com/search?q={urllib.parse.quote_plus(self.last_query)}"
-            return {"ok": True}
         if "hasSearch" in script:
             return {"url": "https://music.youtube.com/", "hasSearch": True}
         return {"ok": True}
 
     async def goto(self, url: str, **kwargs) -> None:  # noqa: ANN003
+        self.goto_calls.append(url)
         self.url = url
         self.last_query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("q", [""])[0]
 
@@ -284,6 +308,11 @@ class FakeLocator:
     async def wait_for(self, state: str = "visible", timeout: int = 0) -> None:  # noqa: ANN001
         return None
 
+    async def fill(self, value: str) -> None:
+        self.page.fill_calls.append(value)
+        self.page.last_query = value
+        self.page.url = f"https://music.youtube.com/search?q={urllib.parse.quote_plus(value)}"
+
     async def click(self) -> None:
         self.page.state["playing"] = True
         self.page.state["player_loaded"] = True
@@ -299,11 +328,11 @@ FakePage.locator = lambda self, selector: FakeLocator(self, selector)  # type: i
 
 
 class FakeKeyboard:
+    def __init__(self, page: FakePage) -> None:
+        self.page = page
+
     async def press(self, key: str) -> None:
-        return None
-
-
-FakePage.keyboard = FakeKeyboard()
+        self.page.keyboard_presses.append(key)
 
 
 class FakePersistentContext:
@@ -1039,6 +1068,36 @@ async def test_play_query_success(monkeypatch) -> None:
     assert result["selected_video_id"] == "test-track"
     assert result["title"] == "Selected Result"
     assert result["artist"] == "Selected Artist"
+    assert page.goto_calls == []
+    assert page.fill_calls == ["test song"]
+    assert page.keyboard_presses == ["Enter"]
+    assert page.bring_to_front_calls == 0
+
+
+async def test_play_query_traces_dedicated_window_without_presenting_it(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    _set_connected_runtime(monkeypatch, page, pages=[page])
+    browser = FakeBrowser(page)
+    monkeypatch.setattr(ytm_web, "_browser", browser)
+
+    result = await ytm_web.play_query("trace song")
+
+    assert result["ok"] is True
+    reasons = [item["reason"] for item in result["window_trace"]]
+    assert reasons == [
+        "play_query.before_search",
+        "play_query.before_search_submit",
+        "play_query.after_search_submit",
+        "play_query.after_search_route",
+        "play_query.before_result_click",
+        "play_query.after_result_click",
+        "play_query.during_playback_verification",
+        "play_query.final",
+    ]
+    assert all(item["after"] == "minimized" for item in result["window_trace"])
+    assert page.goto_calls == []
+    assert page.fill_calls == ["trace song"]
     assert page.bring_to_front_calls == 0
 
 
@@ -1098,6 +1157,85 @@ async def test_play_query_selects_component_song_and_skips_artist_album_navigati
     assert result["selection_method"] == "watch_endpoint_anchor"
     assert result["actual_video_id"] == "component-track"
     assert result["error"] is None
+
+
+async def test_play_query_specific_artist_song_does_not_select_partial_artist_match(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        component_candidates=[
+            {
+                "title": "Nisam ljubomoran",
+                "artist": "Vlado Georgiev",
+                "video_id": "wrong-track",
+                "watch_endpoint": True,
+            },
+            {
+                "title": "Anđele",
+                "artist": "Vlado Georgiev",
+                "video_id": "andele-track",
+                "watch_endpoint": True,
+            },
+        ],
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("Vlado Georgiev Anđele")
+
+    assert result["ok"] is True
+    assert result["selected_video_id"] == "andele-track"
+    assert result["selected_title"] == "Anđele"
+
+
+async def test_play_query_specific_artist_song_fails_when_only_partial_match_exists(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        component_candidates=[
+            {
+                "title": "Nisam ljubomoran",
+                "artist": "Vlado Georgiev",
+                "video_id": "wrong-track",
+                "watch_endpoint": True,
+            }
+        ],
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("Vlado Georgiev Anđele")
+
+    assert result["ok"] is False
+    assert result["error_code"] == "NO_PLAYABLE_SEARCH_RESULT"
+    assert result["delivered"] is False
+    assert page.transport_commands == []
+
+
+async def test_play_query_artist_does_not_select_unrelated_channel_result(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        component_candidates=[
+            {
+                "title": "Vlado Georgiev Live In Herceg Novi",
+                "artist": "Dusan Potic",
+                "video_id": "wrong-channel-track",
+                "watch_endpoint": True,
+            },
+            {
+                "title": "Nisam ljubomoran",
+                "artist": "Vlado Georgiev",
+                "video_id": "vlado-track",
+                "watch_endpoint": True,
+            },
+        ],
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("Vlado Georgiev")
+
+    assert result["ok"] is True
+    assert result["selected_video_id"] == "vlado-track"
+    assert result["selected_artist"] == "Vlado Georgiev"
 
 
 async def test_play_query_no_component_candidate_is_structured_connected_failure(monkeypatch) -> None:

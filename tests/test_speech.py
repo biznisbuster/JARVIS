@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+import jarvis.audio.speech as speech_mod
 from jarvis.audio.speech import _take_sentence, normalize_for_speech
+from jarvis.config import SETTINGS
 
 
 @pytest.mark.parametrize(
@@ -89,3 +93,71 @@ def test_take_sentence_force_cuts_very_long_buffer() -> None:
 def test_take_sentence_handles_ellipsis() -> None:
     s, _ = _take_sentence("Razmišljam još uvek… Možda je greška.")
     assert s == "Razmišljam još uvek…"
+
+
+@pytest.mark.asyncio
+async def test_ptt_speech_is_played_by_server_and_marked_as_played(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "ptt-reply.wav"
+    events: list[tuple[str, dict]] = []
+    played: list[str] = []
+
+    async def publish(kind: str, payload: dict) -> None:
+        events.append((kind, payload))
+
+    async def synthesize(_text: str) -> str:
+        return str(path)
+
+    async def play_file(audio_path) -> bool:  # noqa: ANN001
+        played.append(str(audio_path))
+        return True
+
+    monkeypatch.setattr(speech_mod.BUS, "publish", publish)
+    monkeypatch.setattr(speech_mod, "_synthesize_cached", synthesize)
+    monkeypatch.setattr(speech_mod.player, "play_file", play_file)
+    monkeypatch.setattr(
+        speech_mod,
+        "SETTINGS",
+        replace(SETTINGS, audio=replace(SETTINGS.audio, output="ui")),
+    )
+
+    session = speech_mod._SessionSpeech("session-ptt")
+    session.begin_turn("ptt")
+    await session._speak("Odgovor sa PTT-a.")
+
+    tts = next(payload for kind, payload in events if kind == "tts_speak")
+    assert tts["server_played"] is True
+    assert played == [str(path)]
+
+
+@pytest.mark.asyncio
+async def test_normal_text_speech_keeps_browser_playback_path(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "text-reply.wav"
+    events: list[tuple[str, dict]] = []
+    played: list[str] = []
+
+    async def publish(kind: str, payload: dict) -> None:
+        events.append((kind, payload))
+
+    async def synthesize(_text: str) -> str:
+        return str(path)
+
+    async def play_file(audio_path) -> bool:  # noqa: ANN001
+        played.append(str(audio_path))
+        return True
+
+    monkeypatch.setattr(speech_mod.BUS, "publish", publish)
+    monkeypatch.setattr(speech_mod, "_synthesize_cached", synthesize)
+    monkeypatch.setattr(speech_mod.player, "play_file", play_file)
+    monkeypatch.setattr(
+        speech_mod,
+        "SETTINGS",
+        replace(SETTINGS, audio=replace(SETTINGS.audio, output="ui")),
+    )
+
+    session = speech_mod._SessionSpeech("session-text")
+    session.begin_turn("text")
+    await session._speak("Odgovor iz browser toka.")
+
+    tts = next(payload for kind, payload in events if kind == "tts_speak")
+    assert tts["server_played"] is False
+    assert played == []
