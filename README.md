@@ -76,8 +76,9 @@ akcija. Ako sesija istekne, status prelazi u *Potrebna prijava*.
 - 🔐 **Dozvole** — svaki tool ima `allow / ask / deny` (UI u tabu *Dozvole*),
   hot-reload, pamćenje po toolu, "zapamti" checkbox u approval modalu.
 - 🖥 **Kontrolni panel** — single-page UI na `http://127.0.0.1:7777/`, živi
-  WebSocket event stream, push-to-talk preko mikrofona ili globalnog
-  hotkey-a (`⌘⌥ Space`).
+  WebSocket event stream, push-to-talk preko mikrofona ili globalne
+  kombinacije `Fn+Shift` (drži oba tastera dok pričaš, pusti za transkripciju).
+  Zahteva macOS Accessibility dozvolu za proces koji pokreće JARVIS.
 - 📋 **Menu bar** — `scripts/menubar.sh` (opciono, zahteva `rumps`).
 
 ## Brzi start

@@ -184,7 +184,7 @@ export default function ConnectionsTab() {
       <ConnCard title="Global Push-to-Talk">
         <KV k="key" v={ptt?.key || '—'} />
         <KV k="auto-send" v={ptt?.auto_send ? 'uključen — transkript se odmah šalje' : 'isključen — transkript ide u input'} />
-        <KV k="status" v={ptt?.enabled ? '● ACTIVE — drži taster da snimaš' : '○ ugašen'} />
+        <KV k="status" v={ptt?.enabled ? `● ACTIVE — drži ${pttTriggerLabel(ptt)} da snimaš` : '○ ugašen'} />
         <p className="hint">{renderPttHint(ptt, listenHint, listenReasons.length > 0)}</p>
         <div className="row">
           <button type="button" className="primary" onClick={() => void togglePtt()}>
@@ -214,6 +214,11 @@ function KV({ k, v }: { k: string; v: string }) {
   );
 }
 
+function pttTriggerLabel(ptt: PttState | null): string {
+  const key = ptt?.key || 'taster';
+  return key.includes('+') ? `kombinaciju ${key}` : `taster ${key}`;
+}
+
 function renderPttHint(ptt: PttState | null, listenHint: string, isListening: boolean): React.ReactNode {
   const tail = ptt?.auto_send
     ? 'transkript se odmah šalje kao poruka.'
@@ -230,7 +235,7 @@ function renderPttHint(ptt: PttState | null, listenHint: string, isListening: bo
         </>
       );
     }
-    return `Drži taster bilo gde na macOS-u. Kad pustiš, ${listenHint}; ${tail}`;
+    return `Drži ${pttTriggerLabel(ptt)} bilo gde na macOS-u. Kad pustiš, ${listenHint}; ${tail}`;
   }
   if (ptt?.error) {
     return `Greška: ${ptt.error} — verovatno treba Accessibility dozvola (System Settings → Privacy & Security → Accessibility).`;

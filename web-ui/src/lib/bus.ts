@@ -206,12 +206,11 @@ export function handleEvent(msg: BusEvent): void {
       const text = String(p.text || '');
       if (!text) break;
       if (p.auto_send) {
-        store.addUser('🎙 ' + text);
-        void sendText(text, { interrupt: true });
+        void sendText(text, { interrupt: true, userLabel: '🎙 ' + text });
       } else {
         const draft = store.state.draft;
         store.set({ draft: (draft ? draft + ' ' : '') + text });
-        store.addUser('🎙 ' + text);
+        store.addTool('🎙 PTT transkript je u input polju — pritisni Pošalji.');
       }
       break;
     }

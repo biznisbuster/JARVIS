@@ -175,13 +175,12 @@ class LocalModelSettings:
 class PushToTalkSettings:
     """Global push-to-talk (radi BILO GDE na macOS-u, ne samo u Jarvis prozoru).
 
-    ``key`` je pynput key spec (e.g. ``"right cmd"``, ``"caps lock"``, ``"f20"``).
-    Funkcionalni taster Fn (``keyboard.Key.media_*``) se ne može globalno
-    presluškivati na macOS-u; korisnik bira jedan od dostupnih tastera.
+    ``key`` je pynput key spec (e.g. ``"right cmd"``, ``"caps lock"``, ``"f20"``)
+    ili macOS chord ``"fn+shift"``. Fn nije običan pynput taster, pa se taj
+    chord prati kroz Quartz event tap.
 
     ``mute_while_held`` mutiraj sistemski zvuk dok je PTT aktivan (default True).
-    ``auto_send`` automatski pošalji transkript kao poruku (default False — samo
-    popunjava input polje).
+    ``auto_send`` automatski pošalji transkript kao poruku (default True).
     """
 
     enabled: bool
@@ -430,10 +429,10 @@ def load() -> Settings:
             push_to_talk=PushToTalkSettings(
                 enabled=(_env("JARVIS_PTT_ENABLED", dotenv, "true") or "true").lower()
                 in ("1", "true", "yes"),
-                key=(_env("JARVIS_PTT_KEY", dotenv, "right cmd") or "right cmd").strip().lower(),
+                key=(_env("JARVIS_PTT_KEY", dotenv, "fn+shift") or "fn+shift").strip().lower(),
                 mute_while_held=(_env("JARVIS_PTT_MUTE", dotenv, "true") or "true").lower()
                 in ("1", "true", "yes"),
-                auto_send=(_env("JARVIS_PTT_AUTO_SEND", dotenv, "false") or "false").lower()
+                auto_send=(_env("JARVIS_PTT_AUTO_SEND", dotenv, "true") or "true").lower()
                 in ("1", "true", "yes"),
                 sample_rate=int(_env("JARVIS_PTT_SAMPLE_RATE", dotenv, "16000") or 16000),
             ),

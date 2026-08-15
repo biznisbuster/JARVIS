@@ -149,6 +149,31 @@ class AudioFocusManager:
         await BUS.publish("listen_exit", {"reason": reason, **snapshot})
         return snapshot
 
+    async def wait_until_released(self) -> None:
+        """Wait until listen mode has released focus and restored volume.
+
+        PTT may finish transcription before the debounced volume restore has
+        completed. Waiting here keeps a fast assistant response from being
+        played while the system output is still muted.
+        """
+        while True:
+            async with self._lock:
+                if self._reasons or self._active:
+                    restore_task = None
+                else:
+                    restore_task = self._restore_task
+                    if restore_task is None or restore_task.done():
+                        return
+            if restore_task is not None:
+                try:
+                    await asyncio.shield(restore_task)
+                except asyncio.CancelledError:
+                    if restore_task.cancelled():
+                        continue
+                    raise
+                return
+            await asyncio.sleep(0.02)
+
     def _on_restore_done(self, task: asyncio.Task) -> None:
         if self._restore_task is task:
             self._restore_task = None

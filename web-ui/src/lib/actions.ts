@@ -56,7 +56,10 @@ export async function deleteSession(id: string): Promise<void> {
   }
 }
 
-export async function sendText(text: string, opts?: { interrupt?: boolean }): Promise<void> {
+export async function sendText(
+  text: string,
+  opts?: { interrupt?: boolean; userLabel?: string },
+): Promise<boolean> {
   stopSpeech();
   try {
     const data = await jpost<{ session_id: string }>('/api/chat', {
@@ -65,10 +68,13 @@ export async function sendText(text: string, opts?: { interrupt?: boolean }): Pr
       model: store.state.currentModel || null,
       interrupt: !!opts?.interrupt,
     });
+    if (opts?.userLabel) store.addUser(opts.userLabel);
     store.set({ sessionId: data.session_id });
     void refreshSessions();
+    return true;
   } catch (e) {
     store.addTool(`⚠ chat: ${(e as Error).message}`);
+    return false;
   }
 }
 

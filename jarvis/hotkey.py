@@ -25,10 +25,12 @@ state, not the permission grant (the OS doesn't expose that).
 from __future__ import annotations
 
 import asyncio
+import sys
 import tempfile
 import threading
 import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -36,10 +38,18 @@ from .audio.focus import FOCUS
 from .bus import BUS
 from .config import SETTINGS
 
-# Key spec → pynput.Key enum. We accept a small set of common physical
-# keys; Fn itself can't be bound on macOS so we use the right-Cmd as the
-# default (easy to hold, common PTT choice).
+# Key spec → pynput.Key enum. Fn is not a normal pynput key on macOS; the
+# special ``fn+shift`` chord is handled by a small Quartz event tap below.
 _KEY_MAP: dict[str, Any] = {}
+
+_FN_SHIFT_PARTS = frozenset({"fn", "function"})
+_SHIFT_PARTS = frozenset({"shift", "left shift", "right shift", "shift_l", "shift_r"})
+
+
+def is_fn_shift_spec(spec: str) -> bool:
+    """Return whether ``spec`` names the supported macOS Fn+Shift chord."""
+    parts = {part.strip().lower() for part in (spec or "").split("+") if part.strip()}
+    return len(parts) == 2 and bool(parts & _FN_SHIFT_PARTS) and bool(parts & _SHIFT_PARTS)
 
 
 def _init_key_map() -> None:
@@ -81,7 +91,7 @@ def resolve_key(spec: str) -> Any:
 
 
 class PushToTalk:
-    """Background listener for a single configurable key."""
+    """Background listener for a configurable key or macOS key chord."""
 
     def __init__(self) -> None:
         self._enabled: bool = False
@@ -139,6 +149,9 @@ class PushToTalk:
         try:
             from pynput import keyboard  # noqa: F401
 
+            if is_fn_shift_spec(self._active_key_spec or SETTINGS.audio.push_to_talk.key):
+                import Quartz  # noqa: F401
+
             return True
         except Exception:
             return False
@@ -154,17 +167,21 @@ class PushToTalk:
         except RuntimeError:
             self._loop = None
         cfg = SETTINGS.audio.push_to_talk
-        key = resolve_key(cfg.key)
-        if key is None:
-            raise RuntimeError(f"unknown PTT key: {cfg.key!r}. Supported: {sorted(_KEY_MAP.keys())}")
-        from pynput import keyboard
-
-        self._active_key = key
         self._active_key_spec = cfg.key
-        self._listener = keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release,
-        )
+        if is_fn_shift_spec(cfg.key):
+            self._active_key = None
+            self._listener = self._make_fn_shift_listener()
+        else:
+            key = resolve_key(cfg.key)
+            if key is None:
+                raise RuntimeError(f"unknown PTT key: {cfg.key!r}. Supported: {sorted(_KEY_MAP.keys())}")
+            from pynput import keyboard
+
+            self._active_key = key
+            self._listener = keyboard.Listener(
+                on_press=self._on_press,
+                on_release=self._on_release,
+            )
         try:
             self._listener.start()
         except Exception as exc:
@@ -177,6 +194,47 @@ class PushToTalk:
         self._last_press_at = None
         self._last_error = None
         return self.status()
+
+    def _make_fn_shift_listener(self) -> Any:
+        """Create a listen-only Quartz tap for the macOS Fn+Shift chord.
+
+        Fn is represented by the ``SecondaryFn`` event flag rather than a
+        normal key event, so ``pynput`` cannot reliably expose it through its
+        regular ``on_press`` callback. The event tap observes modifier state
+        only and never suppresses or changes the user's keyboard events.
+        """
+        if sys.platform != "darwin":
+            raise RuntimeError("the fn+shift PTT chord is supported only on macOS")
+
+        try:
+            from pynput import keyboard
+            from Quartz import (
+                CGEventGetFlags,
+                CGEventMaskBit,
+                kCGEventFlagMaskSecondaryFn,
+                kCGEventFlagMaskShift,
+                kCGEventFlagsChanged,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"macOS Quartz support is unavailable for fn+shift PTT: {exc}") from exc
+
+        on_state_change: Callable[[bool, bool], None] = self._on_fn_shift_state
+
+        class FnShiftListener(keyboard.Listener):
+            _EVENTS = CGEventMaskBit(kCGEventFlagsChanged)
+
+            def _handle_message(
+                self, _proxy: Any, event_type: int, event: Any, _refcon: Any, _injected: bool
+            ) -> None:
+                if event_type != kCGEventFlagsChanged:
+                    return
+                flags = CGEventGetFlags(event)
+                on_state_change(
+                    bool(flags & kCGEventFlagMaskSecondaryFn),
+                    bool(flags & kCGEventFlagMaskShift),
+                )
+
+        return FnShiftListener()
 
     def disable(self) -> dict[str, Any]:
         if self._listener is not None:
@@ -226,6 +284,11 @@ class PushToTalk:
     def _on_press(self, key: Any) -> None:
         if key != self._active_key or self._pressed:
             return
+        self._begin_press()
+
+    def _begin_press(self) -> None:
+        if self._pressed:
+            return
         self._pressed = True
         now = time.time()
         if self._first_press_at is None:
@@ -240,12 +303,24 @@ class PushToTalk:
     def _on_release(self, key: Any) -> None:
         if key != self._active_key or not self._pressed:
             return
+        self._end_press()
+
+    def _end_press(self) -> None:
+        if not self._pressed:
+            return
         self._pressed = False
         # Focus must release BEFORE transcription so the user can hear the
         # assistant's reply as soon as the transcript returns.
         self._schedule_focus_exit()
         self._stop_recording()
         self._publish("ptt_recording_end", {})
+
+    def _on_fn_shift_state(self, fn_pressed: bool, shift_pressed: bool) -> None:
+        """Translate Quartz modifier state into the normal PTT lifecycle."""
+        if fn_pressed and shift_pressed:
+            self._begin_press()
+        else:
+            self._end_press()
 
     def _start_recording(self) -> None:
         if self._recording:
@@ -357,6 +432,7 @@ class PushToTalk:
             wav_path.unlink()
         except OSError:
             pass
+        await FOCUS.wait_until_released()
         text = (text or "").strip()
         self._last_text = text
         if not text:
