@@ -36,6 +36,8 @@ class FakePage:
         identity_available: bool = True,
         transport_control_shape: str = "player_bar",
         volume_available: bool = True,
+        click_updates_player: bool = True,
+        search_surface_snapshots: list[dict[str, object]] | None = None,
     ) -> None:
         self.closed = closed
         self.url = url
@@ -53,6 +55,9 @@ class FakePage:
         self.identity_available = identity_available
         self.transport_control_shape = transport_control_shape
         self.volume_available = volume_available
+        self.click_updates_player = click_updates_player
+        self.search_surface_snapshots = search_surface_snapshots or []
+        self.search_surface_reads = 0
         self.last_query = ""
         self.bring_to_front_calls = 0
         self.goto_calls: list[str] = []
@@ -61,7 +66,11 @@ class FakePage:
         self.wait_for_selector_calls: list[str] = []
         self.transport_commands: list[str] = []
         self.volume_commands: list[str] = []
+        self.clicked_video_ids: list[str] = []
+        self.resume_selected_calls: list[str] = []
         self.state_reads = 0
+        self.rendered_candidates: list[dict[str, object]] = []
+        self.rendered_raw_rows: list[dict[str, object]] = []
         self.state = {
             "ok": True,
             "playing": False,
@@ -76,6 +85,55 @@ class FakePage:
             "muted": False,
         }
         self.keyboard = FakeKeyboard(self)
+
+    def configured_candidates(self) -> list[dict[str, object]]:
+        if self.search_result_shape == "component":
+            return [
+                {
+                    "video_id": item.get("video_id", ""),
+                    "title": item.get("title", ""),
+                    "artist": item.get("artist", ""),
+                    "component": item.get("component", "ytmusic-responsive-list-item-renderer"),
+                    "result_type": item.get("result_type", "song"),
+                    "section": item.get("section", "Songs"),
+                    "row_index": index,
+                    "selection_method": item.get("selection_method", "watch_endpoint_anchor"),
+                    "watch_endpoint": item.get("watch_endpoint", False),
+                }
+                for index, item in enumerate(self.component_candidates)
+                if item.get("video_id") and item.get("watch_endpoint")
+            ]
+        video_id = ytm_web._video_id_from_href(self.playable_href)
+        if not video_id:
+            return []
+        return [
+            {
+                "video_id": video_id,
+                "title": "Selected Result",
+                "artist": "Selected Artist",
+                "component": "ytmusic-responsive-list-item-renderer",
+                "result_type": "song",
+                "section": "Songs",
+                "row_index": 0,
+                "selection_method": "watch_endpoint_anchor",
+                "watch_endpoint": True,
+            }
+        ]
+
+    def commit_search_results(self) -> None:
+        self.rendered_candidates = [dict(item) for item in self.configured_candidates()]
+        self.rendered_raw_rows = [
+            dict(item)
+            for item in (
+                self.component_candidates
+                if self.search_result_shape == "component"
+                else self.rendered_candidates
+            )
+        ]
+        if self.search_result_shape != "component":
+            for candidate in self.rendered_candidates:
+                candidate["title"] = self.last_query
+            self.rendered_raw_rows = [dict(item) for item in self.rendered_candidates]
 
     def is_closed(self) -> bool:
         return self.closed
@@ -110,6 +168,67 @@ class FakePage:
                 "player_loaded": self.state.get("player_loaded", True),
                 "playing": self.state.get("playing"),
                 "track_id": self.state.get("track_id", ""),
+            }
+        if "searchCandidateSnapshot" in script:
+            if self.search_surface_snapshots:
+                index = min(self.search_surface_reads, len(self.search_surface_snapshots) - 1)
+                self.search_surface_reads += 1
+                snapshot = dict(self.search_surface_snapshots[index])
+                raw_candidates = snapshot.get("candidates")
+                if isinstance(raw_candidates, list):
+                    self.rendered_candidates = [
+                        dict(item) for item in raw_candidates if isinstance(item, dict)
+                    ]
+                return snapshot
+            candidates = [dict(item) for item in self.rendered_candidates]
+            raw_rows = [dict(item) for item in self.rendered_raw_rows]
+            raw_row_count = len(raw_rows)
+            return {
+                "path": "/search" if self.last_query else "/",
+                "query": self.last_query,
+                "surface_ready": bool(self.last_query),
+                "rows_ready": raw_row_count > 0,
+                "row_fingerprint": [
+                    f"row|{item.get('title', '')}|{item.get('artist', '')}" for item in raw_rows[:12]
+                ],
+                "fingerprint": [
+                    f"{item.get('video_id', '')}|{item.get('title', '')}|"
+                    f"{item.get('artist', '')}|{item.get('result_type', 'unknown')}"
+                    for item in candidates[:12]
+                ],
+                "candidates": candidates,
+            }
+        if "clickSelectedSearchResult" in script:
+            request = arg if isinstance(arg, dict) else {}
+            expected_id = str(request.get("video_id") or "")
+            candidate = next(
+                (item for item in self.rendered_candidates if str(item.get("video_id") or "") == expected_id),
+                None,
+            )
+            if candidate is None:
+                return {
+                    "ok": False,
+                    "clicked": False,
+                    "error": "selected YT Music candidate is no longer present",
+                }
+            self.clicked_video_ids.append(expected_id)
+            if self.click_updates_player:
+                self.state.update(
+                    {
+                        "playing": self.playback_starts,
+                        "player_loaded": True,
+                        "track_id": expected_id,
+                        "identity_source": "movie_player",
+                        "title": candidate.get("title", ""),
+                        "artist": candidate.get("artist", ""),
+                    }
+                )
+            return {
+                "ok": True,
+                "clicked": True,
+                "clicked_video_id": expected_id,
+                "selection_method": candidate.get("selection_method", "watch_endpoint_anchor"),
+                "component": candidate.get("component", "ytmusic-responsive-list-item-renderer"),
             }
         if "searchSurfaceState" in script:
             return {
@@ -210,6 +329,13 @@ class FakePage:
         if "ytmPlayerState" in script:
             self.state_reads += 1
             state = dict(self.state)
+            state.setdefault("media_paused", state.get("playing") is False)
+            state.setdefault("media_ready_state", 4)
+            state.setdefault("identity_source", "movie_player" if state.get("track_id") else None)
+            if "getVideoData" not in script:
+                state["track_id"] = urllib.parse.parse_qs(urllib.parse.urlparse(self.url).query).get(
+                    "v", [""]
+                )[0]
             if not self.identity_available:
                 state.update({"title": "", "artist": "", "track_id": ""})
             return state
@@ -244,6 +370,17 @@ class FakePage:
             else:
                 return {"ok": False, "error": f"unknown volume action: {action}"}
             return {"ok": True, "method": "html_media_element", "before": before, "requested": action}
+        if "resumeSelectedPlayer" in script:
+            expected_id = str(arg or "")
+            self.resume_selected_calls.append(expected_id)
+            if self.state.get("track_id") != expected_id:
+                return {
+                    "ok": False,
+                    "delivered": False,
+                    "error": "selected track is not the loaded player item",
+                }
+            self.state["playing"] = True
+            return {"ok": True, "delivered": True, "method": "verified_selected_video.play"}
         if "video.play" in script:
             action = arg
             self.transport_commands.append(str(action))
@@ -333,6 +470,8 @@ class FakeKeyboard:
 
     async def press(self, key: str) -> None:
         self.page.keyboard_presses.append(key)
+        if key == "Enter" and not self.page.search_surface_snapshots:
+            self.page.commit_search_results()
 
 
 class FakePersistentContext:
@@ -448,6 +587,10 @@ def _reset_ytm_web(monkeypatch):
     monkeypatch.setattr(ytm_web, "_search_ready", False)
     monkeypatch.setattr(ytm_web, "_player_loaded", False)
     monkeypatch.setattr(ytm_web, "_playing", None)
+    monkeypatch.setattr(ytm_web, "_YTM_SEARCH_MAX_READS", 4)
+    monkeypatch.setattr(ytm_web, "_YTM_SEARCH_READ_DELAY", 0)
+    monkeypatch.setattr(ytm_web, "_YTM_PLAYBACK_READ_DELAYS", (0.0, 0.0, 0.0, 0.0))
+    monkeypatch.setattr(ytm_web, "_YTM_PLAYBACK_CONTINUATION_READ_DELAY", 0)
 
 
 @pytest.fixture(autouse=True)
@@ -466,6 +609,32 @@ def _set_connected_runtime(monkeypatch, page: FakePage, *, pages: list[FakePage]
     monkeypatch.setattr(ytm_web, "_page_ready", True)
     monkeypatch.setattr(ytm_web, "_search_ready", True)
     monkeypatch.setattr(ytm_web, "_browser", types.SimpleNamespace(is_connected=lambda: True))
+
+
+def _search_snapshot(
+    query: str,
+    candidates: list[dict[str, object]],
+    *,
+    path: str = "/search",
+) -> dict[str, object]:
+    normalized = [dict(candidate) for candidate in candidates]
+    return {
+        "ok": True,
+        "path": path,
+        "query": query,
+        "surface_ready": path == "/search",
+        "rows_ready": bool(normalized),
+        "row_fingerprint": [
+            f"row|{item.get('video_id', '')}|{item.get('title', '')}|{item.get('artist', '')}"
+            for item in normalized
+        ],
+        "fingerprint": [
+            f"{item.get('video_id', '')}|{item.get('title', '')}|"
+            f"{item.get('artist', '')}|{item.get('result_type', 'unknown')}"
+            for item in normalized
+        ],
+        "candidates": normalized,
+    }
 
 
 async def test_enforce_background_window_minimizes_only_dedicated_ytm_target(monkeypatch) -> None:
@@ -1066,7 +1235,7 @@ async def test_play_query_success(monkeypatch) -> None:
     assert result["query"] == "test song"
     assert result["verified"] is True
     assert result["selected_video_id"] == "test-track"
-    assert result["title"] == "Selected Result"
+    assert result["title"] == "test song"
     assert result["artist"] == "Selected Artist"
     assert page.goto_calls == []
     assert page.fill_calls == ["test song"]
@@ -1205,7 +1374,7 @@ async def test_play_query_specific_artist_song_fails_when_only_partial_match_exi
     result = await ytm_web.play_query("Vlado Georgiev Anđele")
 
     assert result["ok"] is False
-    assert result["error_code"] == "NO_PLAYABLE_SEARCH_RESULT"
+    assert result["error_code"] == "NO_STRONG_MATCH"
     assert result["delivered"] is False
     assert page.transport_commands == []
 
@@ -1258,7 +1427,7 @@ async def test_play_query_no_component_candidate_is_structured_connected_failure
     assert result["result_found"] is False
     assert result["delivered"] is False
     assert result["verified"] is False
-    assert result["error_code"] == "NO_PLAYABLE_SEARCH_RESULT"
+    assert result["error_code"] == "NO_STRONG_MATCH"
     assert "timeout" not in result["error"].lower()
     assert page.wait_for_selector_calls == []
 
@@ -1268,7 +1437,7 @@ async def test_second_component_play_query_changes_track_in_same_session(monkeyp
     page = FakePage(
         search_result_shape="component",
         component_candidates=[
-            {"title": "Relja song", "artist": "Relja", "video_id": "relja-track", "watch_endpoint": True},
+            {"title": "Takvi kao ja", "artist": "Relja", "video_id": "relja-track", "watch_endpoint": True},
         ],
     )
     _set_connected_runtime(monkeypatch, page)
@@ -1296,6 +1465,7 @@ async def test_play_query_connected_playback_failure_is_not_reported_as_login(mo
     page = FakePage(
         search_result_shape="component",
         playback_starts=False,
+        click_updates_player=False,
         component_candidates=[
             {"title": "Song", "artist": "Artist", "video_id": "song-track", "watch_endpoint": True},
         ],
@@ -1308,7 +1478,408 @@ async def test_play_query_connected_playback_failure_is_not_reported_as_login(mo
     assert result["connection_state"] == ytm_web.CONNECTED
     assert result["delivered"] is True
     assert result["verified"] is False
-    assert result["error_code"] == "PLAYBACK_DID_NOT_START"
+    assert result["error_code"] == "PLAYBACK_VERIFICATION_FAILED"
+
+
+@pytest.mark.parametrize(
+    ("query", "candidates", "expected_id", "expected_kind"),
+    [
+        (
+            "They Don't Care About Us Michael Jackson",
+            [
+                {
+                    "video_id": "michael-track",
+                    "title": "They Don't Care About Us",
+                    "artist": "Michael Jackson",
+                    "result_type": "song",
+                    "row_index": 0,
+                }
+            ],
+            "michael-track",
+            "exact_title_artist",
+        ),
+        (
+            "Michael Jackson They Don't Really Care About Us",
+            [
+                {
+                    "video_id": "michael-track",
+                    "title": "They Don't Care About Us",
+                    "artist": "Michael Jackson",
+                    "result_type": "song",
+                    "row_index": 0,
+                }
+            ],
+            "michael-track",
+            "one_extra_token_title_artist",
+        ),
+        (
+            "Vlado Georgiev",
+            [
+                {
+                    "video_id": "vlado-track",
+                    "title": "Nisam ljubomoran",
+                    "artist": "Vlado Georgiev",
+                    "result_type": "song",
+                    "row_index": 1,
+                }
+            ],
+            "vlado-track",
+            "exact_artist",
+        ),
+        (
+            "Nisam ljubomoran",
+            [
+                {
+                    "video_id": "title-track",
+                    "title": "Nisam ljubomoran",
+                    "artist": "Vlado Georgiev",
+                    "result_type": "song",
+                    "row_index": 0,
+                }
+            ],
+            "title-track",
+            "exact_title",
+        ),
+    ],
+)
+def test_candidate_ranking_requires_strong_identity(
+    query: str,
+    candidates: list[dict[str, object]],
+    expected_id: str,
+    expected_kind: str,
+) -> None:
+    selected, scored = ytm_web._rank_search_candidates(query, candidates)
+
+    assert selected is not None
+    assert selected["video_id"] == expected_id
+    assert selected["match_kind"] == expected_kind
+    assert scored[0]["strong_match"] is True
+
+
+def test_candidate_ranking_rejects_weak_title_plus_artist_overlap() -> None:
+    selected, scored = ytm_web._rank_search_candidates(
+        "They Don't Care About Us Michael Jackson",
+        [
+            {
+                "video_id": "unrelated",
+                "title": "They Dance Tonight",
+                "artist": "Michael Bolton",
+                "result_type": "song",
+                "row_index": 0,
+            }
+        ],
+    )
+
+    assert selected is None
+    assert scored[0]["title_match_score"] == 1
+    assert scored[0]["artist_match_score"] == 1
+    assert scored[0]["strong_match"] is False
+
+
+def test_metadata_fallback_cannot_verify_unchanged_old_track() -> None:
+    before = {
+        "ok": True,
+        "playing": True,
+        "player_loaded": True,
+        "track_id": "",
+        "title": "MUŠKARČINA",
+        "artist": "Kotlaja",
+    }
+    selected = {
+        "video_id": "michael-track",
+        "title": "They Don't Care About Us",
+        "artist": "Michael Jackson",
+    }
+
+    verified, verification, loaded = ytm_web._verify_selected_playback(before, dict(before), selected)
+
+    assert verified is False
+    assert verification == "failed"
+    assert loaded is False
+
+
+async def test_play_query_waits_until_stale_rows_are_replaced(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    old = {
+        "video_id": "old-track",
+        "title": "MUŠKARČINA",
+        "artist": "Kotlaja",
+        "result_type": "song",
+        "row_index": 0,
+        "selection_method": "watch_endpoint_anchor",
+    }
+    fresh = {
+        "video_id": "michael-track",
+        "title": "They Don't Care About Us",
+        "artist": "Michael Jackson",
+        "result_type": "song",
+        "row_index": 0,
+        "selection_method": "watch_endpoint_anchor",
+    }
+    query = "They Don't Care About Us Michael Jackson"
+    page = FakePage(
+        search_surface_snapshots=[
+            _search_snapshot("Vlado Georgiev", [old]),
+            _search_snapshot(query, [old]),
+            _search_snapshot(query, [fresh]),
+        ]
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query(query)
+
+    assert result["ok"] is True
+    assert result["selected_video_id"] == "michael-track"
+    assert page.clicked_video_ids == ["michael-track"]
+    assert "old-track" not in page.clicked_video_ids
+    assert result["search_after"]["freshness"] == "candidate_fingerprint_changed"
+
+
+async def test_play_query_never_clicks_rows_that_remain_stale(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    old = {
+        "video_id": "old-track",
+        "title": "MUŠKARČINA",
+        "artist": "Kotlaja",
+        "result_type": "song",
+        "row_index": 0,
+        "selection_method": "watch_endpoint_anchor",
+    }
+    query = "They Don't Care About Us Michael Jackson"
+    page = FakePage(
+        search_surface_snapshots=[
+            _search_snapshot("Vlado Georgiev", [old]),
+            _search_snapshot(query, [old]),
+        ]
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query(query)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "SEARCH_RESULTS_STALE"
+    assert result["delivered"] is False
+    assert page.clicked_video_ids == []
+
+
+async def test_candidate_probe_and_click_remain_bound_to_same_video_id(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    _set_connected_runtime(monkeypatch, page)
+    selected, _ = ytm_web._rank_search_candidates(
+        "Song Artist",
+        [
+            {
+                "video_id": "candidate-a",
+                "title": "Song",
+                "artist": "Artist",
+                "result_type": "song",
+                "row_index": 0,
+            }
+        ],
+    )
+    assert selected is not None
+    page.rendered_candidates = [
+        {
+            "video_id": "candidate-b",
+            "title": "Song",
+            "artist": "Artist",
+            "selection_method": "watch_endpoint_anchor",
+        }
+    ]
+
+    result = await ytm_web._click_selected_search_result(selected)
+
+    assert result["ok"] is False
+    assert result["clicked"] is False
+    assert page.clicked_video_ids == []
+
+
+async def test_get_state_uses_live_player_video_id_on_search_url(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(url="https://music.youtube.com/search?q=artist")
+    page.state.update({"track_id": "VIDEO_A", "identity_source": "movie_player"})
+    _set_connected_runtime(monkeypatch, page)
+
+    first = await ytm_web.get_state()
+    page.state.update({"track_id": "VIDEO_B", "identity_source": "movie_player"})
+    second = await ytm_web.get_state()
+
+    assert first["track_id"] == "VIDEO_A"
+    assert second["track_id"] == "VIDEO_B"
+    assert page.url == "https://music.youtube.com/search?q=artist"
+
+
+async def test_new_request_cannot_verify_when_old_player_identity_remains(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        click_updates_player=False,
+        component_candidates=[
+            {
+                "title": "They Don't Care About Us",
+                "artist": "Michael Jackson",
+                "video_id": "michael-track",
+                "watch_endpoint": True,
+                "result_type": "song",
+            }
+        ],
+    )
+    page.state.update(
+        {
+            "playing": True,
+            "track_id": "old-track",
+            "identity_source": "movie_player",
+            "title": "MUŠKARČINA",
+            "artist": "Kotlaja",
+        }
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("Michael Jackson They Don't Care About Us")
+
+    assert result["ok"] is False
+    assert result["verified"] is False
+    assert result["actual_video_id"] == "old-track"
+    assert result["before"]["track_id"] == "old-track"
+    assert result["selected_video_id"] == "michael-track"
+    assert result["verification"] == "failed"
+    assert result["play_continuation"] is None
+    assert page.resume_selected_calls == []
+
+
+async def test_selected_track_loaded_paused_gets_one_safe_play_continuation(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        playback_starts=False,
+        component_candidates=[
+            {
+                "title": "Nisam ljubomoran",
+                "artist": "Vlado Georgiev",
+                "video_id": "vlado-track",
+                "watch_endpoint": True,
+                "result_type": "song",
+            }
+        ],
+    )
+    page.state.update(
+        {"playing": True, "track_id": "relja-track", "title": "Takvi kao ja", "artist": "Relja"}
+    )
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("Vlado Georgiev Nisam ljubomoran")
+
+    assert result["ok"] is True
+    assert result["verification"] == "verified_player_id"
+    assert result["actual_video_id"] == "vlado-track"
+    assert result["play_continuation"]["delivered"] is True
+    assert page.resume_selected_calls == ["vlado-track"]
+    assert page.clicked_video_ids == ["vlado-track"]
+
+
+async def test_safe_play_continuation_always_gets_a_followup_verification_read(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    page.state.update(
+        {
+            "playing": False,
+            "player_loaded": True,
+            "track_id": "selected-track",
+            "identity_source": "movie_player",
+            "title": "Selected Song",
+            "artist": "Selected Artist",
+        }
+    )
+    _set_connected_runtime(monkeypatch, page)
+    monkeypatch.setattr(ytm_web, "_YTM_PLAYBACK_READ_DELAYS", (0.0, 0.0, 0.0))
+    selected = {
+        "video_id": "selected-track",
+        "title": "Selected Song",
+        "artist": "Selected Artist",
+    }
+    before = {
+        "ok": True,
+        "playing": True,
+        "player_loaded": True,
+        "track_id": "old-track",
+        "title": "Old Song",
+        "artist": "Old Artist",
+    }
+
+    state, verified, verification, reads, continuation = await ytm_web._observe_selected_playback(
+        before,
+        selected,
+    )
+
+    assert verified is True
+    assert verification == "verified_player_id"
+    assert state["playing"] is True
+    assert continuation["delivered"] is True
+    assert reads[-1]["post_continuation"] is True
+    assert page.resume_selected_calls == ["selected-track"]
+
+
+async def test_delayed_selected_track_transition_succeeds_with_bounded_reads(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(
+        search_result_shape="component",
+        click_updates_player=False,
+        component_candidates=[
+            {
+                "title": "Nisam ljubomoran",
+                "artist": "Vlado Georgiev",
+                "video_id": "vlado-track",
+                "watch_endpoint": True,
+                "result_type": "song",
+            }
+        ],
+    )
+    page.state.update(
+        {"playing": True, "track_id": "relja-track", "title": "Takvi kao ja", "artist": "Relja"}
+    )
+    _set_connected_runtime(monkeypatch, page)
+    original_get_state = ytm_web.get_state
+    post_click_reads = 0
+
+    async def delayed_get_state() -> dict[str, object]:
+        nonlocal post_click_reads
+        if page.clicked_video_ids:
+            post_click_reads += 1
+            if post_click_reads == 3:
+                page.state.update(
+                    {
+                        "playing": True,
+                        "player_loaded": True,
+                        "track_id": "vlado-track",
+                        "identity_source": "movie_player",
+                        "title": "Nisam ljubomoran",
+                        "artist": "Vlado Georgiev",
+                    }
+                )
+        return await original_get_state()
+
+    monkeypatch.setattr(ytm_web, "get_state", delayed_get_state)
+
+    result = await ytm_web.play_query("Vlado Georgiev Nisam ljubomoran")
+
+    assert result["ok"] is True
+    assert result["actual_video_id"] == "vlado-track"
+    assert len(result["verification_reads"]) == 3
+    assert page.resume_selected_calls == []
+
+
+async def test_raw_video_id_is_not_used_as_search_query(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.play_query("QNJL6nfu__Q")
+
+    assert result["ok"] is False
+    assert result["error_code"] == "RAW_VIDEO_ID_NOT_SEARCHABLE"
+    assert result["search_submitted"] is False
+    assert page.fill_calls == []
 
 
 async def test_transport_requires_loaded_player(monkeypatch) -> None:

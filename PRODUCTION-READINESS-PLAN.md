@@ -1506,6 +1506,189 @@ Phase 2.
 
 ---
 
+## Phase 1 search-result identity correction (2026-08-15)
+
+### Root cause
+
+The user-led real run on `405f135d573c3aeab054e3f9f0f40983b5199a22`
+confirmed a false-positive `ytm_play`. The search URL changed to the Michael
+Jackson query, but the candidate probe used:
+
+```text
+document.querySelector('ytmusic-search-page, ytmusic-section-list-renderer')
+```
+
+The first matching element in the real DOM was the persistent home-page
+`Listen again` section, not `ytmusic-search-page`. Its candidate fingerprint
+remained unchanged across Relja, Vlado and Michael Jackson searches, so the
+adapter selected recycled rows such as `MUŠKARČINA` or an unrelated Dzejla
+cover after the route had already changed.
+
+The weak partial-query exception then allowed a long request to continue when
+only one title token and one artist token matched. Search selection was also
+performed twice (`click=false`, then a new `click=true` probe), so the clicked
+row was not identity-bound to the originally inspected candidate.
+
+Finally, YT Music normally keeps the SPA URL on `/search?q=...`, while
+`get_state()` derived `track_id` from URL `v=`. The real authoritative player
+already exposed the active identity through
+`#movie_player.getVideoData().video_id`; ignoring it forced metadata fallback
+and allowed an unchanged unrelated player to be accepted as success.
+
+### Real pre-fix candidate evidence
+
+The bad root exposed the same stale `Listen again` IDs after unrelated query
+changes, including `g21vfoxBeNs` (Relja), `W-aqoVliWtk` (Vlado) and other
+history rows. A direct bounded inspection of the actual visible
+`ytmusic-search-page` for `They Don't Care About Us Michael Jackson` showed:
+
+| Order | Video ID | Title | Artist | Type |
+|---:|---|---|---|---|
+| 1 | `QNJL6nfu__Q` | They Don't Care About Us | Michael Jackson | video |
+| 2 | `t1pqi8vjTLY` | They Don't Care About Us (Prison Version) (Official Video) | Michael Jackson | video |
+| 3 | `_QqCu0ktlhM` | Michael Jackson - They Don't Care About Us - Live Munich 1997 | LiveMJHD | video |
+| 4 | `GsHZBisKwxg` | They Don't Care About Us (Remastered Version) | Michael Jackson | song |
+| 5 | `q-OzeShtUXg` | Michael Jackson - They Don t Care About Us Dark Gothic Orchestral | Gr1ven | song |
+| 6 | `iWeSEk_vjd8` | They Don't Care About Us (Epic Version) | Mathias Fritsche | song |
+
+No credentials, cookies, tokens or media URLs were captured.
+
+### Completed
+
+- Scoped result discovery exclusively to the visible `ytmusic-search-page`.
+- Captured the prior row/candidate fingerprint and required positive freshness
+  evidence after the exact new search route before selection.
+- Replaced the weak partial-token escape hatch with deterministic candidate
+  ranking over title, artist, video ID, result type and row order.
+- Required exact title+artist identity for specific requests; allowed exactly
+  one extra STT token only when both title and artist remain strongly matched.
+- Kept artist-only and exact-title-only requests supported, including the real
+  `Relja Popović` -> `Relja` stage-name case.
+- Preserved one selected video ID from ranking through a separate exact-ID
+  click revalidation; DOM reordering can no longer turn candidate A into B.
+- Read the active video ID from `#movie_player.getVideoData()` on both
+  `/search?q=...` and `/watch?v=...`; URL `v=` is now only a fallback.
+- Required `actual_player_video_id == selected_video_id` and `playing=true`
+  for normal success. Metadata fallback also requires strong selected metadata
+  and an observed before/after metadata change for a new result.
+- Added bounded post-click reads. One `video.play()` continuation is allowed
+  only after the selected ID remains loaded, media is ready and explicitly
+  paused over multiple reads; the result row is never clicked again.
+- Rejected raw 11-character video IDs as public `ytm_play` search queries.
+- Strengthened the agent prompt: ordinary song failure stays inside YT Music,
+  never auto-falls back to `play_youtube`/`open_url`, and permits at most one
+  clearly justified corrected YTM query.
+
+### Old vs new selection rule
+
+```text
+OLD
+URL q changed
+-> first generic section-list rows
+-> any long query with one title + one artist token could continue
+-> probe again and click whichever row wins now
+
+NEW
+exact visible ytmusic-search-page
+-> changed row/candidate fingerprint (or same-query surface)
+-> deterministic strong title/artist identity
+-> preserve selected_video_id
+-> revalidate and click exactly that video_id once
+```
+
+### Tests added/changed
+
+- Stale rows after the new `q` route cannot be selected or clicked.
+- Probe/click remains bound to the same video ID.
+- Exact title+artist, one-extra-token, artist-only and title-only ranking.
+- Weak one-title/one-artist overlap and unrelated candidates are rejected.
+- `/search?q=...` state follows changing live player IDs independently of URL.
+- `before=MUŠKARČINA`, Michael Jackson request, `after=MUŠKARČINA` cannot
+  succeed through either ID or metadata verification.
+- Correct selected ID loaded but paused receives one safe play continuation;
+  old-track state receives none; a delayed correct transition succeeds through
+  bounded reads.
+- Raw video-ID search recovery is rejected.
+- Prompt regressions preserve explicit video use while prohibiting automatic
+  song fallback to `play_youtube` or `open_url`.
+- Existing minimized-window, pause/resume, next/previous, volume and
+  single-delivery regressions remain in the targeted/full suite.
+
+### Real authenticated adapter validation
+
+- Baseline unrelated `Kotlaja MUŠKARČINA` -> PASS; selected and final
+  `OEoAO-TamKQ`, `playing=true`.
+- `Relja Popović` -> PASS; real run selected/final `IRlPbqzZcWM`, Relja,
+  `playing=true`.
+- `Vlado Georgiev` -> PASS inside the adapter; selected/final
+  `Gl5cSh60qhs`, Vlado Georgiev, `playing=true`, with no separate
+  `ytm_status` repair.
+- `They Don't Care About Us Michael Jackson` -> PASS; selected/final a strong
+  Michael Jackson result (`GsHZBisKwxg` in the primary run).
+- Reordered `Michael Jackson They Don't Care About Us` -> PASS.
+- Extra-token `Michael Jackson They Don't Really Care About Us` -> PASS;
+  selected/final `QNJL6nfu__Q`, Michael Jackson, using the explicit
+  one-extra-token title+artist rule.
+- Nonsense query -> PASS as a negative case: `ok=false`,
+  `NO_STRONG_MATCH`; the existing Michael Jackson player identity remained
+  unchanged and was not reported as a new success.
+- Repeat A -> B -> A -> C -> PASS; every success had
+  `selected_id == actual_id == final_id` and `playing=true`.
+- The dedicated CDP window remained `minimized` at every recorded point.
+- This was direct DOM/adapter validation; audible output and the final
+  user-led chat behavior were not independently claimed.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/prompts.py`
+- `tests/test_ytm_web.py`
+- `tests/test_prompts.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Validation
+
+- Focused YTM/prompt tests -> PASS (`103 passed`).
+- Full backend -> PASS (`223 passed, 3 xfailed`); the xfails are the existing
+  Phase 3 local-model defects. The first restricted run could not bind five
+  local integration-test ports; the identical suite passed outside that
+  sandbox restriction.
+- Targeted Ruff and changed-file format checks -> PASS.
+- `git diff --check` -> PASS.
+- Full repository Ruff -> FAIL only on the three pre-existing unused imports
+  in `jarvis/audio/focus.py`, `jarvis/log.py` and
+  `tests/test_web_ui_7b.py`.
+- Full repository format check -> FAIL only on the five pre-existing files
+  `AGENTS.md`, `DEVELOPER-GUIDE.md`, `jarvis/app.py`,
+  `jarvis/audio/focus.py` and `jarvis/log.py`.
+- Frontend -> not touched by this correction.
+
+### Manual validation still required
+
+- Repeat the exact Relja/Vlado/Michael Jackson matrix through normal JARVIS
+  chat/PTT and confirm the audible track matches the final reported title and
+  artist.
+- Confirm a failed ordinary song request does not trigger `play_youtube`,
+  `open_url`, another browser/player or a raw-video-ID retry in the real model
+  trace.
+- Confirm the dedicated browser remains backgrounded throughout the chat flow.
+
+### Remaining risks
+
+- YT Music result metadata/Polymer fields can change; failures now remain
+  bounded and explicit instead of accepting generic or stale rows.
+- Artist-only stage-name matching intentionally uses fresh YTM result ordering
+  plus a strict one-token artist alias; a weak unrelated candidate remains
+  rejected.
+- Phase 2 `MediaService` and wider tool-executor policy have not started.
+
+### Ready for next phase
+
+NO — the real adapter matrix passes, but the final user-led audible/chat
+checkpoint remains open. Do not merge and do not start Phase 2.
+
+---
+
 # 5. Phase 2 — Introduce authoritative MediaService
 
 **Priority:** P0/P1  
@@ -2521,12 +2704,39 @@ detect the missing playback, but does not add an unbounded retry or a provider
 fallback.
 
 **Recommended phase:**
-A focused YT Music adapter follow-up, or the Phase 2 media boundary once it is
-authorized. Preserve the current strict false result until the player effect
-can be verified.
+Phase 1 — resolved in the search-result identity correction. The adapter now
+reads the real player video ID, owns bounded delayed verification and may call
+`video.play()` once only when that exact selected ID is stably loaded, ready
+and paused.
 
-**Blocks current phase:** yes — the final user-led YT Music playback checkpoint
-remains open.
+**Blocks current phase:** yes — resolved in code and direct real-adapter
+validation; the final user-led audible/chat checkpoint remains open.
+
+## [P0] Stale generic section-list rows caused false YTM play success
+
+**Found in phase:** 1 search-result identity correction
+**Files:** `jarvis/media/ytm_web.py`, `tests/test_ytm_web.py`
+
+**Symptom:**
+After the search URL changed to a Michael Jackson request, `ytm_play` could
+select and report `MUŠKARČINA` or another unrelated prior item. One run
+returned `ok=true`, `verified=true`, `verified_metadata` while the visible
+player remained on `MUŠKARČINA`.
+
+**Root cause:**
+The comma-separated root selector returned the first generic
+`ytmusic-section-list-renderer`, which was the persistent `Listen again`
+surface, instead of the real `ytmusic-search-page`. A weak partial-token rule
+accepted one title plus one artist token, and URL-derived identity was empty
+on `/search?q=...`, allowing unsafe metadata verification.
+
+**Recommended phase:**
+Phase 1 — fixed by exact search-page scoping, positive result freshness,
+strong deterministic title/artist ranking, same-video-ID click binding and
+authoritative `#movie_player.getVideoData().video_id` verification.
+
+**Blocks current phase:** yes — resolved in code and direct real-adapter
+validation; final user-led audible/chat validation remains required.
 
 ---
 

@@ -31,11 +31,11 @@ Alati koje imaš (koristi ih kad su relevantni):
 - calendar_today — današnji događaji (Apple Calendar, čitanje).
 - open_app — otvori macOS aplikaciju po imenu.
 - open_url — otvori URL u podrazumevanom browseru.
-- ytm_play — **podrazumevani alat za pesme**. Koristi povezanu, namensku YT Music browser sesiju, pretraži i pusti verifikovani rezultat. Ako rezultat ima `connection_state` DISCONNECTED ili NEEDS_LOGIN, prijavi neuspeh i uputi korisnika na "Poveži YouTube Music" u tabu Konekcije. Ako je `connection_state` CONNECTED, ne traži ponovnu prijavu samo zato što je `ok=false`: razlikuj grešku pretrage, neuspeh pokretanja i neuspeh verifikacije, i reci da je YT Music povezan ali zahtev nije potvrđen.
+- ytm_play — **autoritativni alat za obične pesme**. Koristi povezanu, namensku YT Music browser sesiju, pretraži i pusti verifikovani rezultat. Ako rezultat ima `connection_state` DISCONNECTED ili NEEDS_LOGIN, prijavi neuspeh i uputi korisnika na "Poveži YouTube Music" u tabu Konekcije. Ako je `connection_state` CONNECTED, ne traži ponovnu prijavu samo zato što je `ok=false`: razlikuj grešku pretrage, neuspeh pokretanja i neuspeh verifikacije, i reci da je YT Music povezan ali zahtev nije potvrđen. Posle neuspelog ytm_play za običnu pesmu NE koristi automatski play_youtube, open_url niti drugi browser/player; ne izmišljaj direktan video ID i ne šalji sirovi video ID kao ytm_play query. Dozvoljen je najviše jedan jasno opravdan ispravljen YT Music upit kada su naslov i izvođač očigledni, inače tačno prijavi neuspeh.
 - ytm_pause / ytm_resume / ytm_next / ytm_previous — kontrola reprodukcije (pauza, nastavak, sledeća, prethodna). Svaka akcija verifikuje efekat i prijavljuje STVARNO stanje u rezultatu — pročitaj rezultat i veruj njemu. Pause/resume možeš ponoviti samo kada rezultat jasno pokazuje da idempotentno stanje nije postignuto; next/previous nemoj automatski ponavljati kada je komanda već isporučena ali tranzicija nije potvrđena, jer su to non-idempotentne akcije.
 - ytm_volume_set / ytm_volume_up / ytm_volume_down / ytm_volume_mute — kontroliši samo YT Music player, nikada macOS sistemski zvuk. Za "stavi/podesi YT Music na X%" koristi ytm_volume_set(level=X). Za "pojačaj/smanji za X%" koristi ytm_volume_up/down(amount=X) u jednom pozivu; bez amount koristi podrazumevanih 10%. Za ceo Mac koristi system_volume.
 - ytm_status — status i verifikovana reprodukcija iz namenske YT Music browser sesije; generički macOS now-playing nije dokaz za YT Music.
-- play_youtube — **samo za videe/klipove** (spotovi, tutoriali, klipovi), NE za obične pesme. Otvara Chrome i pušta prvi YouTube rezultat.
+- play_youtube — **samo kada korisnik izričito traži video/klip/spot/tutorial ili kaže YouTube**, NE kao fallback za običnu pesmu ili neuspešan ytm_play. Otvara Chrome i pušta prvi YouTube rezultat.
 - web_search — pretraži web (DuckDuckGo).
 - read_clipboard / write_clipboard — clipboard.
 - system_volume — podešavanje zvuka sistema.
@@ -44,7 +44,8 @@ Alati koje imaš (koristi ih kad su relevantni):
 Rutiranje muzike vs videa:
 - "pusti pesmu / muziku / numera / track / artistu" → ytm_play
 - "pusti sledeću / prethodnu / pauziraj / pojačaj / utišaj" (bez konteksta) → ytm_* (podrazumevano je YTM kad god korisnik priča o muzici u svom playeru)
-- "pusti klip / video / spot / tutorial / youtube" → play_youtube
+- "pusti klip / video / spot / tutorial / pusti na YouTube" → play_youtube
+- Ne prelazi sa neuspelog ytm_play na play_youtube/open_url bez izričitog korisnikovog zahteva za YouTube/video.
 
 Kontekst:
 - Radiš na macOS-u (Apple Silicon), korisnikov nalog ima pristup standardnim Apple aplikacijama.
