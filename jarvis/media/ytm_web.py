@@ -55,7 +55,10 @@ _search_ready: bool = False
 _player_loaded: bool = False
 _playing: bool | None = None
 
-_YTM_VOLUME_STEP = 0.10
+_YTM_VOLUME_DEFAULT_AMOUNT = 10
+_YTM_VOLUME_TOLERANCE = 0.011
+_YTM_PREVIOUS_RESTART_MIN_TIME = 3.0
+_YTM_PREVIOUS_RESTART_MAX_TIME = 2.5
 
 
 def _get_lock() -> asyncio.Lock:
@@ -478,6 +481,80 @@ async def _present_ytm_page() -> bool:
         return False
 
 
+async def _enforce_background_window() -> dict[str, Any]:
+    """Minimize only the dedicated YT Music window through its CDP target."""
+    page = await _find_or_adopt_ytm_page()
+    if page is None or _browser is None:
+        return {"ok": False, "error": "dedicated YT Music browser target is unavailable"}
+    cdp = None
+    try:
+        cdp = await _browser.new_browser_cdp_session()
+        targets = await cdp.send("Target.getTargets")
+        page_url = str(getattr(page, "url", "") or "")
+        target_infos = targets.get("targetInfos", []) if isinstance(targets, dict) else []
+        target = next(
+            (
+                info
+                for info in target_infos
+                if info.get("type") == "page"
+                and info.get("url") == page_url
+                and _page_origin(page) == YTM_URL
+            ),
+            None,
+        )
+        if target is None:
+            target = next(
+                (
+                    info
+                    for info in target_infos
+                    if info.get("type") == "page"
+                    and _page_origin(page) == YTM_URL
+                    and str(info.get("url") or "").startswith(YTM_URL)
+                ),
+                None,
+            )
+        if not isinstance(target, dict) or not target.get("targetId"):
+            return {"ok": False, "error": "dedicated YT Music CDP target was not found"}
+        target_id = target["targetId"]
+        window = await cdp.send("Browser.getWindowForTarget", {"targetId": target_id})
+        window_id = window.get("windowId") if isinstance(window, dict) else None
+        bounds = window.get("bounds") if isinstance(window, dict) else None
+        if window_id is None or not isinstance(bounds, dict):
+            return {"ok": False, "error": "dedicated YT Music window bounds were unavailable"}
+        state = bounds.get("windowState")
+        changed = state != "minimized"
+        if changed:
+            await cdp.send(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"windowState": "minimized"}},
+            )
+            state = "minimized"
+        result = {
+            "ok": True,
+            "target_id": target_id,
+            "window_id": window_id,
+            "window_state": state,
+            "changed": changed,
+        }
+        log.debug(
+            "ytm_web: background window target=%s window=%s state=%s changed=%s",
+            target_id,
+            window_id,
+            state,
+            changed,
+        )
+        return result
+    except Exception as exc:
+        log.debug("ytm_web: background window enforcement unavailable: %s", exc)
+        return {"ok": False, "error": str(exc)}
+    finally:
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+
+
 async def _navigate_to_ytm(*, present: bool = False) -> bool:
     global _connection_state, _connection_error
     page = await _find_or_adopt_ytm_page()
@@ -493,6 +570,8 @@ async def _navigate_to_ytm(*, present: bool = False) -> bool:
         # user action in the headed browser and is never automated here.
         await asyncio.sleep(0.5)
         await _refresh_connection_status()
+        if not present:
+            await _enforce_background_window()
         return True
     except Exception as exc:
         _connection_state = ERROR
@@ -566,6 +645,7 @@ async def ensure_ready() -> bool:
     global _connection_state, _connection_error
     if is_available():
         await _refresh_connection_status()
+        await _enforce_background_window()
         return is_available()
     if not _launched:
         if not _profile_is_connected():
@@ -578,6 +658,7 @@ async def ensure_ready() -> bool:
         await _navigate_to_ytm()
     else:
         await _refresh_connection_status()
+        await _enforce_background_window()
     return is_available()
 
 
@@ -708,19 +789,33 @@ _MEDIA_VOLUME_STATE_JS = r"""
 """
 
 _MEDIA_VOLUME_CONTROL_JS = r"""
-async (action) => {
+async (request) => {
   const ytmMediaVolumeControl = true;
   void ytmMediaVolumeControl;
   const video = document.querySelector('video');
   if (!video) return { ok: false, error: 'no video element' };
+  const action = String((request && request.action) || '');
+  const amount = Number(request && request.amount);
+  const level = Number(request && request.level);
   const before = {
     volume: Number.isFinite(video.volume) ? video.volume : null,
     muted: !!video.muted,
   };
   if (action === 'volume_up') {
-    video.volume = Math.min(1, Math.max(0, video.volume + 0.10));
+    if (!Number.isFinite(amount) || amount < 1 || amount > 100) {
+      return { ok: false, error: 'volume amount must be between 1 and 100' };
+    }
+    video.volume = Math.min(1, Math.max(0, video.volume + amount / 100));
   } else if (action === 'volume_down') {
-    video.volume = Math.min(1, Math.max(0, video.volume - 0.10));
+    if (!Number.isFinite(amount) || amount < 1 || amount > 100) {
+      return { ok: false, error: 'volume amount must be between 1 and 100' };
+    }
+    video.volume = Math.min(1, Math.max(0, video.volume - amount / 100));
+  } else if (action === 'volume_set') {
+    if (!Number.isFinite(level) || level < 0 || level > 100) {
+      return { ok: false, error: 'volume level must be between 0 and 100' };
+    }
+    video.volume = Math.min(1, Math.max(0, level / 100));
   } else if (action === 'volume_mute') {
     video.muted = !video.muted;
   } else {
@@ -730,7 +825,8 @@ async (action) => {
     ok: true,
     method: 'html_media_element',
     before,
-    requested: action,
+    requested: { action, amount: Number.isFinite(amount) ? amount : null,
+      level: Number.isFinite(level) ? level : null },
   };
 }
 """
@@ -1080,6 +1176,9 @@ def _verify_volume_action(
     action: str,
     before: dict[str, Any] | None,
     after: dict[str, Any] | None,
+    *,
+    amount: int | None = None,
+    level: int | None = None,
 ) -> tuple[bool, str]:
     if not isinstance(after, dict) or not after.get("ok"):
         return False, "unavailable"
@@ -1093,100 +1192,209 @@ def _verify_volume_action(
         return False, "unavailable"
     if not isinstance(after.get("volume"), (int, float)):
         return False, "unavailable"
-    delta = _YTM_VOLUME_STEP if action == "volume_up" else -_YTM_VOLUME_STEP
-    expected = min(1.0, max(0.0, float(before["volume"]) + delta))
-    if abs(float(after["volume"]) - expected) <= 0.011:
+    if action == "volume_set":
+        if level is None:
+            return False, "unavailable"
+        expected = level / 100
+    else:
+        if amount is None:
+            return False, "unavailable"
+        delta = amount / 100 if action == "volume_up" else -amount / 100
+        expected = min(1.0, max(0.0, float(before["volume"]) + delta))
+    if abs(float(after["volume"]) - expected) <= _YTM_VOLUME_TOLERANCE:
         return True, "verified"
     return False, "failed"
 
 
-async def control_volume(action: str) -> dict[str, Any]:
+def _volume_failure(
+    action: str,
+    *,
+    error: str,
+    error_code: str = "INVALID_ARGUMENTS",
+    amount: int | None = None,
+    level: int | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "action": action,
+        "adapter": "ytm_web",
+        "delivered": False,
+        "verified": False,
+        "verification": "not_attempted",
+        "degraded": False,
+        "error_code": error_code,
+        "error": error,
+    }
+    if amount is not None:
+        result["amount"] = amount
+    if level is not None:
+        result["level"] = level
+    return result
+
+
+async def control_volume(
+    action: str,
+    *,
+    amount: int | None = None,
+    level: int | None = None,
+) -> dict[str, Any]:
     """Change only the connected YT Music HTML media element volume."""
-    if action not in ("volume_up", "volume_down", "volume_mute"):
-        return {
-            "ok": False,
-            "action": action,
-            "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "error": f"unknown volume action: {action}",
-        }
+    if action not in ("volume_up", "volume_down", "volume_set", "volume_mute"):
+        return _volume_failure(action, error=f"unknown volume action: {action}", error_code="UNKNOWN_ACTION")
+
+    requested_amount: int | None = None
+    requested_level: int | None = None
+    if action in ("volume_up", "volume_down"):
+        requested_amount = _YTM_VOLUME_DEFAULT_AMOUNT if amount is None else amount
+        if isinstance(requested_amount, bool) or not isinstance(requested_amount, int):
+            return _volume_failure(
+                action,
+                amount=requested_amount if isinstance(requested_amount, int) else None,
+                error="volume amount must be an integer between 1 and 100",
+            )
+        if not 1 <= requested_amount <= 100:
+            return _volume_failure(
+                action,
+                amount=requested_amount,
+                error="volume amount must be between 1 and 100",
+            )
+    elif action == "volume_set":
+        requested_level = level
+        if isinstance(requested_level, bool) or not isinstance(requested_level, int):
+            return _volume_failure(
+                action,
+                error="volume level must be an integer between 0 and 100",
+            )
+        if not 0 <= requested_level <= 100:
+            return _volume_failure(
+                action,
+                level=requested_level,
+                error="volume level must be between 0 and 100",
+            )
+
     if not await ensure_ready():
         status = _status_payload()
-        return {
-            "ok": False,
-            "action": action,
-            "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "degraded": False,
-            "connection_state": status["state"],
-            "page_ready": status["page_ready"],
-            "search_ready": status["search_ready"],
-            "player_loaded": status["player_loaded"],
-            "error": f"YT Music is {status['state'].lower()}",
-        }
+        result = _volume_failure(
+            action,
+            amount=requested_amount,
+            level=requested_level,
+            error=f"YT Music is {status['state'].lower()}",
+            error_code="NOT_READY",
+        )
+        result.update(
+            {
+                "connection_state": status["state"],
+                "page_ready": status["page_ready"],
+                "search_ready": status["search_ready"],
+                "player_loaded": status["player_loaded"],
+            }
+        )
+        return result
+
+    player_state = await get_state()
+    if not _state_has_player(player_state):
+        result = _volume_failure(
+            action,
+            amount=requested_amount,
+            level=requested_level,
+            error="YT Music player has no loaded track",
+            error_code="PLAYER_NOT_LOADED",
+        )
+        result.update(
+            {
+                "connection_state": _status_payload()["state"],
+                "before": player_state,
+                "after": None,
+            }
+        )
+        return result
 
     before = await _read_volume_state()
     if not before.get("ok"):
         status = _status_payload()
-        return {
-            "ok": False,
-            "action": action,
-            "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "degraded": False,
-            "connection_state": status["state"],
-            "before": before,
-            "after": None,
-            "error": before.get("error", "YT Music media element is unavailable"),
-        }
+        result = _volume_failure(
+            action,
+            amount=requested_amount,
+            level=requested_level,
+            error=before.get("error", "YT Music media element is unavailable"),
+            error_code="MEDIA_ELEMENT_UNAVAILABLE",
+        )
+        result.update(
+            {
+                "connection_state": status["state"],
+                "before": before,
+                "after": None,
+            }
+        )
+        return result
 
+    request = {
+        "action": action,
+        "amount": requested_amount,
+        "level": requested_level,
+    }
     try:
-        send_result = await _ytm_page.evaluate(_MEDIA_VOLUME_CONTROL_JS, action)
+        send_result = await _ytm_page.evaluate(_MEDIA_VOLUME_CONTROL_JS, request)
     except Exception as exc:
         send_result = {"ok": False, "error": str(exc)}
-    delivered = bool(isinstance(send_result, dict) and send_result.get("ok"))
+    send_data = send_result if isinstance(send_result, dict) else {}
+    delivered = bool(send_data.get("ok"))
     if not delivered:
         status = _status_payload()
-        return {
-            "ok": False,
-            "action": action,
-            "method": (send_result or {}).get("method"),
-            "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "degraded": False,
-            "connection_state": status["state"],
-            "before": before,
-            "after": None,
-            "error": (send_result or {}).get("error", "volume command was not delivered"),
-        }
+        result = _volume_failure(
+            action,
+            amount=requested_amount,
+            level=requested_level,
+            error=send_data.get("error", "volume command was not delivered"),
+            error_code="DELIVERY_FAILED",
+        )
+        result.update(
+            {
+                "method": send_data.get("method"),
+                "connection_state": status["state"],
+                "before": before,
+                "after": None,
+            }
+        )
+        return result
 
     await asyncio.sleep(0.05)
     after = await _read_volume_state()
-    verified, verification = _verify_volume_action(action, before, after)
+    verified, verification = _verify_volume_action(
+        action,
+        before,
+        after,
+        amount=requested_amount,
+        level=requested_level,
+    )
+    await _enforce_background_window()
     status = _status_payload()
     result = {
         "ok": bool(delivered and verified),
         "action": action,
-        "method": (send_result or {}).get("method", "html_media_element"),
+        "method": send_data.get("method", "html_media_element"),
         "adapter": "ytm_web",
         "delivered": delivered,
         "verified": verified,
         "verification": verification,
         "degraded": delivered and not verified and verification == "unavailable",
+        "error_code": None
+        if verified
+        else "VERIFICATION_UNAVAILABLE"
+        if verification == "unavailable"
+        else "VOLUME_NOT_REACHED",
         "connection_state": status["state"],
         "before": before,
         "after": after,
-        "volume": after.get("volume"),
-        "muted": after.get("muted"),
+        "volume": after.get("volume") if isinstance(after, dict) else None,
+        "muted": after.get("muted") if isinstance(after, dict) else None,
     }
+    if requested_amount is not None:
+        result["amount"] = requested_amount
+    if requested_level is not None:
+        result["requested_level"] = requested_level
+        actual_volume = result["volume"]
+        result["level"] = round(actual_volume * 100) if isinstance(actual_volume, (int, float)) else None
     if not verified:
         result["error"] = (
             "YT Music volume change could not be verified"
@@ -1232,6 +1440,58 @@ def _verify_action(
     if before_identity is None or after_identity is None:
         return False, "unavailable"
     return (before_identity != after_identity, "verified" if before_identity != after_identity else "failed")
+
+
+def _native_previous_restart_detected(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> bool:
+    """Recognize YT Music's native restart-current Previous behavior.
+
+    A second Previous click is safe only when the same track is identified in
+    both reads and the media element demonstrably jumped from a progressed
+    position back to the beginning. Missing metadata is never enough.
+    """
+    if _track_identity(before) is None or _track_identity(after) is None:
+        return False
+    if _track_identity(before) != _track_identity(after):
+        return False
+    before_time = before.get("currentTime") if isinstance(before, dict) else None
+    after_time = after.get("currentTime") if isinstance(after, dict) else None
+    if isinstance(before_time, bool) or isinstance(after_time, bool):
+        return False
+    if not isinstance(before_time, (int, float)) or not isinstance(after_time, (int, float)):
+        return False
+    return (
+        before_time >= _YTM_PREVIOUS_RESTART_MIN_TIME
+        and after_time <= _YTM_PREVIOUS_RESTART_MAX_TIME
+        and after_time < before_time - 1.0
+    )
+
+
+async def _observe_after_delivery(
+    action: str,
+    before: dict[str, Any],
+    *,
+    detect_native_restart: bool = True,
+) -> tuple[dict[str, Any] | None, bool, str, bool]:
+    """Read bounded post-command state without sending another command."""
+    read_count = 4 if action in ("next", "previous") else 1
+    state: dict[str, Any] | None = None
+    verification = "unavailable"
+    for _ in range(read_count):
+        await asyncio.sleep(0.4)
+        state = await get_state()
+        verified, verification = _verify_action(action, before, state)
+        if verified:
+            return state, True, "verified", False
+        if (
+            action == "previous"
+            and detect_native_restart
+            and _native_previous_restart_detected(before, state)
+        ):
+            return state, False, verification, True
+    return state, False, verification, False
 
 
 def _state_has_player(state: dict[str, Any] | None) -> bool:
@@ -1297,13 +1557,14 @@ async def control(action: str) -> dict[str, Any]:
             "connection_state": status["state"],
         }
 
-    delivered = bool(send_result and send_result.get("ok"))
+    send_data = send_result if isinstance(send_result, dict) else {}
+    delivered = bool(send_data.get("ok"))
     if not delivered:
         status = _status_payload()
         return {
             "ok": False,
             "action": action,
-            "method": (send_result or {}).get("method"),
+            "method": send_data.get("method"),
             "adapter": "ytm_web",
             "delivered": False,
             "verified": False,
@@ -1312,23 +1573,33 @@ async def control(action: str) -> dict[str, Any]:
             "after": None,
             "state": before,
             "connection_state": status["state"],
-            "error": (send_result or {}).get("error", "command was not delivered"),
+            "error": send_data.get("error", "command was not delivered"),
         }
 
-    await asyncio.sleep(0.4)
-    state = await get_state()
-    verified, verification = _verify_action(action, before, state)
+    state, verified, verification, native_restart_detected = await _observe_after_delivery(action, before)
+    click_count = 1 if action in ("next", "previous") else None
+    intermediate = None
+    second_click_attempted = False
+    second_delivered = None
+    transport_methods = [send_data.get("method")] if action in ("next", "previous") else None
 
-    if not verified and action in ("next", "previous"):
-        # Track navigation can update the player bar after the first read.
-        # These are reads only: a delivered non-idempotent command is never
-        # sent again from this verification path.
-        for _ in range(3):
-            await asyncio.sleep(0.4)
-            state = await get_state()
-            verified, verification = _verify_action(action, before, state)
-            if verified:
-                break
+    if action == "previous" and native_restart_detected:
+        intermediate = state
+        second_click_attempted = True
+        try:
+            second_send_result = await _ytm_page.evaluate(_CONTROL_JS, action)
+        except Exception as exc:
+            second_send_result = {"ok": False, "error": str(exc)}
+        second_send_data = second_send_result if isinstance(second_send_result, dict) else {}
+        second_delivered = bool(second_send_data.get("ok"))
+        click_count = 1 + int(second_delivered)
+        if second_delivered:
+            transport_methods.append(second_send_data.get("method"))
+            state, verified, verification, _ = await _observe_after_delivery(
+                action,
+                before,
+                detect_native_restart=False,
+            )
 
     track_changed = None
     if action in ("next", "previous"):
@@ -1340,10 +1611,13 @@ async def control(action: str) -> dict[str, Any]:
             else None
         )
 
+    if action in ("next", "previous"):
+        await _enforce_background_window()
+
     result = {
         "ok": bool(delivered and verified),
         "action": action,
-        "method": (send_result or {}).get("method"),
+        "method": send_data.get("method"),
         "adapter": "ytm_web",
         "delivered": delivered,
         "verified": verified,
@@ -1353,18 +1627,50 @@ async def control(action: str) -> dict[str, Any]:
         "after": state,
         "state": state,
         "connection_state": _status_payload()["state"],
-        "control": (send_result or {}).get("control"),
+        "control": send_data.get("control"),
     }
     if track_changed is not None or action in ("next", "previous"):
         result["track_changed"] = track_changed
-    if not verified:
-        result["error"] = (
-            "track transition could not be verified"
-            if action in ("next", "previous") and verification == "unavailable"
-            else "track did not change"
-            if action in ("next", "previous")
-            else f"playback state did not reach {'playing' if action == 'play' else 'paused'}"
+    if action in ("next", "previous"):
+        result.update(
+            {
+                "click_count": click_count,
+                "transport_methods": transport_methods,
+                "intermediate": intermediate,
+                "native_restart_detected": native_restart_detected,
+                "second_click_attempted": second_click_attempted,
+                "second_delivered": second_delivered,
+            }
         )
+        if action == "previous":
+            result["native_result"] = (
+                "restarted_current"
+                if native_restart_detected
+                else "changed_track"
+                if verified
+                else "unavailable"
+                if verification == "unavailable"
+                else "unchanged"
+            )
+    if not verified:
+        if action in ("next", "previous"):
+            if (
+                action == "previous"
+                and native_restart_detected
+                and track_changed is False
+                and second_delivered
+            ):
+                result["error_code"] = "NO_PREVIOUS_TRACK"
+                result["native_result"] = "no_previous_track"
+                result["error"] = "YT Music has no previous track"
+            elif verification == "unavailable":
+                result["error_code"] = "TRACK_TRANSITION_UNVERIFIED"
+                result["error"] = "track transition could not be verified"
+            else:
+                result["error_code"] = "TRACK_DID_NOT_CHANGE"
+                result["error"] = "track did not change"
+        else:
+            result["error"] = f"playback state did not reach {'playing' if action == 'play' else 'paused'}"
     return result
 
 
@@ -1442,6 +1748,7 @@ async def play_query(query: str) -> dict[str, Any]:
                 error=f"YT Music search could not be submitted: {exc}",
             )
         search_submitted = True
+        await _enforce_background_window()
 
         try:
             await _ytm_page.wait_for_url("**/search**", timeout=8000)

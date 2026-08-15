@@ -22,6 +22,9 @@ class FakePage:
         closed: bool = False,
         url: str = "https://music.youtube.com/",
         transition_changes_track: bool = True,
+        previous_native_restart: bool = False,
+        previous_has_item: bool = True,
+        current_time: float = 0.0,
         authenticated: bool = True,
         login_required: bool | None = None,
         surface_ready: bool = True,
@@ -37,6 +40,8 @@ class FakePage:
         self.closed = closed
         self.url = url
         self.transition_changes_track = transition_changes_track
+        self.previous_native_restart = previous_native_restart
+        self.previous_has_item = previous_has_item
         self.authenticated = authenticated
         self.login_required = not authenticated if login_required is None else login_required
         self.surface_ready = surface_ready
@@ -62,7 +67,7 @@ class FakePage:
             "artist": "Test Artist",
             "track_id": "test-track",
             "ariaLabel": "Play",
-            "currentTime": 0,
+            "currentTime": current_time,
             "duration": 200,
             "volume": 0.5,
             "muted": False,
@@ -190,7 +195,10 @@ class FakePage:
                 "muted": self.state["muted"],
             }
         if "ytmMediaVolumeControl" in script:
-            action = str(arg)
+            request = arg if isinstance(arg, dict) else {}
+            action = str(request.get("action", ""))
+            amount = request.get("amount")
+            level = request.get("level")
             self.volume_commands.append(action)
             if not self.volume_available:
                 return {"ok": False, "error": "no video element"}
@@ -199,9 +207,11 @@ class FakePage:
                 "muted": self.state["muted"],
             }
             if action == "volume_up":
-                self.state["volume"] = min(1.0, self.state["volume"] + 0.10)
+                self.state["volume"] = min(1.0, self.state["volume"] + int(amount or 0) / 100)
             elif action == "volume_down":
-                self.state["volume"] = max(0.0, self.state["volume"] - 0.10)
+                self.state["volume"] = max(0.0, self.state["volume"] - int(amount or 0) / 100)
+            elif action == "volume_set":
+                self.state["volume"] = min(1.0, max(0.0, int(level) / 100))
             elif action == "volume_mute":
                 self.state["muted"] = not self.state["muted"]
             else:
@@ -222,9 +232,19 @@ class FakePage:
                 self.state["playing"] = False
             elif action in ("next", "previous"):
                 self.state["playing"] = True
-                if self.transition_changes_track:
+                command_number = self.transport_commands.count(str(action))
+                native_restart = (
+                    action == "previous"
+                    and self.previous_native_restart
+                    and command_number == 1
+                    and self.state["currentTime"] > 3.0
+                )
+                if native_restart:
+                    self.state["currentTime"] = 0.8
+                elif self.transition_changes_track and (action != "previous" or self.previous_has_item):
                     self.state["title"] = f"After {action}"
                     self.state["track_id"] = f"{action}-track"
+                    self.state["currentTime"] = 0.0
             return {"ok": True, "method": f"fake.{action}"}
         if "HTMLInputElement" in script:
             self.last_query = str(arg or "")
@@ -336,6 +356,53 @@ def _install_fake_playwright(monkeypatch, *, launch_should_fail: bool = False) -
     return fake_pw
 
 
+class FakeCdpSession:
+    def __init__(self, page: FakePage) -> None:
+        self.page = page
+        self.calls: list[tuple[str, dict | None]] = []
+        self.window_state = "normal"
+        self.detached = False
+
+    async def send(self, command: str, params: dict | None = None):
+        self.calls.append((command, params))
+        if command == "Target.getTargets":
+            return {
+                "targetInfos": [
+                    {
+                        "targetId": "normal-target",
+                        "type": "page",
+                        "url": "https://example.com/",
+                    },
+                    {
+                        "targetId": "ytm-target",
+                        "type": "page",
+                        "url": self.page.url,
+                    },
+                ]
+            }
+        if command == "Browser.getWindowForTarget":
+            return {"windowId": 42, "bounds": {"windowState": self.window_state}}
+        if command == "Browser.setWindowBounds":
+            self.window_state = params["bounds"]["windowState"]
+            return {}
+        raise AssertionError(f"unexpected CDP command: {command}")
+
+    async def detach(self) -> None:
+        self.detached = True
+
+
+class FakeBrowser:
+    def __init__(self, page: FakePage) -> None:
+        self.page = page
+        self.cdp = FakeCdpSession(page)
+
+    def is_connected(self) -> bool:
+        return True
+
+    async def new_browser_cdp_session(self) -> FakeCdpSession:
+        return self.cdp
+
+
 @pytest.fixture(autouse=True)
 def _reset_ytm_web(monkeypatch):
     monkeypatch.setattr(ytm_web, "_pw", None)
@@ -370,6 +437,39 @@ def _set_connected_runtime(monkeypatch, page: FakePage, *, pages: list[FakePage]
     monkeypatch.setattr(ytm_web, "_page_ready", True)
     monkeypatch.setattr(ytm_web, "_search_ready", True)
     monkeypatch.setattr(ytm_web, "_browser", types.SimpleNamespace(is_connected=lambda: True))
+
+
+async def test_enforce_background_window_minimizes_only_dedicated_ytm_target(monkeypatch) -> None:
+    page = FakePage()
+    _set_connected_runtime(monkeypatch, page)
+    browser = FakeBrowser(page)
+    monkeypatch.setattr(ytm_web, "_browser", browser)
+
+    result = await ytm_web._enforce_background_window()
+
+    assert result["ok"] is True
+    assert result["target_id"] == "ytm-target"
+    assert result["window_id"] == 42
+    assert result["window_state"] == "minimized"
+    assert result["changed"] is True
+    assert browser.cdp.window_state == "minimized"
+    assert (
+        "Browser.setWindowBounds",
+        {"windowId": 42, "bounds": {"windowState": "minimized"}},
+    ) in browser.cdp.calls
+    assert browser.cdp.detached is True
+
+
+async def test_ensure_ready_reasserts_background_window_without_presenting_page(monkeypatch) -> None:
+    page = FakePage()
+    _set_connected_runtime(monkeypatch, page)
+    browser = FakeBrowser(page)
+    monkeypatch.setattr(ytm_web, "_browser", browser)
+
+    assert await ytm_web.ensure_ready() is True
+
+    assert browser.cdp.window_state == "minimized"
+    assert page.bring_to_front_calls == 0
 
 
 async def test_is_available_false_when_not_launched(monkeypatch) -> None:
@@ -680,6 +780,59 @@ async def test_control_previous_verifies_track_transition(monkeypatch) -> None:
     assert page.transport_commands == ["previous"]
 
 
+async def test_control_previous_near_track_start_uses_one_click(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(previous_native_restart=True, current_time=1.0)
+    page.state["playing"] = True
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control("previous")
+
+    assert result["ok"] is True
+    assert result["click_count"] == 1
+    assert result["native_restart_detected"] is False
+    assert result["intermediate"] is None
+    assert result["after"]["track_id"] == "previous-track"
+    assert page.transport_commands == ["previous"]
+
+
+async def test_control_previous_restarts_current_then_deliberately_clicks_once_more(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(previous_native_restart=True, current_time=30.0)
+    page.state["playing"] = True
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control("previous")
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["click_count"] == 2
+    assert result["native_restart_detected"] is True
+    assert result["native_result"] == "restarted_current"
+    assert result["intermediate"]["track_id"] == "test-track"
+    assert result["intermediate"]["currentTime"] == 0.8
+    assert result["after"]["track_id"] == "previous-track"
+    assert result["track_changed"] is True
+    assert page.transport_commands == ["previous", "previous"]
+
+
+async def test_control_previous_restart_without_previous_item_stops_at_two_clicks(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage(previous_native_restart=True, previous_has_item=False, current_time=30.0)
+    page.state["playing"] = True
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control("previous")
+
+    assert result["ok"] is False
+    assert result["verified"] is False
+    assert result["error_code"] == "NO_PREVIOUS_TRACK"
+    assert result["native_result"] == "no_previous_track"
+    assert result["click_count"] == 2
+    assert result["track_changed"] is False
+    assert page.transport_commands == ["previous", "previous"]
+
+
 @pytest.mark.parametrize("action", ["next", "previous"])
 async def test_control_non_idempotent_action_is_sent_once_when_identity_unavailable(
     monkeypatch,
@@ -722,7 +875,7 @@ async def test_control_volume_clamps_and_verifies_media_element(
     assert result["verified"] is True
     assert result["adapter"] == "ytm_web"
     assert result["before"]["volume"] == start_volume
-    assert result["after"]["volume"] == expected_volume
+    assert result["after"]["volume"] == pytest.approx(expected_volume)
     assert page.volume_commands == [action]
 
 
@@ -740,6 +893,82 @@ async def test_control_volume_mute_toggles_and_verifies_media_element(monkeypatc
     assert page.volume_commands == ["volume_mute"]
 
 
+@pytest.mark.parametrize("level", [0, 30, 75, 100])
+async def test_control_volume_set_reads_back_requested_level(monkeypatch, level: int) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control_volume("volume_set", level=level)
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["action"] == "volume_set"
+    assert result["requested_level"] == level
+    assert result["level"] == level
+    assert result["volume"] == level / 100
+    assert page.volume_commands == ["volume_set"]
+    assert page.bring_to_front_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("action", "amount", "start_volume", "expected_volume"),
+    [
+        ("volume_up", 25, 0.5, 0.75),
+        ("volume_down", 40, 0.5, 0.1),
+        ("volume_up", None, 0.5, 0.6),
+    ],
+)
+async def test_control_volume_relative_amount_is_one_verified_media_action(
+    monkeypatch,
+    action: str,
+    amount: int | None,
+    start_volume: float,
+    expected_volume: float,
+) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    page.state["volume"] = start_volume
+    _set_connected_runtime(monkeypatch, page)
+
+    kwargs = {} if amount is None else {"amount": amount}
+    result = await ytm_web.control_volume(action, **kwargs)
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["amount"] == (10 if amount is None else amount)
+    assert result["after"]["volume"] == pytest.approx(expected_volume)
+    assert page.volume_commands == [action]
+
+
+@pytest.mark.parametrize(
+    ("action", "kwargs"),
+    [
+        ("volume_set", {"level": -1}),
+        ("volume_set", {"level": 101}),
+        ("volume_set", {"level": 30.5}),
+        ("volume_up", {"amount": 0}),
+        ("volume_down", {"amount": 101}),
+        ("volume_up", {"amount": True}),
+    ],
+)
+async def test_control_volume_rejects_invalid_percentage_without_dom_action(
+    monkeypatch,
+    action: str,
+    kwargs: dict[str, object],
+) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control_volume(action, **kwargs)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "INVALID_ARGUMENTS"
+    assert result["delivered"] is False
+    assert page.volume_commands == []
+
+
 async def test_control_volume_without_media_element_is_explicit_failure(monkeypatch) -> None:
     _install_fake_playwright(monkeypatch)
     page = FakePage(volume_available=False)
@@ -751,6 +980,20 @@ async def test_control_volume_without_media_element_is_explicit_failure(monkeypa
     assert result["delivered"] is False
     assert result["verified"] is False
     assert result["verification"] == "not_attempted"
+    assert page.volume_commands == []
+
+
+async def test_control_volume_without_loaded_track_does_not_touch_background_video(monkeypatch) -> None:
+    _install_fake_playwright(monkeypatch)
+    page = FakePage()
+    page.state.update({"player_loaded": False, "playing": None, "title": "", "artist": "", "track_id": ""})
+    _set_connected_runtime(monkeypatch, page)
+
+    result = await ytm_web.control_volume("volume_set", level=30)
+
+    assert result["ok"] is False
+    assert result["error_code"] == "PLAYER_NOT_LOADED"
+    assert result["delivered"] is False
     assert page.volume_commands == []
 
 
@@ -796,6 +1039,7 @@ async def test_play_query_success(monkeypatch) -> None:
     assert result["selected_video_id"] == "test-track"
     assert result["title"] == "Selected Result"
     assert result["artist"] == "Selected Artist"
+    assert page.bring_to_front_calls == 0
 
 
 async def test_play_query_starts_from_connected_page_without_player(monkeypatch) -> None:

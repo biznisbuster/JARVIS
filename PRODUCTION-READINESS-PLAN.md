@@ -504,12 +504,21 @@ YT Music related tool tests
       select and verify two different requested tracks.
 - [x] Use the live `ytmusic-player-bar` custom-control shape for next/previous
       and keep transition verification to one delivered action plus bounded
-      state reads only.
+      state reads only, except for the deliberate, state-proven second
+      `previous` click required after a native restart-current result.
+- [x] Detect YT Music native restart-current behavior from same-track identity
+      plus a meaningful `currentTime` reset, allow at most one deliberate
+      continuation click, and return an explicit no-previous-track failure.
 - [x] Route YT Music volume up/down/mute through the dedicated HTML media
       element with clamping and readback verification; keep `system_volume`
       as the macOS-wide volume tool.
-- [x] Keep normal saved-profile restore headed but minimized, while explicit
-      Connect still presents the dedicated browser for login/reconnection.
+- [x] Add verified absolute YT Music volume (`level` 0-100) and one-call
+      relative volume amounts (`amount` 1-100, default 10).
+- [x] Refuse volume commands when no YT Music track is loaded instead of
+      touching an unrelated/background HTML video element.
+- [x] Keep normal saved-profile restore headed but minimized and reassert the
+      dedicated window's minimized state through scoped CDP bounds, while
+      explicit Connect still presents the dedicated browser.
 - [ ] Complete real macOS/YT Music connection and audible playback validation.
 
 ## Suggested verification semantics
@@ -1215,6 +1224,122 @@ adopted as the normal runtime.
 NO — the focused runtime correction is implemented and directly validated, but
 the required user-led audible/manual Phase 1 checkpoint remains outstanding.
 Do not merge and do not start Phase 2.
+
+---
+
+## Phase 1 focused UX/runtime correction (2026-08-15)
+
+### Root cause
+
+On the real authenticated YT Music player, `Previous` is stateful: when the
+current track has progressed, the first native player-bar click restarts that
+same track instead of selecting the previous item. The strict identity check
+correctly refused to call that a track transition, but it had no bounded,
+state-aware continuation for the user's semantic request to go to the
+previous track.
+
+The volume tools only exposed fixed ten-percent steps. The dedicated browser
+also became visible after ordinary navigation because `--start-minimized`
+only affects initial launch and does not reassert the window state after a
+presented Connect flow or later page navigation. A bounded real headless
+diagnostic reached the YT Music origin but received Chrome's deprecated-browser
+surface (`HeadlessChrome` user agent), with no YT Music app, search box or
+player bar; headless audio was therefore not evaluated or claimed.
+
+### Completed
+
+- Added same-track/current-time-reset detection for native restart-current
+  `previous` behavior. A deliberate second click is allowed only after that
+  positive evidence, never when metadata is unavailable, and never more than
+  twice total. Results now expose click count, intermediate state, restart
+  detection and explicit `NO_PREVIOUS_TRACK` failure where observed.
+- Added verified `ytm_volume_set(level=0..100)` and parametrized
+  `ytm_volume_up/down(amount=1..100, default=10)` using only the YT Music HTML
+  media element. macOS `system_volume` remains separate.
+- Added scoped Chromium CDP window-state enforcement using
+  `Browser.getWindowForTarget` and `Browser.setWindowBounds(windowState=minimized)`.
+  Normal restore, search, transport and volume paths do not present the page;
+  explicit Connect remains the presentation path.
+- Added the new tool to backend audio suppression and frontend tool metadata.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/tools.py`
+- `jarvis/agent/loop.py`
+- `jarvis/agent/prompts.py`
+- `web-ui/src/lib/tools.ts`
+- `tests/test_ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `README.md`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added previous near-start, native-restart continuation, no-previous-item,
+  unavailable-identity and maximum-click diagnostics coverage.
+- Added absolute/relative volume, clamping, validation, one-DOM-action and
+  system-volume isolation coverage.
+- Added dedicated CDP target selection/minimization and normal-path
+  non-presentation coverage.
+
+### Validation
+
+- `./.venv/bin/pytest -q tests/test_ytm_web.py tests/test_phase0_media_regressions.py`
+  -> PASS (`81 passed`).
+- `./.venv/bin/pytest -q` -> PASS (`179 passed, 3 xfailed`); the xfails are
+  the existing Phase 3 local-model defects.
+- Targeted Ruff and changed-file format checks -> PASS; `git diff --check` ->
+  PASS. Full repository Ruff/format remain red only on the pre-existing
+  findings recorded below.
+- `cd web-ui && npm run typecheck` -> PASS; `npm run test` -> PASS (`3
+  tests`); `npm run build` -> PASS.
+- Real authenticated adapter check -> `CONNECTED`; loaded-track `next` and
+  near-start `previous` each verified with one click; `ytm_volume_set` at 30%
+  and 75%, relative down 20%/up 15%, mute and unmute all verified by media
+  element readback. A progressed real track produced `native_restart_detected`
+  and exactly two clicks, then correctly returned `NO_PREVIOUS_TRACK` because
+  that track had no previous item. CDP reported the dedicated target window as
+  minimized. Audible output was not independently measured.
+- Headless diagnostic -> NOT ADOPTED: `HeadlessChrome` produced the Chrome
+  deprecated-browser page; YT Music DOM/player and audible output were not
+  available.
+
+### Manual validation still required
+
+- With the logged-in profile, play a track, invoke `previous` near the start
+  and confirm one click reaches the previous track.
+- Let a track progress, invoke `previous`, and confirm the result reports an
+  intermediate `restarted_current`, uses exactly two clicks, and ends on the
+  actual previous track. Repeat at the beginning/end of a playlist to confirm
+  the explicit no-previous failure.
+- Through chat, test `ytm_volume_set` at 30%, 75%, 0% and 100%, then
+  `ytm_volume_down(amount=20)` and `ytm_volume_up(amount=15)`; verify each
+  request uses one tool call and does not change macOS-wide volume.
+- During play/search/pause/resume/next/previous/volume, confirm the dedicated
+  browser remains minimized/backgrounded; Connect/Reconnect may present it.
+- Confirm playback remains audible and DOM controls continue working while
+  minimized, then repeat after a JARVIS restart.
+
+### New issues discovered
+
+- The bounded headless diagnostic identified the exact deprecated-browser
+  surface and remains recorded in Appendix A; normal runtime stays headed and
+  minimized.
+
+### Remaining risks
+
+- Real previous semantic success with a populated previous queue,
+  minimized-window non-intrusiveness during the full chat flow and audible
+  output still require user-led macOS/YT Music validation.
+- YT Music may change player-bar DOM, native Previous semantics or media-element
+  behavior; failures remain explicit and bounded.
+- Phase 2 `MediaService` and state-ownership work has not started.
+
+### Ready for next phase
+
+NO — automated coverage is expanded, but the required real manual Phase 1
+checkpoint remains outstanding. Do not merge and do not start Phase 2.
 
 ---
 
@@ -2172,9 +2297,12 @@ The real authenticated profile could launch in headless Chrome and reach
 were not rendered in the bounded smoke test.
 
 **Root cause:**
-The exact headless rendering/autoplay incompatibility was not isolated. The
-same profile works in headed Chrome, so Phase 1 does not assume that an origin
-load in headless mode means that YT Music is usable.
+The bounded diagnostic used the current Chrome headless implementation and
+the authenticated profile, but the page exposed a `HeadlessChrome` user agent
+and rendered Chrome's "Your browser is deprecated" page. No `ytmusic-app`,
+search box, player bar or video element was available. The same profile works
+in headed Chrome, so an origin load in headless mode is not evidence that YT
+Music or audible playback is usable.
 
 **Recommended phase:**
 Phase 1 — resolved operationally by retaining a headed dedicated browser and

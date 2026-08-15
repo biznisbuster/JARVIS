@@ -57,8 +57,9 @@ ili ponovnog povezivanja. Ista browser sesija se zatim koristi za pretragu,
 reprodukciju, YT Music-only volume i DOM verifikaciju pause/resume/next/previous
 akcija. Ako sesija istekne, status prelazi u *Potrebna prijava*.
 
-`ytm_volume_up/down/mute` menjaju samo HTML media element YT Music playera;
-`system_volume` je alat za ceo macOS izlazni zvuk.
+`ytm_volume_set/up/down/mute` menjaju samo HTML media element YT Music playera;
+`ytm_volume_set` prima `level` 0–100, a `ytm_volume_up/down` opcioni `amount`
+1–100 (podrazumevano 10). `system_volume` je alat za ceo macOS izlazni zvuk.
 
 ## Šta imaš odmah
 

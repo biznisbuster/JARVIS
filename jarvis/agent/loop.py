@@ -38,6 +38,7 @@ AUDIO_TOOLS = frozenset(
         "ytm_previous",
         "ytm_volume_up",
         "ytm_volume_down",
+        "ytm_volume_set",
         "ytm_volume_mute",
         "play_youtube",
     }

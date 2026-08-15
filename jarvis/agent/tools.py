@@ -520,7 +520,9 @@ def _ytm_bundle_id_sync() -> str | None:
         try:
             out = subprocess.run(
                 ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIdentifier", str(plist)],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True,
+                text=True,
+                timeout=3,
             )
             if out.returncode == 0 and out.stdout.strip():
                 return out.stdout.strip()
@@ -617,7 +619,7 @@ async def _ytm_is_running() -> bool:
         script = (
             'tell application "System Events"\n'
             f'  return (count of (every process whose bundle identifier is "{bid}")) > 0\n'
-            'end tell'
+            "end tell"
         )
         rc, out, _ = await _osascript(script, timeout=4)
         if rc == 0:
@@ -757,7 +759,8 @@ async def _ytm_send_keystrokes(steps: list[tuple[str, float]]) -> tuple[int, str
     YTM — koristi se samo za ytm_play fallback."""
     bid = await _ytm_bundle_id()
     activate_line = (
-        f'tell application id "{bid}" to activate' if bid
+        f'tell application id "{bid}" to activate'
+        if bid
         else f'tell application "{_YTM_APP_NAME}" to activate'
     )
     parts = [
@@ -798,7 +801,8 @@ async def _ytm_send_keys_quiet(steps: list[tuple[str, float]]) -> bool:
     prev_app = await _ytm_get_frontmost_app()
     bid = await _ytm_bundle_id()
     activate_line = (
-        f'tell application id "{bid}" to activate' if bid
+        f'tell application id "{bid}" to activate'
+        if bid
         else f'tell application "{_YTM_APP_NAME}" to activate'
     )
     rc, _, _ = await _osascript(activate_line)
@@ -1060,10 +1064,15 @@ async def _ytm_send_transport(action: str) -> dict[str, Any]:
     return {**result, "adapter": result.get("adapter", "ytm_web")}
 
 
-async def _ytm_send_volume(action: str) -> dict[str, Any]:
+async def _ytm_send_volume(
+    action: str,
+    *,
+    amount: int | None = None,
+    level: int | None = None,
+) -> dict[str, Any]:
     """Change and verify volume on the dedicated YT Music media element."""
     try:
-        result = await _ytm_web.control_volume(action)
+        result = await _ytm_web.control_volume(action, amount=amount, level=level)
     except Exception as exc:
         result = {
             "ok": False,
@@ -1099,15 +1108,22 @@ async def ytm_previous(args: dict[str, Any]) -> str:
 
 
 async def ytm_volume_up(args: dict[str, Any]) -> str:
-    return json.dumps(await _ytm_send_volume("volume_up"), ensure_ascii=False)
+    amount = (args or {}).get("amount", 10)
+    return json.dumps(await _ytm_send_volume("volume_up", amount=amount), ensure_ascii=False)
 
 
 async def ytm_volume_down(args: dict[str, Any]) -> str:
-    return json.dumps(await _ytm_send_volume("volume_down"), ensure_ascii=False)
+    amount = (args or {}).get("amount", 10)
+    return json.dumps(await _ytm_send_volume("volume_down", amount=amount), ensure_ascii=False)
 
 
 async def ytm_volume_mute(args: dict[str, Any]) -> str:
     return json.dumps(await _ytm_send_volume("volume_mute"), ensure_ascii=False)
+
+
+async def ytm_volume_set(args: dict[str, Any]) -> str:
+    level = (args or {}).get("level")
+    return json.dumps(await _ytm_send_volume("volume_set", level=level), ensure_ascii=False)
 
 
 async def ytm_status(args: dict[str, Any]) -> str:
@@ -1372,15 +1388,48 @@ def build_registry() -> list[ToolDef]:
         ),
         ToolDef(
             "ytm_volume_up",
-            "Pojačaj samo YT Music player (ne menja macOS sistemski zvuk).",
-            _schema("ytm_volume_up", "Pojačaj samo YT Music player.", {}, []),
+            "Pojačaj samo YT Music player za zadati procenat (ne menja macOS sistemski zvuk).",
+            _schema(
+                "ytm_volume_up",
+                "Pojačaj samo YT Music player. Bez amount koristi 10%; amount je 1-100.",
+                {
+                    "amount": {
+                        **_int_prop("Procenat povećanja, 1-100.", default=10),
+                        "minimum": 1,
+                        "maximum": 100,
+                    }
+                },
+                [],
+            ),
             ytm_volume_up,
         ),
         ToolDef(
             "ytm_volume_down",
-            "Smanji samo YT Music player (ne menja macOS sistemski zvuk).",
-            _schema("ytm_volume_down", "Smanji samo YT Music player.", {}, []),
+            "Smanji samo YT Music player za zadati procenat (ne menja macOS sistemski zvuk).",
+            _schema(
+                "ytm_volume_down",
+                "Smanji samo YT Music player. Bez amount koristi 10%; amount je 1-100.",
+                {
+                    "amount": {
+                        **_int_prop("Procenat smanjenja, 1-100.", default=10),
+                        "minimum": 1,
+                        "maximum": 100,
+                    }
+                },
+                [],
+            ),
             ytm_volume_down,
+        ),
+        ToolDef(
+            "ytm_volume_set",
+            "Postavi samo YT Music player na procenat 0-100 (ne menja macOS sistemski zvuk).",
+            _schema(
+                "ytm_volume_set",
+                "Postavi YT Music HTML media element na level 0-100.",
+                {"level": {**_int_prop("Ciljni procenat, 0-100."), "minimum": 0, "maximum": 100}},
+                ["level"],
+            ),
+            ytm_volume_set,
         ),
         ToolDef(
             "ytm_volume_mute",

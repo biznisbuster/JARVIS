@@ -140,22 +140,30 @@ async def test_missing_loaded_player_does_not_fall_back_to_desktop_transport(
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "action"),
+    ("tool_name", "action", "args"),
     [
-        ("ytm_volume_up", "volume_up"),
-        ("ytm_volume_down", "volume_down"),
-        ("ytm_volume_mute", "volume_mute"),
+        ("ytm_volume_up", "volume_up", {}),
+        ("ytm_volume_down", "volume_down", {"amount": 25}),
+        ("ytm_volume_mute", "volume_mute", {}),
+        ("ytm_volume_set", "volume_set", {"level": 30}),
     ],
 )
 async def test_ytm_volume_uses_dedicated_media_element_not_system_volume(
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
     action: str,
+    args: dict[str, int],
 ) -> None:
-    web_calls: list[str] = []
+    web_calls: list[tuple[str, int | None, int | None]] = []
 
-    async def fake_control_volume(requested: str) -> dict[str, object]:
-        web_calls.append(requested)
+    async def fake_control_volume(
+        requested: str,
+        *,
+        amount: int | None = None,
+        level: int | None = None,
+    ) -> dict[str, object]:
+        web_calls.append((requested, amount, level))
+        volume = level / 100 if requested == "volume_set" and level is not None else 0.6
         return {
             "ok": True,
             "action": requested,
@@ -164,7 +172,7 @@ async def test_ytm_volume_uses_dedicated_media_element_not_system_volume(
             "verified": True,
             "verification": "verified",
             "before": {"volume": 0.5, "muted": False},
-            "after": {"volume": 0.6, "muted": requested == "volume_mute"},
+            "after": {"volume": volume, "muted": requested == "volume_mute"},
         }
 
     async def forbidden_system_volume(*args, **kwargs):  # noqa: ANN002, ANN003
@@ -173,12 +181,33 @@ async def test_ytm_volume_uses_dedicated_media_element_not_system_volume(
     monkeypatch.setattr(tools._ytm_web, "control_volume", fake_control_volume)
     monkeypatch.setattr(tools, "_osascript", forbidden_system_volume)
 
-    result = json.loads(await getattr(tools, tool_name)({}))
+    result = json.loads(await getattr(tools, tool_name)(args))
 
     assert result["ok"] is True
     assert result["adapter"] == "ytm_web"
     assert result["verified"] is True
-    assert web_calls == [action]
+    assert web_calls == [
+        (
+            action,
+            args.get("amount", 10) if action in ("volume_up", "volume_down") else None,
+            args.get("level") if action == "volume_set" else None,
+        )
+    ]
+
+
+def test_ytm_volume_schemas_expose_absolute_and_relative_percentages() -> None:
+    set_schema = tools.get("ytm_volume_set").schema
+    up_schema = tools.get("ytm_volume_up").schema
+    down_schema = tools.get("ytm_volume_down").schema
+
+    assert set_schema["function"]["parameters"]["required"] == ["level"]
+    assert set_schema["function"]["parameters"]["properties"]["level"]["minimum"] == 0
+    assert set_schema["function"]["parameters"]["properties"]["level"]["maximum"] == 100
+    for schema in (up_schema, down_schema):
+        amount = schema["function"]["parameters"]["properties"]["amount"]
+        assert amount["default"] == 10
+        assert amount["minimum"] == 1
+        assert amount["maximum"] == 100
 
 
 async def test_transport_state_refuses_generic_nowplaying_fallback(
