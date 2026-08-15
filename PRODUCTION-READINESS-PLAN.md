@@ -460,18 +460,66 @@ YT Music related tool tests
 
 ## Tasks
 
-- [ ] Remove unconditional Space/play toggle after `next`.
-- [ ] Remove unconditional Space/play toggle after `previous`.
-- [ ] Capture state before transition.
-- [ ] Verify next/previous using changed track identity when possible.
-- [ ] If track identity is unavailable, use a clearly documented degraded
+- [x] Remove unconditional Space/play toggle after `next`.
+- [x] Remove unconditional Space/play toggle after `previous`.
+- [x] Capture state before transition.
+- [x] Verify next/previous using changed track identity when possible.
+- [x] If track identity is unavailable, use a clearly documented degraded
       verification strategy.
-- [ ] Do not set mirrored state to playing merely because a key event was
+- [x] Do not repeat a delivered `next`/`previous` command when verification is
+      unavailable or proves that no transition occurred.
+- [x] Allow bounded additional state reads after delivery, and allow fallback
+      transports only when the prior transport did not deliver the command.
+- [x] Do not set mirrored state to playing merely because a key event was
       delivered.
-- [ ] Return `ok=False` when no channel can verify the intended effect.
-- [ ] Add adapter/method metadata to diagnostic result.
-- [ ] Preserve current working play/pause behavior while strengthening
+- [x] Return `ok=False` when no channel can verify the intended effect.
+- [x] Add adapter/method metadata to diagnostic result.
+- [x] Reject generic macOS now-playing evidence as YT Music verification.
+- [x] Make `tool_done` reflect structured tool result status when available.
+- [x] Preserve current working play/pause behavior while strengthening
       verification.
+- [x] Add explicit per-device YT Music connection states separate from page,
+      search and player readiness.
+- [x] Add a headed persistent-profile Connect YT Music flow with safe backend
+      status APIs and frontend backend-truth display.
+- [x] Allow connected/search-ready pages without a loaded player to start the
+      first `ytm_play` request.
+- [x] Route normal YT Music play/pause/resume/next/previous through the same
+      dedicated web session and remove desktop deep-link fallback from the
+      normal playback path.
+- [x] Select a playable YT Music watch result and verify the resulting DOM
+      player state.
+- [x] Explicit Connect brings the existing dedicated headed YT Music page to
+      the front without launching a duplicate persistent browser.
+- [x] Do not auto-restore a profile directory until a prior authenticated
+      YT Music connection has been observed.
+- [x] Re-scan all live persistent-context pages and adopt the usable
+      `music.youtube.com` page after Google login or tab replacement.
+- [x] Treat explicit Google/YT Music login evidence as `NEEDS_LOGIN` without
+      treating a missing avatar selector as proof of logout.
+- [x] Let normal connection polling detect login completion and persist the
+      marker only after the dedicated YT Music surface is verified usable.
+- [x] Resolve the live Polymer search-result shape, stale successive-search
+      behavior and Playwright verification call so direct YTM playback can
+      select and verify two different requested tracks.
+- [x] Use the live `ytmusic-player-bar` custom-control shape for next/previous
+      and keep transition verification to one delivered action plus bounded
+      state reads only, except for the deliberate, state-proven second
+      `previous` click required after a native restart-current result.
+- [x] Detect YT Music native restart-current behavior from same-track identity
+      plus a meaningful `currentTime` reset, allow at most one deliberate
+      continuation click, and return an explicit no-previous-track failure.
+- [x] Route YT Music volume up/down/mute through the dedicated HTML media
+      element with clamping and readback verification; keep `system_volume`
+      as the macOS-wide volume tool.
+- [x] Add verified absolute YT Music volume (`level` 0-100) and one-call
+      relative volume amounts (`amount` 1-100, default 10).
+- [x] Refuse volume commands when no YT Music track is loaded instead of
+      touching an unrelated/background HTML video element.
+- [x] Keep normal saved-profile restore headed but minimized and reassert the
+      dedicated window's minimized state through scoped CDP bounds, while
+      explicit Connect still presents the dedicated browser.
+- [ ] Complete real macOS/YT Music connection and audible playback validation.
 
 ## Suggested verification semantics
 
@@ -536,10 +584,1123 @@ STOP before architectural extraction.
 
 ---
 
+## Phase 1 report (2026-08-14)
+
+### Root cause
+
+The desktop YT Music fallback treated Quartz/AppleScript key delivery as
+proof that playback changed, then sent Space after `next` and `previous`.
+Space is a play/pause toggle, so a successfully started next/previous track
+could be paused immediately. The Playwright adapter had a related verification
+gap: it treated `playing=True` as proof of a track transition. The generic
+now-playing fallback also accepted `playing=True` when no before/after track
+identity existed.
+
+The generic fallback also retained retry behavior after a successful
+`next`/`previous` delivery when transition verification was unavailable.
+Because those actions are non-idempotent, that could skip multiple tracks
+before the system returned a failure.
+
+Real manual validation then confirmed a second contamination path: when the
+dedicated YT Music web adapter was unavailable, the desktop fallback accepted
+generic macOS now-playing state. It treated an already-playing unrelated
+track as proof that a new YT Music request had started, and could observe
+JARVIS TTS as if it were the requested YT Music track. The same run confirmed
+that `_execute_tool()` published `tool_done.ok=True` for any tool that returned
+without raising, even when its JSON result contained `{"ok": false}`.
+
+### Completed
+
+- Removed the unconditional play/pause key after desktop `next` and
+  `previous`.
+- Added before/after verification using track ID first and title/artist
+  metadata as the documented degraded identity fallback.
+- Made delivered-but-unverified actions return `ok=False` with explicit
+  `delivered`, `verified`, `verification`, `degraded`, `adapter` and `method`
+  metadata.
+- Updated the mirrored playing state only from observed verified state.
+- Preserved pause/resume no-op behavior when an observed state already matches
+  the requested result, while verifying all delivered commands.
+- Hardened the existing desktop YT Music play fallbacks against the same
+  command-delivery false-success behavior.
+- Restricted YT Music transport verification to dedicated `ytm_web` state;
+  generic macOS now-playing state is now rejected and produces an explicit
+  delivered-but-unverified/degraded result.
+- Removed the desktop `ytm_play` shortcut that treated any existing playing
+  state as the requested track, and stopped sending Space when requested
+  playback cannot be verified from YT Music-specific state.
+- Made `tool_done` include the structured tool result status and diagnostic
+  fields when a tool returns JSON with an `ok` field.
+- Converted the Phase 0 strict YT Music xfails into passing regressions and
+  added web/generic transport verification coverage.
+
+### Files changed
+
+- `jarvis/agent/loop.py`
+- `jarvis/agent/tools.py`
+- `jarvis/media/nowplaying.py`
+- `jarvis/media/ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `tests/test_loop_tool_events.py`
+- `tests/test_ytm_web.py`
+- `tests/test_nowplaying.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Converted `test_next_does_not_send_unconditional_toggle` and
+  `test_previous_does_not_send_unconditional_toggle` from strict xfails to
+  passing tests with before/after state.
+- Added delivered-without-state failure coverage and verified pause/resume
+  transport coverage.
+- Added web-adapter track-transition success/failure coverage.
+- Added generic now-playing coverage proving a transition requires an
+  observed identity change.
+- Added generic transport coverage proving delivered `next`/`previous`
+  commands are sent once when verification is unavailable or shows no change,
+  while a not-delivered transport may fall back and a later state read can
+  verify the transition.
+- Kept play/pause retry behavior separately covered as idempotent transport.
+- Added regressions proving JARVIS/TTS generic now-playing state cannot verify
+  YT Music transitions or a new `ytm_play` request.
+- Added a focused regression proving `tool_done.ok` reflects a structured
+  tool failure.
+
+### Validation
+
+- `./.venv/bin/pytest tests/test_phase0_media_regressions.py tests/test_ytm_web.py tests/test_nowplaying.py tests/test_loop_tool_events.py -q` -> PASS (`36 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`120 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
+- `./.venv/bin/ruff check .` -> FAIL (4 pre-existing findings in `jarvis/audio/focus.py`, `jarvis/log.py`, `jarvis/media/ytm_web.py` and `tests/test_web_ui_7b.py`)
+- `./.venv/bin/ruff format --check .` -> FAIL (8 pre-existing formatted files; no added Phase 1 formatting issue)
+- `git diff --check` -> PASS
+- `cd web-ui && npm run typecheck` -> PASS
+- `cd web-ui && npm run test` -> PASS (1 test)
+- `cd web-ui && npm run build` -> PASS
+
+### Manual validation still required
+
+- Manual validation was performed on real macOS/YT Music and FAILED. The
+  dedicated web adapter reported `ready=False` because its player bar was not
+  ready, so the run used the desktop Quartz path. `ytm_play` and transport
+  results were not reliable, and generic now-playing evidence was shown to be
+  unsafe for YT Music verification.
+- The runtime log identifies the failed paths as `ytm_play(fallback)` with a
+  scraped video ID and the desktop Quartz transport path (`pid=48245`). For
+  `Relja Popovic`, the old log recorded `sent space=False verified=True` even
+  though the state was the already-playing generic `Top Gun`/`Relja`; for
+  `Vlado Georgiev`, it recorded `sent space=True verified=False` and the model
+  retried. The old code did not log the complete JSON result; this correction
+  now logs the complete result with adapter/path metadata.
+- After this correction, repeat on macOS with YT Music logged in to the
+  persistent browser profile. Start JARVIS with `./scripts/start.sh`, then
+  issue `ytm_play` for a different song/artist while another track is already
+  playing, followed by `pause`, `resume`, `next` five times and `previous`
+  three times. Confirm successful results identify `adapter=ytm_web`, have
+  `verified=true`, and refer to the requested/actual YT Music track. If the
+  web adapter is unavailable, confirm the desktop path returns explicit
+  `ok=false` delivered/degraded results rather than claiming success.
+
+### New issues discovered
+
+- The Phase 1 review found that generic now-playing fallback retry behavior
+  could repeat a delivered non-idempotent command when identity verification
+  was unavailable. It was fixed in this Phase 1 correction; see Appendix A.
+- Real manual validation found generic JARVIS/TTS now-playing contamination
+  and a misleading `tool_done.ok` event; both are fixed in this correction.
+  Existing Phase 3 xfails, the Phase 0 frontend dependency advisory and the
+  deferred MediaService world-state test remain outside this phase.
+
+### Remaining risks
+
+- The desktop fallback can deliver YT Music commands but cannot claim success
+  without dedicated YT Music state; when the web adapter is unavailable it
+  intentionally returns delivered-but-unverified/degraded results.
+- A delivered desktop `next`/`previous` command now returns an explicit
+  unverified/degraded failure when identity remains unavailable; callers must
+  decide whether and when a user-requested retry is appropriate.
+- Full Ruff validation remains red on pre-existing repository findings.
+- Phase 2 MediaService/state-ownership work has intentionally not started.
+
+### Ready for next phase
+
+NO — manual Phase 1 validation failed. The corrected branch requires a new
+real macOS/YT Music validation pass before merge. Phase 2 has not been
+started.
+
+## Phase 1 correction update (2026-08-14)
+
+### Root cause
+
+The first Phase 1 correction correctly rejected generic now-playing evidence,
+but it still had no usable per-device authentication flow. The web adapter
+used a single player-bar readiness gate, so a connected YT Music home page
+with no current track was treated as unavailable. `ytm_play` then fell back to
+desktop deep links/keystrokes, which could reopen the installed web app and
+could not reliably produce audible, verifiable playback.
+
+### Completed
+
+- Added explicit `DISCONNECTED`, `NEEDS_LOGIN`, `CONNECTING`, `CONNECTED` and
+  `ERROR` states with separate page, search, player and playing state.
+- Added headed persistent-profile connection flow using the per-device
+  `~/.jarvis/ytm_profile` profile; Google authentication remains entirely in
+  the visible Google/YT Music page.
+- Added `GET /api/ytm/connection`, `POST /api/ytm/connect` and a minimal
+  Connections-tab card driven by backend status.
+- Separated page/search readiness from player readiness so first play can start
+  from an authenticated page with no loaded track.
+- Made the dedicated YTM browser the only normal play/transport path and
+  removed desktop deep-link/Quartz fallback from those actions.
+- Restricted status and verification evidence to the dedicated YTM DOM; the
+  generic macOS now-playing stream cannot provide YTM success evidence.
+- Selects a watch/video identity from YTM search results and verifies the
+  resulting player state, including a second different play request.
+- Added clean browser shutdown while retaining the local persistent profile
+  for restart.
+- Updated the Phase 2 handoff so `MediaService` must consume this connected
+  browser adapter rather than recreate authentication.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/tools.py`
+- `jarvis/agent/prompts.py`
+- `jarvis/app.py`
+- `web-ui/src/components/ConnectionsTab.tsx`
+- `web-ui/src/lib/ytm-connection.ts`
+- `tests/test_ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `tests/test_ytm_connection_api.py`
+- `web-ui/src/lib/ytm-connection.test.ts`
+- `README.md`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added disconnected/login-required/connected-without-player/expired-session
+  connection state coverage.
+- Added headed launch, first play from an empty player, second different play,
+  player-required transport, DOM pause/resume, launch-error and no-desktop-
+  fallback coverage, plus playable-result metadata coverage.
+- Added API and frontend regressions proving backend confirmation is required
+  before the UI shows Connected.
+- Reworked the previous desktop-fallback regressions to prove normal YTM
+  actions do not call the deep-link or desktop transport path.
+
+### Validation
+
+- `./.venv/bin/pytest tests/test_ytm_web.py tests/test_phase0_media_regressions.py tests/test_ytm_connection_api.py tests/test_nowplaying.py tests/test_loop_tool_events.py -q` -> PASS (`48 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`132 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
+- `./.venv/bin/ruff check jarvis/media/ytm_web.py jarvis/agent/tools.py jarvis/app.py jarvis/agent/prompts.py tests/test_ytm_web.py tests/test_phase0_media_regressions.py tests/test_ytm_connection_api.py` -> PASS
+- `./.venv/bin/ruff check .` -> FAIL (3 pre-existing findings in `jarvis/audio/focus.py`, `jarvis/log.py` and `tests/test_web_ui_7b.py`)
+- `./.venv/bin/ruff format --check .` -> FAIL (6 pre-existing formatting findings; changed YTM/connection test files are formatted)
+- `git diff --check` -> PASS
+- `cd web-ui && npm run typecheck` -> PASS
+- `cd web-ui && npm run test` -> PASS (3 tests)
+- `cd web-ui && npm run build` -> PASS
+- `curl -sS http://127.0.0.1:7777/api/ytm/connection` -> PASS runtime smoke; current real profile reports `NEEDS_LOGIN`, `page_ready=true`, `search_ready=true`, `player_loaded=false`
+
+### Manual validation still required
+
+No real Google login or audible playback has been claimed. In the open headed
+YT Music window, click **Poveži YouTube Music** if needed, log in directly on
+Google, then validate: play artist/song A; play different artist/song B while
+A is active; pause; resume; next five times; previous three times; play a
+specific different song; restart JARVIS and confirm the profile reconnects.
+Confirm every successful tool result reports `adapter=ytm_web` and
+`verified=true`, and confirm audio is audible from the same browser session.
+
+### New issues discovered
+
+- No additional out-of-scope issue was found. Real browser DOM/audio behavior
+  remains the required manual checkpoint.
+
+### Remaining risks
+
+- Authentication/account selectors and YT Music DOM control selectors need
+  confirmation against the user's logged-in account.
+- Browser autoplay/audio policy and macOS Accessibility permissions may still
+  affect real playback or unrelated PTT functionality.
+- Full Ruff and format checks remain red on unrelated pre-existing files.
+- Phase 2 MediaService has not started.
+
+### Ready for next phase
+
+NO — automated validation passes, but real connection/authentication and
+audible YT Music manual validation are still required. Do not merge and do not
+start Phase 2.
+
+## Phase 1 connection presentation correction (2026-08-14)
+
+### Root cause
+
+When the server already had a live headed Playwright page in
+`~/.jarvis/ytm_profile`, `POST /api/ytm/connect` reused it and navigated to
+YT Music but never brought that page to the front. The endpoint returned the
+same `NEEDS_LOGIN` state, while the Connections card had no inline action
+feedback, so the user could not see where to authenticate. Startup also
+treated the existence of the profile directory as proof that the profile had
+previously been authenticated, so an incomplete profile was launched again on
+every restart.
+
+### Completed
+
+- Explicit `connect()` now calls Playwright `Page.bring_to_front()` on the
+  existing dedicated page before navigation and does not create a duplicate
+  persistent context.
+- Added a local `.connected` marker written only after backend probe evidence
+  establishes `CONNECTED`; `warm_up()` and implicit readiness restoration now
+  require that marker.
+- Added immediate inline Connections-card feedback for opening/login errors
+  and login progress, while preserving backend-confirmed `CONNECTED` truth.
+- Changed the `NEEDS_LOGIN` button label to **Otvori YouTube Music prijavu**.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `web-ui/src/components/ConnectionsTab.tsx`
+- `web-ui/src/lib/ytm-connection.ts`
+- `tests/test_ytm_web.py`
+- `web-ui/src/lib/ytm-connection.test.ts`
+- `README.md`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added a regression proving an existing `NEEDS_LOGIN` page is brought to the
+  front exactly once and no second persistent context is launched.
+- Added coverage proving an unconnected profile directory is not warmed up
+  automatically.
+- Added frontend pure-state coverage for the explicit login button label.
+
+### Validation
+
+- Targeted connection/YTM backend tests -> PASS (`40 passed`)
+- Targeted Ruff for changed Python files -> PASS
+- Frontend typecheck -> PASS
+- Frontend tests -> PASS (`3 tests`)
+- Frontend build -> PASS
+- Full backend suite -> PASS (`135 passed, 3 xfailed`; known Phase 3 local-model regressions)
+- Changed Python format check -> PASS
+- Full Ruff -> FAIL on 3 pre-existing findings in `jarvis/audio/focus.py`,
+  `jarvis/log.py` and `tests/test_web_ui_7b.py`
+- Full format check -> FAIL on 6 pre-existing files/findings; changed YTM
+  files remain formatted
+- `git diff --check` -> PASS
+
+### Manual validation still required
+
+After restart, open the Connections tab and click **Otvori YouTube Music
+prijavu**. The existing/new dedicated headed browser must become visible. Log
+in directly through Google/YT Music, wait for backend `CONNECTED`, then run
+the full Phase 1 playback sequence and restart JARVIS to verify persistence.
+
+### New issues discovered
+
+- No additional issue beyond the connection-presentation bug recorded in
+  Appendix A.
+
+### Remaining risks
+
+- macOS window-manager behavior may still vary; `bring_to_front()` is scoped
+  to the dedicated Playwright page and does not activate unrelated Chrome
+  profiles.
+- Real Google login, audible playback and YT Music DOM controls remain
+  unvalidated until the user repeats the manual sequence.
+
+### Ready for next phase
+
+NO — the correction is ready for a new manual validation attempt, but Phase 1
+is not complete and Phase 2 must not start.
+
+## Phase 1 login completion correction (2026-08-14)
+
+### Root cause
+
+The failed real login was performed in the intended dedicated profile and
+returned to a live `https://music.youtube.com` page, but the authentication
+probe required one narrow avatar/account selector. The real logged-in page
+had a usable YT Music app, navigation bar and search surface while that
+selector was absent, so every status poll incorrectly returned `NEEDS_LOGIN`.
+
+The adapter also retained only one tracked Playwright page. That made a
+Google login flow vulnerable to leaving `_ytm_page` on an accounts page or a
+stale/closed tab when the usable YT Music page was opened or replaced
+elsewhere in the same persistent context.
+
+The live diagnostic confirmed the profile and DOM evidence without exposing
+credentials: `/Users/marko/.jarvis/ytm_profile`, one active YT Music tab,
+`page_ready=true`, `search_ready=true`, `has_ytm_app=true`, `has_nav=true`,
+`has_search=true`, `has_account=false` and `has_explicit_login=false`.
+
+### Completed
+
+- Added live-page inventory and adoption across `_context.pages`, preferring
+  an authenticated, usable `music.youtube.com` page and recovering from a
+  stale or closed tracked page.
+- Reused the page-adoption path for status polling, connect/reconnect,
+  restore and navigation recovery.
+- Replaced the avatar-presence authentication decision with evidence-based
+  signals: usable YT Music app/search surface plus no explicit login
+  evidence; Google login pages and explicit YT Music sign-in controls remain
+  `NEEDS_LOGIN`.
+- Kept unknown authentication as an explicit error rather than silently
+  claiming `CONNECTED` or inventing a login failure.
+- Preserved automatic polling and marker creation only after verified
+  dedicated-page readiness.
+- Prevented a repeated Connect action from navigating away from an active
+  Google login page.
+- Confirmed the saved profile restored as `CONNECTED` after a JARVIS restart
+  without another login.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `tests/test_ytm_web.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added polling coverage for `NEEDS_LOGIN -> CONNECTED` after DOM/auth state
+  changes without another Connect call.
+- Added coverage proving a usable YT Music surface does not require an
+  avatar selector.
+- Added second-tab, stale-YT Music-tab and closed-page adoption tests.
+- Added coverage for unknown authentication, marker safety and preserving an
+  active Google login page on repeated Connect.
+
+### Validation
+
+- `./.venv/bin/pytest -q tests/test_ytm_web.py tests/test_ytm_connection_api.py` -> PASS (`37 passed`)
+- `./.venv/bin/pytest -q tests/test_phase0_media_regressions.py tests/test_ytm_web.py tests/test_ytm_connection_api.py tests/test_nowplaying.py tests/test_loop_tool_events.py` -> PASS (`58 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`142 passed, 3 xfailed`; known Phase 3 local-model regressions)
+- `./.venv/bin/ruff check jarvis/media/ytm_web.py tests/test_ytm_web.py` -> PASS
+- `./.venv/bin/ruff format --check jarvis/media/ytm_web.py tests/test_ytm_web.py` -> PASS
+- `./.venv/bin/ruff check .` -> FAIL (3 pre-existing findings in
+  `jarvis/audio/focus.py`, `jarvis/log.py` and `tests/test_web_ui_7b.py`)
+- `./.venv/bin/ruff format --check .` -> FAIL (6 pre-existing formatting
+  findings; changed files remain formatted)
+- `git diff --check` -> PASS
+- `cd web-ui && npm run typecheck` -> PASS
+- `cd web-ui && npm run test` -> PASS (`3 tests`)
+- `cd web-ui && npm run build` -> PASS
+- Real runtime before the correction: dedicated profile/page was confirmed,
+  but old code returned `NEEDS_LOGIN` despite YTM readiness.
+- Real runtime after the correction: `POST /api/ytm/connect` returned
+  `CONNECTED`; after shutdown/restart, automatic profile restore returned
+  `CONNECTED` again. Safe probe logs showed the real usable YTM surface and
+  no account selector.
+
+### Manual validation still required
+
+- Repeat the full connection-only sequence in the visible dedicated browser:
+  start JARVIS, click Connect, log in if needed, wait for automatic
+  `CONNECTED`, stop JARVIS, restart it, and confirm `CONNECTED` persists.
+- Only after that connection checkpoint, repeat the Phase 1 playback matrix:
+  different artist/song while another track plays, pause, resume, next five
+  times and previous three times. No manual playback success is claimed by
+  this correction.
+
+### New issues discovered
+
+- The connection correction is resolved, but a separate real-runtime
+  playback/search issue was observed and recorded in Appendix A. The
+  missing-avatar probe and multi-page login handoff are fixed in this
+  correction; the manual playback checkpoint remains outstanding.
+
+### Remaining risks
+
+- YT Music DOM controls and browser autoplay/audio behavior still require the
+  user's real manual playback validation.
+- Full Ruff/format repository checks may still report unrelated pre-existing
+  findings; changed files are clean.
+- Phase 2 MediaService/state-ownership work has not started.
+
+### Ready for next phase
+
+NO — the connection correction passed real profile restore smoke validation,
+but the required user-led connection and audible playback checkpoint has not
+yet been repeated after this correction. Do not merge and do not start Phase 2.
+
+---
+
+## Phase 1 playback DOM correction update (2026-08-14)
+
+### Root cause
+
+The authenticated YT Music page did not use the selector shape assumed by the
+old `play_query()` implementation. The live search surface rendered
+`ytmusic-responsive-list-item-renderer` and `ytmusic-two-row-item-renderer`
+components. A playable row carried `videoId` and a nested `watchEndpoint` in
+Polymer component data, while its rendered watch link could be `/watch` or a
+watch URL without the old guaranteed `href*="/watch?v="` shape. Artist and
+album/navigation rows exposed browse data without a playable `videoId`.
+
+Two additional runtime issues were confirmed during the focused real-browser
+check. Setting the search input and pressing Enter changed the URL but could
+leave stale result rows during a second request, so the same dedicated page
+now navigates directly to the YT Music `/search?q=...` URL. Also, this
+Playwright version exposes the `wait_for_function` argument as keyword-only;
+passing the verification payload positionally caused the real readiness and
+player checks to fail before they could verify playback.
+
+### Completed
+
+- Added component-aware playable-result inspection using nested `videoId` /
+  `watchEndpoint` evidence and a real `/watch` anchor or YT Music play-control
+  fallback.
+- Skipped artist, album and generic navigation rows and ranked playable rows
+  by safe query-text relevance before selecting a candidate.
+- Replaced the stale SPA input/Enter search path with direct navigation inside
+  the same authenticated YT Music browser page and added a bounded render
+  settle before clicking.
+- Used the current YT Music watch anchor as the preferred click target because
+  the live overlay play control could load a selected track without starting
+  playback; the result remains verified only from YT Music player state.
+- Added structured `ytm_play` diagnostics for connection state, search method,
+  stage, candidate identity, delivery and verification. Connected search or
+  playback failures remain `connection_state=CONNECTED` and do not imply
+  login failure.
+- Corrected the real Playwright `wait_for_function(..., arg=...)` calls and
+  preserved strict player identity/playing verification for both successive
+  play requests.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/tools.py`
+- `jarvis/agent/prompts.py`
+- `tests/test_ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added component-shaped fixtures covering playable songs, artist/album
+  navigation, no-candidate structured failure, successive different queries,
+  connected playback failure and verified player state.
+- Added a tool regression proving a connected search failure preserves its
+  diagnostic state and does not become a login instruction.
+
+### Validation
+
+- `./.venv/bin/pytest -q tests/test_ytm_web.py tests/test_phase0_media_regressions.py` -> PASS (`49 passed`)
+- `./.venv/bin/pytest -q` -> PASS (`147 passed, 3 xfailed`; the xfails are the known Phase 3 local-model regressions)
+- `./.venv/bin/ruff check jarvis/media/ytm_web.py jarvis/agent/tools.py jarvis/agent/prompts.py tests/test_ytm_web.py tests/test_phase0_media_regressions.py` -> PASS
+- `./.venv/bin/ruff format --check` on changed YTM/Python test files -> PASS
+- `git diff --check` -> PASS
+- `cd web-ui && npm run typecheck` -> PASS
+- `cd web-ui && npm run test` -> PASS (`3 tests`)
+- `cd web-ui && npm run build` -> PASS
+- Real authenticated adapter check using `/Users/marko/.jarvis/ytm_profile` -> PASS for `Relja Popović` and `Vlado Georgiev`: `CONNECTED`, search submitted through `ytm_search_url`, playable candidate found/clicked, player `playing=true`, actual YT Music title/artist matched, `verified=true` for both successive requests.
+- Audible output was not independently measured; only the dedicated YT Music DOM player state was observed.
+- Full repository Ruff remains red on three pre-existing unused imports, and full format check remains red on six pre-existing documentation/unrelated files; no changed-file finding was introduced.
+
+### Manual validation still required
+
+Start JARVIS and repeat through chat with the logged-in dedicated browser:
+play one specific Relja song, play a different Vlado Georgiev song while it
+is active, pause, resume, next five times and previous three times. Confirm
+each successful result has `adapter=ytm_web`, `connection_state=CONNECTED`,
+`verified=true` and the actual YT Music title/artist. Confirm the audio is
+audible from the dedicated browser and repeat the check after a restart.
+
+### New issues discovered
+
+- The search-result selector issue is resolved in code and recorded here; no
+  separate out-of-scope issue was found. The known YT Music DOM/autoplay
+  variability remains a manual checkpoint.
+
+### Remaining risks
+
+- Audible output and the complete user-led pause/resume/next/previous matrix
+  still require manual confirmation on this macOS session.
+- YT Music may change its Polymer component data or click behavior again;
+  failures now remain explicit and include adapter/stage diagnostics.
+- Phase 2 `MediaService` and state-ownership work has not started.
+
+### Ready for next phase
+
+NO — the focused real adapter check passes, but the required user-led manual
+Phase 1 validation and audible playback checkpoint remain outstanding. Do not
+merge and do not start Phase 2.
+
+---
+
+## Phase 1 final focused runtime pass (2026-08-14)
+
+### Root cause
+
+The live authenticated YT Music player bar does not expose the transport
+controls as `#next-button` and `#previous-button`. It renders
+`yt-icon-button.next-button` and `yt-icon-button.previous-button` inside
+`ytmusic-player-bar`; the actionable inner buttons carry the `Next` and
+`Previous` ARIA labels. The old selectors therefore returned `no next button`
+or `no previous button` even though the visible controls were usable.
+
+The YT Music volume tools were still using AppleScript `set volume`, which
+changed the whole macOS output device rather than the dedicated YT Music
+player. The headless Chrome smoke test also reached the music origin but did
+not render the YT Music app, search box or player bar, so headless mode was not
+adopted as the normal runtime.
+
+### Completed
+
+- Scoped next/previous discovery to the authenticated `ytmusic-player-bar`
+  custom controls and clicked exactly one actionable inner button.
+- Preserved strict before/after track-identity verification and added bounded
+  delayed state reads only; delivered next/previous commands are never resent
+  by the verification path.
+- Added YT Music-only volume operations using `video.volume` and
+  `video.muted`, with ±0.10 clamping, readback and explicit degraded failure
+  results when the media element is unavailable.
+- Updated tool schemas, prompt guidance and README semantics so `ytm_volume_*`
+  is distinct from macOS-wide `system_volume`.
+- Kept explicit Connect headed and presented; saved normal restore uses the
+  headed browser with `--start-minimized`.
+- Real authenticated adapter validation completed `next` ×5 and `previous`
+  ×3 with `CONNECTED`, `delivered=true`, `verified=true` and changed title /
+  artist state for each transition. The YTM volume up/down/mute/toggle path
+  also returned verified media-element readback.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/tools.py`
+- `jarvis/agent/prompts.py`
+- `tests/test_ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `README.md`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added player-bar-shaped fake DOM coverage for next/previous, single command
+  delivery, unchanged-track failure and delivered-but-unverifiable degraded
+  results with bounded read counts.
+- Added YT Music media-element volume clamp, mute, readback and unavailable
+  element coverage.
+- Added a tool-level regression proving YT Music volume never calls the
+  macOS system-volume AppleScript.
+- Added lifecycle coverage for minimized saved-profile restore versus
+  explicitly presented Connect.
+
+### Validation
+
+- `./.venv/bin/pytest -q tests/test_ytm_web.py tests/test_phase0_media_regressions.py` -> PASS (`60 passed`)
+- Real authenticated `ytm_web` adapter using `/Users/marko/.jarvis/ytm_profile` -> PASS: `CONNECTED`; search/play verified; next ×5 and previous ×3 each delivered one player-bar click and verified a changed track identity; volume up/down/mute/toggle verified HTML media-element state.
+- Headless authenticated Chrome smoke -> NOT ADOPTED: origin loaded, but the YT Music app, search box and player bar did not render.
+- Headed saved-profile restore with `--start-minimized` -> PASS: the adapter restored `CONNECTED`; the read-only macOS window-list probe found no on-screen matching YT Music window. Audible output and focus behavior were not independently measured.
+
+### Manual validation still required
+
+- Start JARVIS with `./scripts/start.sh` and use the connected profile through
+  chat: play a specific Relja song, play a different Vlado Georgiev song,
+  pause, resume, next ×5 and previous ×3.
+- Confirm successful tool results show `adapter=ytm_web`,
+  `connection_state=CONNECTED`, `verified=true` and the actual YT Music
+  title/artist; confirm the dedicated browser remains backgrounded during
+  normal actions and is presented only by Connect/reconnect.
+- Test `ytm_volume_up/down/mute` while another macOS audio source is present,
+  confirming only YT Music changes, then confirm the audio is audible.
+- Repeat the playback and persistence checks after a JARVIS restart.
+
+### New issues discovered
+
+- Headless Chrome did not render the authenticated YT Music surface in the
+  real-profile smoke test; this is recorded in Appendix A. Phase 1 uses the
+  safer headed-minimized fallback and does not add a new browser architecture.
+
+### Remaining risks
+
+- Audible output, exact focus/window behavior and the user-led chat sequence
+  still require manual confirmation on this macOS session.
+- YT Music may change its Polymer control classes or labels; failures remain
+  explicit and limited to one delivered non-idempotent action.
+- Phase 2 `MediaService` and state-ownership work has not started.
+
+### Ready for next phase
+
+NO — the focused runtime correction is implemented and directly validated, but
+the required user-led audible/manual Phase 1 checkpoint remains outstanding.
+Do not merge and do not start Phase 2.
+
+---
+
+## Phase 1 focused UX/runtime correction (2026-08-15)
+
+### Root cause
+
+On the real authenticated YT Music player, `Previous` is stateful: when the
+current track has progressed, the first native player-bar click restarts that
+same track instead of selecting the previous item. The strict identity check
+correctly refused to call that a track transition, but it had no bounded,
+state-aware continuation for the user's semantic request to go to the
+previous track.
+
+The volume tools only exposed fixed ten-percent steps. The dedicated browser
+also became visible after ordinary navigation because `--start-minimized`
+only affects initial launch and does not reassert the window state after a
+presented Connect flow or later page navigation. A bounded real headless
+diagnostic reached the YT Music origin but received Chrome's deprecated-browser
+surface (`HeadlessChrome` user agent), with no YT Music app, search box or
+player bar; headless audio was therefore not evaluated or claimed.
+
+### Completed
+
+- Added same-track/current-time-reset detection for native restart-current
+  `previous` behavior. A deliberate second click is allowed only after that
+  positive evidence, never when metadata is unavailable, and never more than
+  twice total. Results now expose click count, intermediate state, restart
+  detection and explicit `NO_PREVIOUS_TRACK` failure where observed.
+- Added verified `ytm_volume_set(level=0..100)` and parametrized
+  `ytm_volume_up/down(amount=1..100, default=10)` using only the YT Music HTML
+  media element. macOS `system_volume` remains separate.
+- Added scoped Chromium CDP window-state enforcement using
+  `Browser.getWindowForTarget` and `Browser.setWindowBounds(windowState=minimized)`.
+  Normal restore, search, transport and volume paths do not present the page;
+  explicit Connect remains the presentation path.
+- Added the new tool to backend audio suppression and frontend tool metadata.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/tools.py`
+- `jarvis/agent/loop.py`
+- `jarvis/agent/prompts.py`
+- `web-ui/src/lib/tools.ts`
+- `tests/test_ytm_web.py`
+- `tests/test_phase0_media_regressions.py`
+- `README.md`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added previous near-start, native-restart continuation, no-previous-item,
+  unavailable-identity and maximum-click diagnostics coverage.
+- Added absolute/relative volume, clamping, validation, one-DOM-action and
+  system-volume isolation coverage.
+- Added dedicated CDP target selection/minimization and normal-path
+  non-presentation coverage.
+
+### Validation
+
+- `./.venv/bin/pytest -q tests/test_ytm_web.py tests/test_phase0_media_regressions.py`
+  -> PASS (`81 passed`).
+- `./.venv/bin/pytest -q` -> PASS (`179 passed, 3 xfailed`); the xfails are
+  the existing Phase 3 local-model defects.
+- Targeted Ruff and changed-file format checks -> PASS; `git diff --check` ->
+  PASS. Full repository Ruff/format remain red only on the pre-existing
+  findings recorded below.
+- `cd web-ui && npm run typecheck` -> PASS; `npm run test` -> PASS (`3
+  tests`); `npm run build` -> PASS.
+- Real authenticated adapter check -> `CONNECTED`; loaded-track `next` and
+  near-start `previous` each verified with one click; `ytm_volume_set` at 30%
+  and 75%, relative down 20%/up 15%, mute and unmute all verified by media
+  element readback. A progressed real track produced `native_restart_detected`
+  and exactly two clicks, then correctly returned `NO_PREVIOUS_TRACK` because
+  that track had no previous item. CDP reported the dedicated target window as
+  minimized. Audible output was not independently measured.
+- Headless diagnostic -> NOT ADOPTED: `HeadlessChrome` produced the Chrome
+  deprecated-browser page; YT Music DOM/player and audible output were not
+  available.
+
+### Manual validation still required
+
+- With the logged-in profile, play a track, invoke `previous` near the start
+  and confirm one click reaches the previous track.
+- Let a track progress, invoke `previous`, and confirm the result reports an
+  intermediate `restarted_current`, uses exactly two clicks, and ends on the
+  actual previous track. Repeat at the beginning/end of a playlist to confirm
+  the explicit no-previous failure.
+- Through chat, test `ytm_volume_set` at 30%, 75%, 0% and 100%, then
+  `ytm_volume_down(amount=20)` and `ytm_volume_up(amount=15)`; verify each
+  request uses one tool call and does not change macOS-wide volume.
+- During play/search/pause/resume/next/previous/volume, confirm the dedicated
+  browser remains minimized/backgrounded; Connect/Reconnect may present it.
+- Confirm playback remains audible and DOM controls continue working while
+  minimized, then repeat after a JARVIS restart.
+
+### New issues discovered
+
+- The bounded headless diagnostic identified the exact deprecated-browser
+  surface and remains recorded in Appendix A; normal runtime stays headed and
+  minimized.
+
+### Remaining risks
+
+- Real previous semantic success with a populated previous queue,
+  minimized-window non-intrusiveness during the full chat flow and audible
+  output still require user-led macOS/YT Music validation.
+- YT Music may change player-bar DOM, native Previous semantics or media-element
+  behavior; failures remain explicit and bounded.
+- Phase 2 `MediaService` and state-ownership work has not started.
+
+### Ready for next phase
+
+NO — automated coverage is expanded, but the required real manual Phase 1
+checkpoint remains outstanding. Do not merge and do not start Phase 2.
+
+---
+
+## Phase 1 final focused correction pass (2026-08-15)
+
+### Root cause
+
+The normal YT Music search path still used top-level `page.goto()` navigation.
+That navigation could make the dedicated headed Chrome window visible during a
+normal play request and did not provide enough evidence to diagnose a flash or
+stale successive-search result. The correction now drives the existing
+authenticated YT Music search box, waits for the exact query/route/rows, and
+records the dedicated CDP window state at each search and verification stage.
+
+Global PTT also still had an unsafe lifecycle: focus acquisition and recorder
+startup were scheduled independently, while recorder output used shared mutable
+state. A quick release or delayed worker completion could publish recording
+events too early, lose an utterance, or leave a temporary WAV behind. There was
+no bounded duration or cheap speech-energy gate, and PTT-originated chat turns
+did not carry their source into server-side speech routing.
+
+### Completed
+
+- Replaced normal YT Music top-level search navigation with authenticated SPA
+  search-box input plus Enter, exact query/route/row readiness checks and stale
+  result filtering. Normal YTM actions do not call `bring_to_front()`.
+- Added bounded, secret-free CDP window-state tracing for before search,
+  submit/route, result click, playback verification and final result; only the
+  explicit Connect path presents the dedicated page.
+- Preserved strict YT Music delivery-versus-verification semantics and the
+  already-fixed single-delivery safety for non-idempotent next/previous.
+- Added an explicit PTT `IDLE -> ARMING -> RECORDING -> IDLE` lifecycle.
+  Focus or TTS cancellation completes before capture begins, and
+  `mute_while_held=false` does not change system output volume.
+- Added documented/testable PTT minimum and maximum durations, a PCM energy
+  gate, MLX segment/no-speech evidence handling, diagnostic skipped events and
+  a per-utterance worker completion handoff with cleanup.
+- Preserved accepted PTT auto-send and added `source=ptt` through `/api/chat`
+  and the agent/speech scheduler. PTT replies publish
+  `tts_speak(server_played=true)` and use the existing server player after
+  focus restoration; ordinary text remains browser/UI-routed by default.
+- Kept rejected/no-speech PTT results out of chat execution and added concise
+  frontend diagnostics.
+
+### Phase 1 focused correction checklist
+
+- [x] Normal YTM search uses the existing authenticated SPA surface.
+- [x] Normal YTM actions remain backgrounded and emit window-state traces.
+- [x] PTT focus, capture start, release, cleanup and timeout are explicit and
+  bounded.
+- [x] PTT speech/no-speech validation and rejected-result UI behavior are
+  covered by regression tests.
+- [x] PTT source reaches server-side speech playback without changing normal
+  text behavior.
+- [ ] User-led real macOS/YT Music and global PTT manual checkpoint.
+
+### Files changed
+
+- `.env.example`
+- `README.md`
+- `jarvis/agent/loop.py`
+- `jarvis/app.py`
+- `jarvis/audio/speech.py`
+- `jarvis/audio/stt.py`
+- `jarvis/config.py`
+- `jarvis/hotkey.py`
+- `jarvis/media/ytm_web.py`
+- `tests/test_hotkey.py`
+- `tests/test_integration_chat.py`
+- `tests/test_ptt_lifecycle.py`
+- `tests/test_speech.py`
+- `tests/test_stt.py`
+- `tests/test_ytm_web.py`
+- `web-ui/src/lib/actions.ts`
+- `web-ui/src/lib/bus.test.ts`
+- `web-ui/src/lib/bus.ts`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests added/changed
+
+- Added YT Music SPA-search, no-top-level-navigation and CDP window-trace
+  coverage.
+- Replaced shallow PTT callback tests with lifecycle, mute-policy, delayed
+  worker, rapid-utterance, duration and state-diagnostic coverage.
+- Added PCM/WAV silence gate, MLX result-evidence and warmup-preservation
+  tests.
+- Added server-side PTT speech/source propagation and frontend rejected-result
+  coverage.
+- Retained the strict YT Music transition and single-delivery regressions.
+
+### Validation
+
+- `pytest -q --ignore=tests/test_web_ui_7b.py` -> PASS (`205 passed, 3
+  xfailed`); the xfails are the existing Phase 3 local-model defects.
+- `pytest -q` -> PASS (`205 passed, 3 xfailed`).
+- `pytest -q tests/test_ytm_web.py tests/test_hotkey.py
+  tests/test_ptt_lifecycle.py tests/test_stt.py tests/test_speech.py
+  tests/test_loop_tool_events.py tests/test_audio_focus.py
+  tests/test_ptt_status.py tests/test_integration_chat.py` -> PASS (`114
+  passed`).
+- `cd web-ui && npm run test` -> PASS (`8 tests`); `npm run typecheck` ->
+  PASS; `npm run build` -> PASS.
+- `.venv/bin/ruff check .` -> FAIL only on the three pre-existing findings in
+  `jarvis/audio/focus.py`, `jarvis/log.py` and `tests/test_web_ui_7b.py`.
+- `.venv/bin/ruff format --check .` -> FAIL on the pre-existing repository
+  formatting findings. Changed implementation/test files pass the focused
+  format check; `jarvis/app.py` still has its pre-existing blank-line finding.
+- `git diff --check` -> PASS.
+- Codex real-profile YTM pre-check (not the final user-led checkpoint) used the
+  `ytm_web` adapter with the persistent authenticated profile. The dedicated
+  CDP target stayed `minimized` at every `play_query` trace point for a
+  successful `Relja Popović Top Gun` request. A successive `Vlado Georgiev`
+  request selected a Vlado result and returned explicit
+  `PLAYBACK_DID_NOT_START` (`ok=false`, `delivered=true`, `verified=false`),
+  rather than claiming success; no normal-YouTube fallback was used.
+- Real PTT capture, audible server playback with zero WebSocket clients,
+  barge-in and duplicate-audio behavior -> NOT RUN by Codex; the required
+  user-led checkpoint remains open.
+
+### Manual validation still required
+
+- In the logged-in dedicated profile, play a specific Relja song, then a
+  different artist/song, pause, resume, next, previous, status and volume.
+  Confirm the dedicated window does not visibly flash during normal actions,
+  the trace stays on the YT Music target, success requires verified YTM state,
+  and investigate the explicit `PLAYBACK_DID_NOT_START` result if it recurs.
+- Hold Fn+Shift for a normal utterance, a too-short tap, silence and a held
+  timeout; confirm only accepted speech is sent and PTT replies are audible
+  through macOS output.
+- Test pause/next/previous commands through PTT, two rapid utterances and
+  barge-in while JARVIS is speaking. Confirm system volume restores before the
+  reply starts and no duplicate browser/server playback occurs.
+- Repeat with the browser window not frontmost; note that the deeper
+  no-WebSocket PTT transcript/session ownership issue remains Appendix A.
+
+### New issues discovered
+
+- The supported one-client PTT flow still relies on the frontend WebSocket to
+  consume `voice_ptt_transcribed`, choose a session and call `/api/chat`.
+  Multiple tabs or zero clients therefore remain a deeper ownership problem;
+  it is recorded in Appendix A and was not expanded into a Phase 1 redesign.
+- A real successive artist change can select the correct YT Music result but
+  fail to start the player; the adapter returns an explicit failure and does
+  not fall back to normal YouTube. This is recorded in Appendix A.
+
+### Remaining risks
+
+- Real minimized-window behavior, YT Music search/play/transport reliability,
+  audible output, PTT capture quality and barge-in still require the user's
+  live macOS checkpoint.
+- YT Music playback can still be unstable after a successive artist change;
+  the current safe behavior is a verified false/degraded result, not a false
+  success or a cross-provider fallback.
+- Browser/DOM and `nowplaying-cli` metadata can change outside automated fake
+  coverage; YTM results remain explicit failure/degraded when verification is
+  unavailable.
+- Phase 2 `MediaService` and state-ownership work has not started.
+
+### Ready for next phase
+
+NO — automated correction and regression coverage are complete, but the user
+manual Phase 1 checkpoint is still required. Do not merge and do not start
+Phase 2.
+
+---
+
+## Phase 1 search-result identity correction (2026-08-15)
+
+### Root cause
+
+The user-led real run on `405f135d573c3aeab054e3f9f0f40983b5199a22`
+confirmed a false-positive `ytm_play`. The search URL changed to the Michael
+Jackson query, but the candidate probe used:
+
+```text
+document.querySelector('ytmusic-search-page, ytmusic-section-list-renderer')
+```
+
+The first matching element in the real DOM was the persistent home-page
+`Listen again` section, not `ytmusic-search-page`. Its candidate fingerprint
+remained unchanged across Relja, Vlado and Michael Jackson searches, so the
+adapter selected recycled rows such as `MUŠKARČINA` or an unrelated Dzejla
+cover after the route had already changed.
+
+The weak partial-query exception then allowed a long request to continue when
+only one title token and one artist token matched. Search selection was also
+performed twice (`click=false`, then a new `click=true` probe), so the clicked
+row was not identity-bound to the originally inspected candidate.
+
+Finally, YT Music normally keeps the SPA URL on `/search?q=...`, while
+`get_state()` derived `track_id` from URL `v=`. The real authoritative player
+already exposed the active identity through
+`#movie_player.getVideoData().video_id`; ignoring it forced metadata fallback
+and allowed an unchanged unrelated player to be accepted as success.
+
+### Real pre-fix candidate evidence
+
+The bad root exposed the same stale `Listen again` IDs after unrelated query
+changes, including `g21vfoxBeNs` (Relja), `W-aqoVliWtk` (Vlado) and other
+history rows. A direct bounded inspection of the actual visible
+`ytmusic-search-page` for `They Don't Care About Us Michael Jackson` showed:
+
+| Order | Video ID | Title | Artist | Type |
+|---:|---|---|---|---|
+| 1 | `QNJL6nfu__Q` | They Don't Care About Us | Michael Jackson | video |
+| 2 | `t1pqi8vjTLY` | They Don't Care About Us (Prison Version) (Official Video) | Michael Jackson | video |
+| 3 | `_QqCu0ktlhM` | Michael Jackson - They Don't Care About Us - Live Munich 1997 | LiveMJHD | video |
+| 4 | `GsHZBisKwxg` | They Don't Care About Us (Remastered Version) | Michael Jackson | song |
+| 5 | `q-OzeShtUXg` | Michael Jackson - They Don t Care About Us Dark Gothic Orchestral | Gr1ven | song |
+| 6 | `iWeSEk_vjd8` | They Don't Care About Us (Epic Version) | Mathias Fritsche | song |
+
+No credentials, cookies, tokens or media URLs were captured.
+
+### Completed
+
+- Scoped result discovery exclusively to the visible `ytmusic-search-page`.
+- Captured the prior row/candidate fingerprint and required positive freshness
+  evidence after the exact new search route before selection.
+- Replaced the weak partial-token escape hatch with deterministic candidate
+  ranking over title, artist, video ID, result type and row order.
+- Required exact title+artist identity for specific requests; allowed exactly
+  one extra STT token only when both title and artist remain strongly matched.
+- Kept artist-only and exact-title-only requests supported, including the real
+  `Relja Popović` -> `Relja` stage-name case.
+- Preserved one selected video ID from ranking through a separate exact-ID
+  click revalidation; DOM reordering can no longer turn candidate A into B.
+- Read the active video ID from `#movie_player.getVideoData()` on both
+  `/search?q=...` and `/watch?v=...`; URL `v=` is now only a fallback.
+- Required `actual_player_video_id == selected_video_id` and `playing=true`
+  for normal success. Metadata fallback also requires strong selected metadata
+  and an observed before/after metadata change for a new result.
+- Added bounded post-click reads. One `video.play()` continuation is allowed
+  only after the selected ID remains loaded, media is ready and explicitly
+  paused over multiple reads; the result row is never clicked again.
+- Rejected raw 11-character video IDs as public `ytm_play` search queries.
+- Strengthened the agent prompt: ordinary song failure stays inside YT Music,
+  never auto-falls back to `play_youtube`/`open_url`, and permits at most one
+  clearly justified corrected YTM query.
+
+### Old vs new selection rule
+
+```text
+OLD
+URL q changed
+-> first generic section-list rows
+-> any long query with one title + one artist token could continue
+-> probe again and click whichever row wins now
+
+NEW
+exact visible ytmusic-search-page
+-> changed row/candidate fingerprint (or same-query surface)
+-> deterministic strong title/artist identity
+-> preserve selected_video_id
+-> revalidate and click exactly that video_id once
+```
+
+### Tests added/changed
+
+- Stale rows after the new `q` route cannot be selected or clicked.
+- Probe/click remains bound to the same video ID.
+- Exact title+artist, one-extra-token, artist-only and title-only ranking.
+- Weak one-title/one-artist overlap and unrelated candidates are rejected.
+- `/search?q=...` state follows changing live player IDs independently of URL.
+- `before=MUŠKARČINA`, Michael Jackson request, `after=MUŠKARČINA` cannot
+  succeed through either ID or metadata verification.
+- Correct selected ID loaded but paused receives one safe play continuation;
+  old-track state receives none; a delayed correct transition succeeds through
+  bounded reads.
+- Raw video-ID search recovery is rejected.
+- Prompt regressions preserve explicit video use while prohibiting automatic
+  song fallback to `play_youtube` or `open_url`.
+- Existing minimized-window, pause/resume, next/previous, volume and
+  single-delivery regressions remain in the targeted/full suite.
+
+### Real authenticated adapter validation
+
+- Baseline unrelated `Kotlaja MUŠKARČINA` -> PASS; selected and final
+  `OEoAO-TamKQ`, `playing=true`.
+- `Relja Popović` -> PASS; real run selected/final `IRlPbqzZcWM`, Relja,
+  `playing=true`.
+- `Vlado Georgiev` -> PASS inside the adapter; selected/final
+  `Gl5cSh60qhs`, Vlado Georgiev, `playing=true`, with no separate
+  `ytm_status` repair.
+- `They Don't Care About Us Michael Jackson` -> PASS; selected/final a strong
+  Michael Jackson result (`GsHZBisKwxg` in the primary run).
+- Reordered `Michael Jackson They Don't Care About Us` -> PASS.
+- Extra-token `Michael Jackson They Don't Really Care About Us` -> PASS;
+  selected/final `QNJL6nfu__Q`, Michael Jackson, using the explicit
+  one-extra-token title+artist rule.
+- Nonsense query -> PASS as a negative case: `ok=false`,
+  `NO_STRONG_MATCH`; the existing Michael Jackson player identity remained
+  unchanged and was not reported as a new success.
+- Repeat A -> B -> A -> C -> PASS; every success had
+  `selected_id == actual_id == final_id` and `playing=true`.
+- The dedicated CDP window remained `minimized` at every recorded point.
+- This was direct DOM/adapter validation; audible output and the final
+  user-led chat behavior were not independently claimed.
+
+### Files changed
+
+- `jarvis/media/ytm_web.py`
+- `jarvis/agent/prompts.py`
+- `tests/test_ytm_web.py`
+- `tests/test_prompts.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Validation
+
+- Focused YTM/prompt tests -> PASS (`103 passed`).
+- Full backend -> PASS (`223 passed, 3 xfailed`); the xfails are the existing
+  Phase 3 local-model defects. The first restricted run could not bind five
+  local integration-test ports; the identical suite passed outside that
+  sandbox restriction.
+- Targeted Ruff and changed-file format checks -> PASS.
+- `git diff --check` -> PASS.
+- Full repository Ruff -> FAIL only on the three pre-existing unused imports
+  in `jarvis/audio/focus.py`, `jarvis/log.py` and
+  `tests/test_web_ui_7b.py`.
+- Full repository format check -> FAIL only on the five pre-existing files
+  `AGENTS.md`, `DEVELOPER-GUIDE.md`, `jarvis/app.py`,
+  `jarvis/audio/focus.py` and `jarvis/log.py`.
+- Frontend -> not touched by this correction.
+
+### Manual validation still required
+
+- Repeat the exact Relja/Vlado/Michael Jackson matrix through normal JARVIS
+  chat/PTT and confirm the audible track matches the final reported title and
+  artist.
+- Confirm a failed ordinary song request does not trigger `play_youtube`,
+  `open_url`, another browser/player or a raw-video-ID retry in the real model
+  trace.
+- Confirm the dedicated browser remains backgrounded throughout the chat flow.
+
+### Remaining risks
+
+- YT Music result metadata/Polymer fields can change; failures now remain
+  bounded and explicit instead of accepting generic or stale rows.
+- Artist-only stage-name matching intentionally uses fresh YTM result ordering
+  plus a strict one-token artist alias; a weak unrelated candidate remains
+  rejected.
+- Phase 2 `MediaService` and wider tool-executor policy have not started.
+
+### Ready for next phase
+
+NO — the real adapter matrix passes, but the final user-led audible/chat
+checkpoint remains open. Do not merge and do not start Phase 2.
+
+---
+
 # 5. Phase 2 — Introduce authoritative MediaService
 
 **Priority:** P0/P1  
 **Goal:** remove competing media truths.
+
+### Phase 1 handoff constraint
+
+Phase 1 now provides a per-device authenticated, persistent `ytm_web` browser
+adapter and connection status. When Phase 2 introduces `MediaService`, its
+authoritative YT Music adapter must consume this existing connected browser
+session and authentication flow; it must not recreate login, copy cookies or
+reintroduce the desktop deep-link path.
 
 ## Target files
 
@@ -1314,6 +2475,67 @@ Template:
 **Blocks current phase:** yes/no
 ```
 
+## [P1] Delivered generic next/previous command could be repeated
+
+**Found in phase:** 1
+**Files:** `jarvis/media/nowplaying.py`
+
+**Symptom:**
+If `nowplaying-cli` reported a successful `next` or `previous` delivery but
+track identity could not be read, the fallback chain could send the same
+non-idempotent action again and potentially skip multiple tracks.
+
+**Root cause:**
+The generic transport treated failed verification uniformly and retried or
+fell back after delivery, without distinguishing a delivered command from a
+transport that failed before delivery.
+
+**Recommended phase:**
+Phase 1 — fixed in the Phase 1 correction.
+
+**Blocks current phase:** yes — resolved.
+
+## [P1] Generic macOS now-playing state contaminated YT Music verification
+
+**Found in phase:** 1
+**Files:** `jarvis/agent/tools.py`
+
+**Symptom:**
+When the dedicated YT Music web adapter was unavailable, desktop `ytm_play`
+and transport actions accepted `nowplaying-cli` state that could describe
+JARVIS TTS or another audio application. An already-playing unrelated track
+could therefore be reported as a newly requested YT Music track.
+
+**Root cause:**
+`_ytm_read_transport_state()` used generic macOS now-playing as a fallback,
+and desktop `ytm_play` treated `playing=True` as sufficient without matching
+the requested YT Music video identity.
+
+**Recommended phase:**
+Phase 1 — fixed by rejecting generic state and returning explicit degraded
+failures when YT Music-specific state is unavailable.
+
+**Blocks current phase:** yes — resolved in code; manual retest required.
+
+## [P2] `tool_done` event conflated execution with operation success
+
+**Found in phase:** 1
+**Files:** `jarvis/agent/loop.py`
+
+**Symptom:**
+The debug event reported `tool_done.ok=True` whenever a tool returned without
+raising, even when the tool returned structured JSON with `{"ok": false}`.
+
+**Root cause:**
+`_execute_tool()` did not inspect the structured tool result before publishing
+the completion event.
+
+**Recommended phase:**
+Phase 1 — fixed with a minimal result-status projection; the Phase 5
+ToolExecutor refactor has not started.
+
+**Blocks current phase:** no — resolved.
+
 ## [P2] Frontend dependency audit reports vulnerabilities
 
 **Found in phase:** 0  
@@ -1334,6 +2556,187 @@ Phase 10 — CI and quality gates, with dependency remediation as a separate
 focused change.
 
 **Blocks current phase:** no
+
+## [P1] Explicit YT Music connect did not present the existing login page
+
+**Found in phase:** 1
+**Files:** `jarvis/media/ytm_web.py`, `web-ui/src/components/ConnectionsTab.tsx`
+
+**Symptom:**
+With a live dedicated headed YT Music page in `NEEDS_LOGIN`, clicking the
+connection button returned `NEEDS_LOGIN` but did not visibly present the page
+or provide inline feedback explaining where to log in.
+
+**Root cause:**
+`connect()` reused the live runtime and navigated it without calling
+`Page.bring_to_front()`. The frontend displayed the same status after the
+request and only surfaced request exceptions through the global tool log.
+Profile-directory existence also caused incomplete profiles to warm up on
+every restart.
+
+**Recommended phase:**
+Phase 1 — fixed in the connection presentation correction.
+
+**Blocks current phase:** yes — resolved in code; manual retest required.
+
+## [P1] Logged-in YT Music page remained in NEEDS_LOGIN after Google login
+
+**Found in phase:** 1
+**Files:** `jarvis/media/ytm_web.py`, `tests/test_ytm_web.py`
+
+**Symptom:**
+After the user completed Google/YT Music login in the dedicated
+`~/.jarvis/ytm_profile` browser, status polling remained `NEEDS_LOGIN` and
+`ytm_play` returned a connection failure.
+
+**Root cause:**
+The probe treated a missing narrow avatar/account selector as proof of logout,
+even though the real page had a usable YT Music app, navigation bar and search
+surface. The adapter also tracked only one page and could miss a usable
+`music.youtube.com` page created or replacing the login tab.
+
+**Recommended phase:**
+Phase 1 — fixed with multi-page adoption and evidence-based login detection;
+manual connection and playback retest required.
+
+**Blocks current phase:** yes — resolved in code; manual retest required.
+
+## [P1] Connected YT Music search did not produce a playable result
+
+**Found in phase:** 1
+**Files:** `jarvis/media/ytm_web.py`
+
+**Symptom:**
+After the dedicated profile reached `CONNECTED`, real `ytm_play` requests for
+`Relja Popović` and `Vlado Georgiev` used the `ytm_web` adapter but timed out
+after 12 seconds waiting for the YT Music search-result selector. The logged
+results were explicit failures (`ok=false`, `delivered=false`,
+`verified=false`), so no false playback success was reported.
+
+**Root cause:**
+The selector assumed every playable result had an anchor whose href contained
+`/watch?v=...`. The real page used Polymer result components with nested
+`videoId`/`watchEndpoint` data and watch anchors whose href shape varied. A
+second search could also leave stale rows after the input/Enter SPA update.
+The focused correction initially passed Playwright `wait_for_function`
+payloads positionally, but the installed Playwright API accepts that argument
+only by keyword; the real readiness and player checks therefore failed until
+corrected.
+
+**Recommended phase:**
+Phase 1 — fixed in the Phase 1 playback DOM correction update. The correction
+uses the same authenticated browser page, the existing YTM search-box SPA
+surface, component-aware selection and strict DOM verification; it does not
+add a desktop or normal-YouTube fallback.
+
+**Blocks current phase:** yes — code and direct adapter validation are fixed,
+but user-led manual playback/audible validation remains required.
+
+## [P2] Headless Chrome did not render the authenticated YT Music surface
+
+**Found in phase:** 1
+**Files:** `jarvis/media/ytm_web.py`
+
+**Symptom:**
+The real authenticated profile could launch in headless Chrome and reach
+`https://music.youtube.com`, but the YT Music app, search box and player bar
+were not rendered in the bounded smoke test.
+
+**Root cause:**
+The bounded diagnostic used the current Chrome headless implementation and
+the authenticated profile, but the page exposed a `HeadlessChrome` user agent
+and rendered Chrome's "Your browser is deprecated" page. No `ytmusic-app`,
+search box, player bar or video element was available. The same profile works
+in headed Chrome, so an origin load in headless mode is not evidence that YT
+Music or audible playback is usable.
+
+**Recommended phase:**
+Phase 1 — resolved operationally by retaining a headed dedicated browser and
+starting saved normal-runtime sessions minimized. Revisit only if a reliable
+background audio mode is needed later.
+
+**Blocks current phase:** no — headed minimized restore is the selected
+fallback; manual focus and audible behavior remain required.
+
+## [P1] Global PTT transcript execution depends on frontend ownership
+
+**Found in phase:** 1 correction pass
+**Files:** `jarvis/hotkey.py`, `jarvis/bus.py`, `web-ui/src/lib/bus.ts`,
+`jarvis/agent/loop.py`
+
+**Symptom:**
+The global listener can capture and transcribe outside the browser, but the
+current supported auto-send path publishes `voice_ptt_transcribed` to the bus
+and relies on one frontend WebSocket client to choose the active session and
+call `/api/chat`. With zero clients there is no chat turn; with multiple tabs,
+more than one client could react to the same transcript.
+
+**Root cause:**
+PTT capture ownership and transcript execution ownership are split between the
+backend listener and browser UI state. This is broader than the focused Phase 1
+lifecycle/source correction.
+
+**Recommended phase:**
+Phase 7 lifecycle/concurrency plus Phase 8 frontend async/event ownership.
+Define one backend-owned PTT session/dispatch authority before making
+zero-client and multi-tab behavior guarantees.
+
+**Blocks current phase:** no — the documented supported manual configuration
+uses one JARVIS UI client; the issue remains a known risk and is not silently
+treated as resolved.
+
+## [P1] YT Music result can load without starting playback after a successive search
+
+**Found in phase:** 1 final focused correction pass
+**Files:** `jarvis/media/ytm_web.py`, `tests/test_ytm_web.py`
+
+**Symptom:**
+In a real authenticated profile, `Relja Popović Top Gun` played and verified,
+but a subsequent `Vlado Georgiev` search selected a Vlado result and left the
+player loaded without entering a verified playing state. The adapter returned
+`ok=false`, `delivered=true`, `verified=false`, `error_code=PLAYBACK_DID_NOT_START`.
+
+**Root cause:**
+The YT Music SPA accepted the new search and exposed a playable result, but the
+result-to-player transition/autoplay behavior was not reliable while another
+track was already playing. The current pass can prove the selected result and
+detect the missing playback, but does not add an unbounded retry or a provider
+fallback.
+
+**Recommended phase:**
+Phase 1 — resolved in the search-result identity correction. The adapter now
+reads the real player video ID, owns bounded delayed verification and may call
+`video.play()` once only when that exact selected ID is stably loaded, ready
+and paused.
+
+**Blocks current phase:** yes — resolved in code and direct real-adapter
+validation; the final user-led audible/chat checkpoint remains open.
+
+## [P0] Stale generic section-list rows caused false YTM play success
+
+**Found in phase:** 1 search-result identity correction
+**Files:** `jarvis/media/ytm_web.py`, `tests/test_ytm_web.py`
+
+**Symptom:**
+After the search URL changed to a Michael Jackson request, `ytm_play` could
+select and report `MUŠKARČINA` or another unrelated prior item. One run
+returned `ok=true`, `verified=true`, `verified_metadata` while the visible
+player remained on `MUŠKARČINA`.
+
+**Root cause:**
+The comma-separated root selector returned the first generic
+`ytmusic-section-list-renderer`, which was the persistent `Listen again`
+surface, instead of the real `ytmusic-search-page`. A weak partial-token rule
+accepted one title plus one artist token, and URL-derived identity was empty
+on `/search?q=...`, allowing unsafe metadata verification.
+
+**Recommended phase:**
+Phase 1 — fixed by exact search-page scoping, positive result freshness,
+strong deterministic title/artist ranking, same-video-ID click binding and
+authoritative `#movie_player.getVideoData().video_id` verification.
+
+**Blocks current phase:** yes — resolved in code and direct real-adapter
+validation; final user-led audible/chat validation remains required.
 
 ---
 

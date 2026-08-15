@@ -46,6 +46,21 @@ Alati `open_url(url, browser)` i `play_youtube(query)` koriste Playwright
 otvore Chrome, ukucaju u YouTube pretragu i puste prvi rezultat. Pitanje
 za `ask` dozvolu pre izvršenja.
 
+## YouTube Music
+
+YT Music koristi namensku persistent headed browser sesiju u
+`~/.jarvis/ytm_profile`. Na novom uređaju otvori tab *Konekcije* i klikni
+*Poveži YouTube Music*; prijava se obavlja direktno na Google/YT Music stranici.
+JARVIS ne prima, ne upisuje i ne čuva Google lozinku. U normalnom radu sačuvana
+sesija se pokreće minimizirano, dok je dugme za povezivanje prikaže radi prijave
+ili ponovnog povezivanja. Ista browser sesija se zatim koristi za pretragu,
+reprodukciju, YT Music-only volume i DOM verifikaciju pause/resume/next/previous
+akcija. Ako sesija istekne, status prelazi u *Potrebna prijava*.
+
+`ytm_volume_set/up/down/mute` menjaju samo HTML media element YT Music playera;
+`ytm_volume_set` prima `level` 0–100, a `ytm_volume_up/down` opcioni `amount`
+1–100 (podrazumevano 10). `system_volume` je alat za ceo macOS izlazni zvuk.
+
 ## Šta imaš odmah
 
 - 🧠 **LLM** — `MiniMax-M3` (MiniMax Token Plan, `https://api.minimax.io/v1`).
@@ -61,8 +76,9 @@ za `ask` dozvolu pre izvršenja.
 - 🔐 **Dozvole** — svaki tool ima `allow / ask / deny` (UI u tabu *Dozvole*),
   hot-reload, pamćenje po toolu, "zapamti" checkbox u approval modalu.
 - 🖥 **Kontrolni panel** — single-page UI na `http://127.0.0.1:7777/`, živi
-  WebSocket event stream, push-to-talk preko mikrofona ili globalnog
-  hotkey-a (`⌘⌥ Space`).
+  WebSocket event stream, push-to-talk preko mikrofona ili globalne
+  kombinacije `Fn+Shift` (drži oba tastera dok pričaš, pusti za transkripciju).
+  Zahteva macOS Accessibility dozvolu za proces koji pokreće JARVIS.
 - 📋 **Menu bar** — `scripts/menubar.sh` (opciono, zahteva `rumps`).
 
 ## Brzi start
@@ -138,6 +154,8 @@ tab *Konekcije* (prikazuje šta je učitano). Najbitnije:
 | `JARVIS_KILO_BIN` | Putanja do `kilo` binarija. |
 | `JARVIS_KILO_AUTO` | `true` = koristi `kilo run --auto` (allowlist). |
 | `JARVIS_TTS_OUTPUT` | `ui` = browser reprodukuje audio; `say` = server igra afplay. |
+| `JARVIS_PTT_MIN_DURATION_MS` | Minimalna dužina PTT snimka; kraći tap se odbacuje (default 350 ms). |
+| `JARVIS_PTT_MAX_DURATION_S` | Maksimalna dužina PTT snimka (default 30 s). |
 | `JARVIS_DEFAULT_POLICY` | `allow` / `ask` / `deny` za nove alate. |
 
 Napomena: env varijable `JARVIS_MINIMAX_BASE_URL` i `JARVIS_MINIMAX_API_KEY`
@@ -168,6 +186,8 @@ postojeći setup.
 | `GET  /api/permissions/pending` | Trenutno otvoreni zahtevi |
 | `POST /api/permissions/resolve` | `{request_id, action, remember}` |
 | `GET  /api/connections` | Status svih konekcija |
+| `GET  /api/ytm/connection` | Bezbedan status YT Music browser konekcije |
+| `POST /api/ytm/connect` | Otvori namenski headed YT Music browser za ručnu prijavu |
 | `POST /api/audio/stt` | multipart `audio` → `{text}` |
 | `POST /api/audio/tts` | `{text}` → WAV fajl (TTS) |
 | `WS   /ws` | Živi event stream |

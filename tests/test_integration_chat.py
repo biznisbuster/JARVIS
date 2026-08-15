@@ -224,6 +224,24 @@ async def test_chat_turn_streams_and_persists(store: PermissionStore, clean_sess
 
 
 @pytest.mark.asyncio
+async def test_ptt_chat_turn_marks_server_side_speech(store: PermissionStore, clean_sessions) -> None:
+    q, _ = await _collect_events()
+    sid = await agent_loop.chat("PTT odgovor", store=store, source="ptt")
+    await _wait_idle(sid)
+    await asyncio.sleep(0.05)
+
+    tts_events: list[dict[str, Any]] = []
+    while not q.empty():
+        evt = json.loads(q.get_nowait())
+        if evt["kind"] == "tts_speak":
+            tts_events.append(evt["payload"])
+
+    assert tts_events
+    assert all(event["server_played"] is True for event in tts_events)
+    BUS.unsubscribe(q)
+
+
+@pytest.mark.asyncio
 async def test_tool_call_loop(store: PermissionStore, clean_sessions) -> None:
     sid = await agent_loop.chat("KOLIKO JE SAT?", store=store)
     await _wait_idle(sid)

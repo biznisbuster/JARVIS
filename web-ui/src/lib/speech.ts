@@ -69,18 +69,36 @@ async function pump(): Promise<void> {
   try {
     while (queue.length > 0 && stopToken === myToken) {
       const item = queue.shift();
-      if (item) await playAudioFile(item.url);
+      if (item) await playAudioFile(item.url, item.text || '');
     }
   } finally {
     if (stopToken === myToken) pumping = false;
   }
 }
 
-function playAudioFile(url: string): Promise<void> {
+async function playThroughServer(text: string): Promise<boolean> {
+  if (!text.trim()) return false;
+  try {
+    const response = await fetch('/api/audio/tts/play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, force: true }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    store.addTool('⚠ Browser je blokirao TTS — odgovor puštam preko sistema.');
+    return true;
+  } catch (err) {
+    store.addTool(`⚠ TTS: browser i sistemska reprodukcija nisu uspeli (${(err as Error).message})`);
+    return false;
+  }
+}
+
+function playAudioFile(url: string, text: string): Promise<void> {
   return new Promise((resolve) => {
     const a = new Audio(url);
     audio = a;
     let settled = false;
+    let fallbackStarted = false;
     const done = () => {
       if (settled) return;
       settled = true;
@@ -91,7 +109,11 @@ function playAudioFile(url: string): Promise<void> {
     a.onpause = done;
     a.onerror = done;
     unlockAudio();
-    a.play().catch(done);
+    a.play().catch(() => {
+      if (settled || fallbackStarted) return;
+      fallbackStarted = true;
+      void playThroughServer(text).finally(done);
+    });
   });
 }
 

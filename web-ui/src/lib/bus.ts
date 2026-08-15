@@ -199,19 +199,27 @@ export function handleEvent(msg: BusEvent): void {
         store.addTool(`⚠ PTT: ${p.error || 'transcribe failed'}`);
         break;
       }
-      if (p.skipped === 'empty') {
-        store.addTool('… PTT: ništa nisam čuo');
+      if (p.skipped) {
+        const reason = String(p.skipped);
+        const message =
+          reason === 'too_short'
+            ? '… PTT: tap je bio prekratak'
+            : reason === 'timeout'
+            ? '⚠ PTT: snimanje je zaustavljeno posle maksimalnog trajanja'
+            : reason === 'no_speech' || reason === 'empty'
+            ? '… PTT: nisam jasno čuo'
+            : `… PTT: preskočeno (${reason})`;
+        store.addTool(message);
         break;
       }
       const text = String(p.text || '');
       if (!text) break;
       if (p.auto_send) {
-        store.addUser('🎙 ' + text);
-        void sendText(text, { interrupt: true });
+        void sendText(text, { interrupt: true, source: 'ptt', userLabel: '🎙 ' + text });
       } else {
         const draft = store.state.draft;
         store.set({ draft: (draft ? draft + ' ' : '') + text });
-        store.addUser('🎙 ' + text);
+        store.addTool('🎙 PTT transkript je u input polju — pritisni Pošalji.');
       }
       break;
     }

@@ -38,6 +38,7 @@ AUDIO_TOOLS = frozenset(
         "ytm_previous",
         "ytm_volume_up",
         "ytm_volume_down",
+        "ytm_volume_set",
         "ytm_volume_mute",
         "play_youtube",
     }
@@ -89,6 +90,7 @@ def _trim_history(messages: list[dict[str, Any]]) -> None:
 class _TurnRequest:
     text: str
     model: str | None = None
+    source: str = "text"
 
 
 @dataclass
@@ -213,6 +215,7 @@ async def chat(
     store: perm_mod.PermissionStore,
     model: str | None = None,
     interrupt: bool = False,
+    source: str = "text",
 ) -> str:
     """Enqueue a user turn for the session and return the session id.
 
@@ -226,7 +229,8 @@ async def chat(
         _cancel_turn(sess)
         _drain_queue(sess)
         await SPEECH.cancel(sess.id)
-    sess.queue.put_nowait(_TurnRequest(text=user_text, model=model))
+    turn_source = "ptt" if source == "ptt" else "text"
+    sess.queue.put_nowait(_TurnRequest(text=user_text, model=model, source=turn_source))
     _ensure_worker(sess, store)
     await _publish_busy(sess)
     return sess.id
@@ -280,7 +284,9 @@ async def _session_worker(sess: Session, store: perm_mod.PermissionStore) -> Non
                 if sess.queue.empty():
                     return
                 continue
-            sess.turn_task = asyncio.create_task(run_turn(sess, req.text, model=req.model, store=store))
+            sess.turn_task = asyncio.create_task(
+                run_turn(sess, req.text, model=req.model, source=req.source, store=store)
+            )
             try:
                 await sess.turn_task
             except asyncio.CancelledError:
@@ -342,6 +348,7 @@ async def run_turn(
     user_text: str,
     *,
     model: str | None = None,
+    source: str = "text",
     max_iterations: int = 8,
     store: perm_mod.PermissionStore,
 ) -> str:
@@ -354,7 +361,7 @@ async def run_turn(
     _trim_history(session.messages)
     await save_sessions()
 
-    SPEECH.begin_turn(session.id)
+    SPEECH.begin_turn(session.id, source=source)
     try:
         world_state = await build_world_state()
     except Exception:  # noqa: BLE001
@@ -501,5 +508,15 @@ async def _execute_tool(session: Session, tc: dict[str, Any], store: perm_mod.Pe
         result_text = json.dumps({"ok": False, "error": repr(exc)})
         await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
     else:
-        await BUS.publish("tool_done", {"session": session.id, "tool": name, "ok": True})
+        done_payload: dict[str, Any] = {"session": session.id, "tool": name, "ok": True}
+        try:
+            result = json.loads(result_text)
+        except (TypeError, json.JSONDecodeError):
+            result = None
+        if isinstance(result, dict) and isinstance(result.get("ok"), bool):
+            done_payload["ok"] = result["ok"]
+            for key in ("delivered", "verified", "degraded", "verification", "error"):
+                if key in result:
+                    done_payload[key] = result[key]
+        await BUS.publish("tool_done", done_payload)
     session.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})

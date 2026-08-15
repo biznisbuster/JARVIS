@@ -1,4 +1,4 @@
-"""JEDAN persistent Playwright browser za YTM kontrolu.
+"""Jedan headed, persistent Playwright browser za YTM kontrolu.
 
 Dizajn: browser se digne JEDNOM (na startup-u, pozivom ``warm_up()`` ili
 ``ensure_ready()``), drži jedan tab na music.youtube.com i živi ceo
@@ -7,31 +7,40 @@ već učitano.
 
 NE pozivati ``launch_persistent_context`` na svaki tool poziv. To je
 razlog zašto je sve bilo sporo: svaki chat je triggerovao 20s timeout
-na učitavanje player bara.
+na učitavanje player bara. Page/search readiness je odvojena od učitanog
+playera, pa prvi play može krenuti sa prazne početne stranice.
 
 Kako se koristi:
-- App startup:   ``asyncio.create_task(ytm_web.warm_up())`` (neblokirajuće)
+- App startup:   ``ytm_web.warm_up()`` (neblokirajuće, zakazuje restore task)
 - Tool poziv:    ``await ytm_web.ensure_ready()`` (brz ako je već warm)
 - State read:    ``await ytm_web.get_state()`` (čita sa postojećeg taba)
 - Search:        ``await ytm_web.play_query(query)``
-- Transport:     koristiti Quartz keystroke (brz, ne dodiruje browser)
+- Transport:     DOM kontrole na istoj YT Music stranici, sa state verifikacijom
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
+import re
+import unicodedata
+import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 log = logging.getLogger("jarvis.ytm_web")
 
 YTM_URL = "https://music.youtube.com"
 
-_CHROME_USER_DATA_ROOT = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
 _JARVIS_PROFILE_DIR = Path.home() / ".jarvis" / "ytm_profile"
-CHROME_PROFILE_NAME = os.environ.get("JARVIS_YTM_CHROME_PROFILE", "Default").strip() or "Default"
+
+ConnectionState = Literal["DISCONNECTED", "NEEDS_LOGIN", "CONNECTING", "CONNECTED", "ERROR"]
+
+DISCONNECTED: ConnectionState = "DISCONNECTED"
+NEEDS_LOGIN: ConnectionState = "NEEDS_LOGIN"
+CONNECTING: ConnectionState = "CONNECTING"
+CONNECTED: ConnectionState = "CONNECTED"
+ERROR: ConnectionState = "ERROR"
 
 _pw = None
 _browser = None
@@ -41,7 +50,22 @@ _launched: bool = False
 _active_profile: str | None = None
 _lock: asyncio.Lock | None = None
 _warmup_task: asyncio.Task | None = None
-_ready: bool = False
+_connection_state: ConnectionState = DISCONNECTED
+_connection_error: str | None = None
+_page_ready: bool = False
+_search_ready: bool = False
+_player_loaded: bool = False
+_playing: bool | None = None
+
+_YTM_VOLUME_DEFAULT_AMOUNT = 10
+_YTM_VOLUME_TOLERANCE = 0.011
+_YTM_PREVIOUS_RESTART_MIN_TIME = 3.0
+_YTM_PREVIOUS_RESTART_MAX_TIME = 2.5
+_YTM_SEARCH_MAX_READS = 16
+_YTM_SEARCH_READ_DELAY = 0.25
+_YTM_PLAYBACK_READ_DELAYS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+_YTM_PLAYBACK_CONTINUATION_READ_DELAY = 0.25
+_RAW_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 def _get_lock() -> asyncio.Lock:
@@ -65,41 +89,112 @@ def _safe_is_connected(browser: Any) -> bool:
         return False
 
 
+def _context_runtime_alive() -> bool:
+    """Return whether the persistent Playwright context is still usable."""
+    if not _launched or _context is None:
+        return False
+    return _browser is None or _safe_is_connected(_browser)
+
+
+def _context_pages() -> list[Any]:
+    """Return live pages, falling back to the tracked page when needed."""
+    if _context is None:
+        return []
+    try:
+        raw_pages = getattr(_context, "pages", None)
+        pages = list(raw_pages) if raw_pages is not None else []
+    except Exception:
+        pages = []
+    if _ytm_page is not None and not _safe_is_closed(_ytm_page):
+        if not any(page is _ytm_page for page in pages):
+            pages.append(_ytm_page)
+    return [page for page in pages if not _safe_is_closed(page)]
+
+
+def _page_origin(page: Any) -> str:
+    """Return a safe page origin without query, fragment or credentials."""
+    try:
+        url = str(getattr(page, "url", "") or "")
+    except Exception:
+        return "<unavailable>"
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        return "<unavailable>"
+    try:
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        port = ""
+    return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{port}"
+
+
+def _is_ytm_page(page: Any) -> bool:
+    return _page_origin(page) == YTM_URL
+
+
+def _runtime_alive() -> bool:
+    """Return whether the dedicated Playwright runtime still has a live tab."""
+    if not _context_runtime_alive() or _ytm_page is None:
+        return False
+    if _safe_is_closed(_ytm_page):
+        return False
+    return True
+
+
+def _connection_marker_path() -> Path:
+    return _JARVIS_PROFILE_DIR / ".connected"
+
+
+def _profile_is_connected() -> bool:
+    return _connection_marker_path().is_file()
+
+
+def _mark_profile_connected() -> None:
+    try:
+        marker = _connection_marker_path()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+    except OSError as exc:
+        log.warning("ytm_web: could not persist connection marker: %s", exc)
+
+
+def _clear_runtime_state() -> None:
+    global _page_ready, _search_ready, _player_loaded, _playing
+    _page_ready = False
+    _search_ready = False
+    _player_loaded = False
+    _playing = None
+
+
+def _status_payload() -> dict[str, Any]:
+    return {
+        "state": _connection_state,
+        "connected": _connection_state == CONNECTED,
+        "needs_login": _connection_state == NEEDS_LOGIN,
+        "page_ready": _page_ready,
+        "search_ready": _search_ready,
+        "player_loaded": _player_loaded,
+        "playing": _playing,
+        "error": _connection_error,
+    }
+
+
 def _resolve_profile() -> tuple[Path, list[str]]:
-    """Odluči koji Chrome profil koristiti za Playwright.
-
-    Podrazumevano: ``~/.jarvis/ytm_profile`` — poseban profil koji se
-    digne brzo i ne zavisi od GCM/token stanja tvog Chrome-a. Sync sa
-    YTM desktop i dalje radi jer se prijaviš na isti Google nalog
-    (biznisbuster@gmail.com). Prvi put te pita "prijavi se na Google" —
-    posle toga cookies perzistiraju.
-
-    Ako postaviš ``JARVIS_YTM_USE_USER_PROFILE=1``, pokuša tvoj sistemski
-    Chrome profil — to je sporije (token decrypt + GCM hanguje) ali
-    deli profile sa tvojim Chrome-om.
-    """
-    use_user = os.environ.get("JARVIS_YTM_USE_USER_PROFILE", "").strip().lower() in ("1", "true", "yes")
-    if use_user:
-        profile_dir = _CHROME_USER_DATA_ROOT / CHROME_PROFILE_NAME
-        if profile_dir.exists():
-            args = [
-                "--no-first-run",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                f"--profile-directory={CHROME_PROFILE_NAME}",
-            ]
-            return _CHROME_USER_DATA_ROOT, args
+    """Return the dedicated per-device browser profile and safe launch args."""
     _JARVIS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    return _JARVIS_PROFILE_DIR, ["--no-first-run"]
+    return _JARVIS_PROFILE_DIR, ["--no-first-run", "--disable-blink-features=AutomationControlled"]
 
 
-async def _launch_browser() -> bool:
-    """Pokreni persistent browser. Pozvati TAČNO jednom (warm_up)."""
+async def _launch_browser(*, start_minimized: bool = False) -> bool:
+    """Launch the one headed, persistent browser used by all YTM actions."""
     global _pw, _context, _ytm_page, _launched, _active_profile, _browser
-    if _launched and _safe_is_connected(_browser) and not _safe_is_closed(_ytm_page):
-        return True
+    if _context_runtime_alive():
+        await _find_or_adopt_ytm_page()
+        if _ytm_page is not None and not _safe_is_closed(_ytm_page):
+            return True
 
     user_data_dir, args = _resolve_profile()
+    if start_minimized:
+        args = [*args, "--start-minimized"]
     log.info("ytm_web: launching persistent browser profile=%s", user_data_dir)
 
     try:
@@ -115,22 +210,19 @@ async def _launch_browser() -> bool:
             log.warning("ytm_web: playwright.start failed: %s", exc)
             return False
 
-    last_exc: Exception | None = None
     for use_channel in (True, False):
         try:
             kwargs: dict[str, Any] = {
                 "user_data_dir": str(user_data_dir),
-                "headless": True,
+                "headless": False,
                 "args": args,
                 "timeout": 30000,
             }
             if use_channel:
                 kwargs["channel"] = "chrome"
             _context = await _pw.chromium.launch_persistent_context(**kwargs)
-            last_exc = None
             break
         except Exception as exc:
-            last_exc = exc
             log.warning("ytm_web: launch failed (channel=%s): %s", use_channel, exc)
     if _context is None:
         if user_data_dir != _JARVIS_PROFILE_DIR:
@@ -138,8 +230,8 @@ async def _launch_browser() -> bool:
             try:
                 _context = await _pw.chromium.launch_persistent_context(
                     user_data_dir=str(_JARVIS_PROFILE_DIR),
-                    headless=True,
-                    args=["--no-first-run"],
+                    headless=False,
+                    args=args,
                     timeout=30000,
                 )
             except Exception as exc:
@@ -153,7 +245,10 @@ async def _launch_browser() -> bool:
     _browser = _context.browser if hasattr(_context, "browser") else None
 
     pages = list(_context.pages or [])
-    if pages:
+    ytm_pages = [page for page in pages if _is_ytm_page(page)]
+    if ytm_pages:
+        _ytm_page = ytm_pages[0]
+    elif pages:
         _ytm_page = pages[0]
     else:
         try:
@@ -162,126 +257,482 @@ async def _launch_browser() -> bool:
             log.warning("ytm_web: new_page failed: %s", exc)
             return False
 
+    await _find_or_adopt_ytm_page()
     return True
 
 
-_PLAYER_READY_JS = """
+_PAGE_PROBE_JS = r"""
 () => {
-  const bar = document.querySelector('ytmusic-player-bar');
-  if (!bar) return false;
-  if (bar.hasAttribute('inert')) return false;
-  if (bar.hidden) return false;
+  const pageReady = location.origin === 'https://music.youtube.com';
+  const search = document.querySelector('ytmusic-search-box input')
+    || document.querySelector('input#input')
+    || document.querySelector('input[name="search_query"]');
+  const ytmApp = document.querySelector('ytmusic-app');
+  const nav = document.querySelector('ytmusic-nav-bar');
+  const account = document.querySelector('#avatar-btn, ytmusic-nav-bar #avatar-btn, ytmusic-nav-bar [aria-label*="Account" i], ytmusic-nav-bar a[href*="/channel/"]');
+  const signIn = document.querySelector('a[href*="ServiceLogin"], #sign-in-button, tp-yt-paper-button[aria-label*="Sign in" i], ytmusic-pivot-bar-item-renderer[tab-id="SIGN_IN"], ytmusic-guide-entry-renderer[tab-id="SIGN_IN"]');
+  const signInText = Array.from(document.querySelectorAll('button, a, tp-yt-paper-button'))
+    .some((el) => /^(sign in|log in|prijavi se)$/i.test(
+      (el.getAttribute('aria-label') || el.textContent || '').trim()
+    ));
+  const googleLogin = /(^|\.)accounts\.google\.com$/i.test(location.hostname)
+    || /(^|\.)google\.com$/i.test(location.hostname) && /servicelogin|signin/i.test(location.pathname);
+  const explicitLoginRequired = googleLogin || !!signIn || signInText;
+  const ytmSurfaceReady = pageReady && !!search && (!!ytmApp || !!nav);
   const video = document.querySelector('video');
-  if (!video) return false;
   const title = document.querySelector('.title.ytmusic-player-bar');
-  return !!(title && title.textContent && title.textContent.trim().length > 0);
+  const moviePlayer = document.getElementById('movie_player');
+  let videoData = {};
+  try {
+    videoData = moviePlayer && typeof moviePlayer.getVideoData === 'function'
+      ? (moviePlayer.getVideoData() || {})
+      : {};
+  } catch (_) {}
+  const playerVideoId = String(videoData.video_id || videoData.videoId || '').trim();
+  const trackId = playerVideoId || new URL(location.href).searchParams.get('v') || '';
+  const playerLoaded = !!(video && (trackId
+    || (title && title.textContent && title.textContent.trim().length > 0)));
+  return {
+    ok: true,
+    origin: location.origin,
+    page_ready: pageReady,
+    search_ready: pageReady && !!search,
+    ytm_surface_ready: ytmSurfaceReady,
+    authenticated: ytmSurfaceReady && !explicitLoginRequired,
+    login_required: explicitLoginRequired,
+    auth_evidence: explicitLoginRequired ? 'login_required' : (ytmSurfaceReady ? 'usable_surface' : 'unknown'),
+    has_ytm_app: !!ytmApp,
+    has_nav: !!nav,
+    has_search: !!search,
+    has_account: !!account,
+    has_explicit_login: explicitLoginRequired,
+    player_loaded: playerLoaded,
+    playing: playerLoaded ? (!video.paused && !video.ended && video.readyState >= 2) : null,
+    track_id: trackId,
+  };
 }
 """
 
 
-async def _ensure_page_ready() -> bool:
-    """Uveri se da je page na music.youtube.com i player bar učitan.
-    Vrati False ako nismo uspeli — pozivalac tada treba da preskoči
-    ytm_web."""
-    if not _launched:
-        return False
-    if _ytm_page is None or _safe_is_closed(_ytm_page):
+def _apply_probe(probe: dict[str, Any] | None) -> None:
+    global _page_ready, _search_ready, _player_loaded, _playing
+    if not isinstance(probe, dict) or probe.get("ok") is not True:
+        _clear_runtime_state()
+        return
+    _page_ready = bool(probe.get("page_ready"))
+    _search_ready = bool(probe.get("search_ready"))
+    _player_loaded = bool(probe.get("player_loaded"))
+    playing = probe.get("playing")
+    _playing = playing if isinstance(playing, bool) else None
+
+
+async def _evaluate_page_probe(page: Any) -> dict[str, Any] | None:
+    try:
+        probe = await page.evaluate(_PAGE_PROBE_JS)
+    except Exception as exc:
+        log.debug("ytm_web: page probe failed for origin=%s: %s", _page_origin(page), exc)
+        return None
+    if not isinstance(probe, dict):
+        return None
+    return probe
+
+
+def _probe_is_usable(probe: dict[str, Any] | None) -> bool:
+    return bool(
+        isinstance(probe, dict)
+        and probe.get("authenticated")
+        and probe.get("page_ready")
+        and probe.get("search_ready")
+    )
+
+
+def _log_probe(page: Any, probe: dict[str, Any]) -> None:
+    log.debug(
+        "ytm_web: probe profile=%s origin=%s page_ready=%s search_ready=%s "
+        "ytm_surface_ready=%s player_loaded=%s auth_evidence=%s "
+        "has_ytm_app=%s has_nav=%s has_search=%s has_account=%s "
+        "has_explicit_login=%s",
+        _active_profile or _JARVIS_PROFILE_DIR,
+        _page_origin(page),
+        bool(probe.get("page_ready")),
+        bool(probe.get("search_ready")),
+        bool(probe.get("ytm_surface_ready")),
+        bool(probe.get("player_loaded")),
+        probe.get("auth_evidence", "unknown"),
+        bool(probe.get("has_ytm_app")),
+        bool(probe.get("has_nav")),
+        bool(probe.get("has_search")),
+        bool(probe.get("has_account")),
+        bool(probe.get("has_explicit_login")),
+    )
+
+
+async def _find_or_adopt_ytm_page() -> Any | None:
+    """Find the usable YTM page and replace stale tracked-page references."""
+    global _ytm_page
+    if not _context_runtime_alive():
+        return None
+
+    pages = _context_pages()
+    log.debug(
+        "ytm_web: page inventory profile=%s count=%s origins=%s",
+        _active_profile or _JARVIS_PROFILE_DIR,
+        len(pages),
+        [_page_origin(page) for page in pages],
+    )
+    ytm_pages = [page for page in pages if _is_ytm_page(page)]
+    selected = None
+
+    if ytm_pages:
+        ordered = []
+        if any(page is _ytm_page for page in ytm_pages):
+            ordered.append(_ytm_page)
+        ordered.extend(page for page in reversed(ytm_pages) if all(page is not item for item in ordered))
+        for page in ordered:
+            probe = await _evaluate_page_probe(page)
+            if probe is not None:
+                _log_probe(page, probe)
+            if _probe_is_usable(probe):
+                selected = page
+                break
+        if selected is None:
+            selected = ordered[0]
+    elif _ytm_page is not None and not _safe_is_closed(_ytm_page):
+        # Keep an accounts.google.com page while the user is completing login,
+        # but replace it as soon as a live music.youtube.com page appears.
+        selected = _ytm_page
+    elif pages:
+        selected = pages[-1]
+
+    if selected is not _ytm_page:
+        log.info(
+            "ytm_web: selected page profile=%s origin=%s previous_origin=%s",
+            _active_profile or _JARVIS_PROFILE_DIR,
+            _page_origin(selected) if selected is not None else "<none>",
+            _page_origin(_ytm_page) if _ytm_page is not None else "<none>",
+        )
+    _ytm_page = selected
+    return selected
+
+
+async def _probe_page() -> dict[str, Any] | None:
+    page = await _find_or_adopt_ytm_page()
+    if page is None:
+        _clear_runtime_state()
+        return None
+    probe = await _evaluate_page_probe(page)
+    if probe is None:
+        _clear_runtime_state()
+        return None
+    _apply_probe(probe)
+    _log_probe(page, probe)
+    return probe
+
+
+def _set_connection_from_probe(probe: dict[str, Any] | None) -> None:
+    global _connection_state, _connection_error
+    previous_state = _connection_state
+    if probe is None:
+        _connection_state = ERROR
+        _connection_error = "YT Music browser page is unavailable"
+    elif _probe_is_usable(probe):
+        _connection_state = CONNECTED
+        _connection_error = None
+        _mark_profile_connected()
+    elif probe.get("login_required"):
+        _connection_state = NEEDS_LOGIN
+        _connection_error = None
+    elif not probe.get("page_ready") or not probe.get("search_ready"):
+        _connection_state = ERROR
+        _connection_error = "YT Music page/search is not ready"
+    else:
+        _connection_state = ERROR
+        _connection_error = "YT Music session could not be verified"
+
+    if _connection_state != previous_state:
+        log.info(
+            "ytm_web: connection state %s -> %s profile=%s origin=%s "
+            "page_ready=%s search_ready=%s auth_evidence=%s "
+            "ytm_surface_ready=%s has_ytm_app=%s has_nav=%s has_search=%s "
+            "has_account=%s has_explicit_login=%s",
+            previous_state,
+            _connection_state,
+            _active_profile or _JARVIS_PROFILE_DIR,
+            probe.get("origin", _page_origin(_ytm_page)) if isinstance(probe, dict) else "<none>",
+            bool(probe.get("page_ready")) if isinstance(probe, dict) else False,
+            bool(probe.get("search_ready")) if isinstance(probe, dict) else False,
+            probe.get("auth_evidence", "unknown") if isinstance(probe, dict) else "unknown",
+            bool(probe.get("ytm_surface_ready")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_ytm_app")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_nav")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_search")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_account")) if isinstance(probe, dict) else False,
+            bool(probe.get("has_explicit_login")) if isinstance(probe, dict) else False,
+        )
+
+
+async def _refresh_connection_status() -> dict[str, Any]:
+    global _connection_state, _connection_error
+    if not _context_runtime_alive():
+        _clear_runtime_state()
+        if _connection_state not in (DISCONNECTED, CONNECTING):
+            _connection_state = ERROR
+            _connection_error = "YT Music browser session is no longer running"
+        return _status_payload()
+    probe = await _probe_page()
+    _set_connection_from_probe(probe)
+    return _status_payload()
+
+
+async def _present_ytm_page() -> bool:
+    page = await _find_or_adopt_ytm_page()
+    if page is None:
         return False
     try:
-        if "music.youtube.com" in (_ytm_page.url or ""):
-            try:
-                if await _ytm_page.evaluate(_PLAYER_READY_JS):
-                    return True
-            except Exception:
-                pass
-    except Exception:
+        await page.bring_to_front()
+        log.info("ytm_web: presented dedicated YT Music page")
+        return True
+    except Exception as exc:
+        log.warning("ytm_web: could not present dedicated YT Music page: %s", exc)
         return False
 
+
+async def _enforce_background_window(*, reason: str = "", minimize: bool = True) -> dict[str, Any]:
+    """Read/minimize only the dedicated YT Music window through its CDP target."""
+    page = await _find_or_adopt_ytm_page()
+    if page is None or _browser is None:
+        return {"ok": False, "error": "dedicated YT Music browser target is unavailable"}
+    cdp = None
+    try:
+        cdp = await _browser.new_browser_cdp_session()
+        targets = await cdp.send("Target.getTargets")
+        page_url = str(getattr(page, "url", "") or "")
+        target_infos = targets.get("targetInfos", []) if isinstance(targets, dict) else []
+        target = next(
+            (
+                info
+                for info in target_infos
+                if info.get("type") == "page"
+                and info.get("url") == page_url
+                and _page_origin(page) == YTM_URL
+            ),
+            None,
+        )
+        if target is None:
+            target = next(
+                (
+                    info
+                    for info in target_infos
+                    if info.get("type") == "page"
+                    and _page_origin(page) == YTM_URL
+                    and str(info.get("url") or "").startswith(YTM_URL)
+                ),
+                None,
+            )
+        if not isinstance(target, dict) or not target.get("targetId"):
+            return {"ok": False, "error": "dedicated YT Music CDP target was not found"}
+        target_id = target["targetId"]
+        window = await cdp.send("Browser.getWindowForTarget", {"targetId": target_id})
+        window_id = window.get("windowId") if isinstance(window, dict) else None
+        bounds = window.get("bounds") if isinstance(window, dict) else None
+        if window_id is None or not isinstance(bounds, dict):
+            return {"ok": False, "error": "dedicated YT Music window bounds were unavailable"}
+        before_state = bounds.get("windowState")
+        state = before_state
+        changed = minimize and state != "minimized"
+        if changed:
+            await cdp.send(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"windowState": "minimized"}},
+            )
+            state = "minimized"
+        result = {
+            "ok": True,
+            "target_id": target_id,
+            "window_id": window_id,
+            "window_state_before": before_state,
+            "window_state": state,
+            "changed": changed,
+            "reason": reason,
+        }
+        log.info(
+            "ytm_web: window state reason=%s target=%s window=%s before=%s after=%s changed=%s",
+            reason or "unspecified",
+            target_id,
+            window_id,
+            before_state,
+            state,
+            changed,
+        )
+        return result
+    except Exception as exc:
+        log.debug("ytm_web: background window enforcement unavailable: %s", exc)
+        return {"ok": False, "error": str(exc)}
+    finally:
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+
+
+async def _navigate_to_ytm(*, present: bool = False) -> bool:
+    global _connection_state, _connection_error
+    page = await _find_or_adopt_ytm_page()
+    if page is None:
+        return False
+    try:
+        if present and not await _present_ytm_page():
+            _connection_state = ERROR
+            _connection_error = "YT Music login page could not be presented"
+            return False
+        await page.goto(YTM_URL, wait_until="domcontentloaded", timeout=15000)
+        # Give the SPA a short opportunity to render. Login itself remains a
+        # user action in the headed browser and is never automated here.
+        await asyncio.sleep(0.5)
+        await _refresh_connection_status()
+        if not present:
+            await _enforce_background_window(reason="navigate.after_home")
+        return True
+    except Exception as exc:
+        _connection_state = ERROR
+        _connection_error = "YT Music page could not be opened"
+        log.warning("ytm_web: navigate failed: %s", exc)
+        return False
+
+
+async def connect() -> dict[str, Any]:
+    """Open the dedicated headed profile for a user-driven Google login."""
+    global _connection_state, _connection_error
     async with _get_lock():
-        try:
-            if "music.youtube.com" in (_ytm_page.url or ""):
-                if await _ytm_page.evaluate(_PLAYER_READY_JS):
-                    return True
-        except Exception:
-            pass
-        try:
-            await _ytm_page.goto(YTM_URL, wait_until="domcontentloaded", timeout=15000)
-        except Exception as exc:
-            log.warning("ytm_web: goto failed: %s", exc)
-            return False
-        try:
-            await _ytm_page.wait_for_function(_PLAYER_READY_JS, timeout=12000)
-            return True
-        except Exception:
-            log.warning("ytm_web: player bar not ready (nisi ulogovan?)")
-            return False
+        if _context_runtime_alive():
+            page = await _find_or_adopt_ytm_page()
+            if page is not None and _page_origin(page) != "<unavailable>":
+                # Re-present an existing YTM/Google login page without
+                # navigating it away while the user is completing login.
+                if not await _present_ytm_page():
+                    _connection_state = ERROR
+                    _connection_error = "YT Music page could not be presented"
+                    return _status_payload()
+                return await _refresh_connection_status()
+        _connection_state = CONNECTING
+        _connection_error = None
+        if not await _launch_browser():
+            _connection_state = ERROR
+            _connection_error = "Could not launch the dedicated YT Music browser"
+            return _status_payload()
+        if not await _navigate_to_ytm(present=True):
+            return _status_payload()
+        return await _refresh_connection_status()
+
+
+async def _restore_existing_connection() -> None:
+    global _connection_state, _connection_error
+    if not _profile_is_connected():
+        return
+    _connection_state = CONNECTING
+    _connection_error = None
+    try:
+        if await _launch_browser(start_minimized=True):
+            await _navigate_to_ytm()
+        else:
+            _connection_state = ERROR
+            _connection_error = "Could not launch the saved YT Music browser profile"
+    except Exception as exc:
+        _connection_state = ERROR
+        _connection_error = "Saved YT Music browser profile could not be restored"
+        log.warning("ytm_web: restore failed: %s", exc)
 
 
 def warm_up() -> None:
-    """Pokreni browser u pozadini. Sinhroni fire-and-forget. Pozvati
-    na app startup. Neblokirajući, ne vraća task — ako treba da sačekaš
-    ``ensure_ready()``."""
+    """Restore a previously connected profile without creating a new one."""
     global _warmup_task
+    if not _profile_is_connected():
+        return
     if _warmup_task is not None and not _warmup_task.done():
         return
-    _warmup_task = asyncio.create_task(_launch_and_navigate())
+    _warmup_task = asyncio.create_task(_restore_existing_connection())
 
 
-async def _launch_and_navigate() -> None:
-    global _ready
-    try:
-        if await _launch_browser():
-            _ready = await _ensure_page_ready()
-            log.info("ytm_web: ready=%s", _ready)
-    except Exception as exc:
-        log.warning("ytm_web: warm_up failed: %s", exc)
+async def connection_status() -> dict[str, Any]:
+    """Return safe connection and runtime/player state from the YTM page."""
+    if _context_runtime_alive() and _connection_state != CONNECTING:
+        await _refresh_connection_status()
+        await _enforce_background_window(reason="status")
+    return _status_payload()
 
 
 async def ensure_ready() -> bool:
-    """Brz ready-check. Ako browser još nije warm, pokreni ga (ali
-    samo jednom). Vrati True kad je player bar spreman."""
-    global _ready
-    if _ready:
-        return True
+    """Ensure authenticated page/search readiness, not player readiness."""
+    global _connection_state, _connection_error
+    if is_available():
+        await _refresh_connection_status()
+        await _enforce_background_window(reason="ensure_ready")
+        return is_available()
     if not _launched:
-        await _launch_browser()
-    if not _launched:
-        return False
-    _ready = await _ensure_page_ready()
-    return _ready
+        if not _profile_is_connected():
+            return False
+        _connection_state = CONNECTING
+        if not await _launch_browser(start_minimized=True):
+            _connection_state = ERROR
+            _connection_error = "Could not restore the YT Music browser"
+            return False
+        await _navigate_to_ytm()
+    else:
+        await _refresh_connection_status()
+        await _enforce_background_window(reason="ensure_ready.refresh")
+    return is_available()
 
 
 def is_available() -> bool:
-    """Sinhroni ready-check (bez launch). True ako je browser već
-    pokrenut i player bar učitan. NE launchuje browser."""
-    return _ready and _launched and _safe_is_connected(_browser) and not _safe_is_closed(_ytm_page)
+    """Return whether the authenticated YTM page can accept search actions."""
+    return _connection_state == CONNECTED and _search_ready and _runtime_alive()
 
 
 _STATE_JS = """
 () => {
+  const ytmPlayerState = true;
+  void ytmPlayerState;
   const video = document.querySelector('video');
+  const moviePlayer = document.getElementById('movie_player');
+  let videoData = {};
+  try {
+    videoData = moviePlayer && typeof moviePlayer.getVideoData === 'function'
+      ? (moviePlayer.getVideoData() || {})
+      : {};
+  } catch (_) {}
   const playPause = document.querySelector('#play-pause-button');
   const titleEl = document.querySelector('.title.ytmusic-player-bar');
   const bylineEl = document.querySelector('.byline.ytmusic-player-bar');
-  if (!video) {
-    return { ok: false, error: 'no video element', playing: null, title: '', artist: '' };
-  }
+  const title = (titleEl && titleEl.textContent ? titleEl.textContent.trim() : '')
+    || String(videoData.title || '').trim();
+  const artist = (bylineEl && bylineEl.textContent ? bylineEl.textContent.trim() : '')
+    || String(videoData.author || '').trim();
+  const playerVideoId = String(videoData.video_id || videoData.videoId || '').trim();
+  const urlVideoId = new URL(location.href).searchParams.get('v') || '';
+  const trackId = playerVideoId || urlVideoId;
+  const playerLoaded = !!(video && (trackId || title));
   const ariaLabel = playPause ? (playPause.getAttribute('aria-label') || '') : '';
-  const isPlaying = !video.paused && video.currentTime > 0 && video.readyState >= 2;
+  const isPlaying = playerLoaded && !video.paused && !video.ended && video.readyState >= 2;
   return {
     ok: true,
-    playing: isPlaying,
-    title: (titleEl && titleEl.textContent ? titleEl.textContent.trim() : ''),
-    artist: (bylineEl && bylineEl.textContent ? bylineEl.textContent.trim() : ''),
+    playing: playerLoaded ? isPlaying : null,
+    player_loaded: playerLoaded,
+    title,
+    artist,
+    track_id: trackId,
+    identity_source: playerVideoId ? 'movie_player' : (urlVideoId ? 'url' : null),
     ariaLabel,
-    currentTime: video.currentTime,
-    duration: isFinite(video.duration) ? video.duration : 0,
+    media_paused: video ? !!video.paused : null,
+    media_ready_state: video ? video.readyState : null,
+    currentTime: video ? video.currentTime : 0,
+    duration: video && isFinite(video.duration) ? video.duration : 0,
     url: location.href,
   };
 }
 """
 
-_CONTROL_JS = """
+_CONTROL_JS = r"""
 async (action) => {
   if (action === 'play' || action === 'pause') {
     const video = document.querySelector('video');
@@ -294,57 +745,1109 @@ async (action) => {
     return { ok: true, method: 'video.pause' };
   }
   if (action === 'next') {
-    const btn = document.querySelector('#next-button');
-    if (!btn) return { ok: false, error: 'no next button' };
-    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
-      return { ok: false, error: 'next button disabled' };
+    const bar = document.querySelector('ytmusic-player-bar');
+    if (!bar) return { ok: false, error: 'no ytmusic-player-bar' };
+    const labels = ['next', 'sledeća', 'sljedeća'];
+    const host = Array.from(bar.querySelectorAll('yt-icon-button, button, [role="button"]'))
+      .find((element) => {
+        const style = getComputedStyle(element);
+        const visible = !element.hidden && style.display !== 'none'
+          && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+        if (!visible) return false;
+        const classes = String(element.className || '').split(/\s+/);
+        const title = (element.getAttribute('title') || '').trim().toLowerCase();
+        const aria = (element.getAttribute('aria-label') || '').trim().toLowerCase();
+        return classes.includes('next-button') || labels.includes(title) || labels.includes(aria);
+      });
+    if (!host) return { ok: false, error: 'no next control in ytmusic-player-bar' };
+    const target = host.matches('yt-icon-button, [role="button"]')
+      ? (host.querySelector('button[aria-label], button') || host)
+      : host;
+    if (host.disabled || host.getAttribute('aria-disabled') === 'true'
+      || target.disabled || target.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, error: 'next control disabled' };
     }
-    btn.click();
-    return { ok: true, method: 'click #next-button' };
+    target.click();
+    return {
+      ok: true,
+      method: 'click ytmusic-player-bar .next-button button',
+      control: { tag: host.tagName.toLowerCase(), className: String(host.className || ''),
+        title: host.getAttribute('title') || '', aria: target.getAttribute('aria-label') || '' },
+    };
   }
   if (action === 'previous') {
-    const btn = document.querySelector('#previous-button');
-    if (!btn) return { ok: false, error: 'no previous button' };
-    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
-      return { ok: false, error: 'previous button disabled' };
+    const bar = document.querySelector('ytmusic-player-bar');
+    if (!bar) return { ok: false, error: 'no ytmusic-player-bar' };
+    const labels = ['previous', 'prethodna'];
+    const host = Array.from(bar.querySelectorAll('yt-icon-button, button, [role="button"]'))
+      .find((element) => {
+        const style = getComputedStyle(element);
+        const visible = !element.hidden && style.display !== 'none'
+          && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+        if (!visible) return false;
+        const classes = String(element.className || '').split(/\s+/);
+        const title = (element.getAttribute('title') || '').trim().toLowerCase();
+        const aria = (element.getAttribute('aria-label') || '').trim().toLowerCase();
+        return classes.includes('previous-button') || labels.includes(title) || labels.includes(aria);
+      });
+    if (!host) return { ok: false, error: 'no previous control in ytmusic-player-bar' };
+    const target = host.matches('yt-icon-button, [role="button"]')
+      ? (host.querySelector('button[aria-label], button') || host)
+      : host;
+    if (host.disabled || host.getAttribute('aria-disabled') === 'true'
+      || target.disabled || target.getAttribute('aria-disabled') === 'true') {
+      return { ok: false, error: 'previous control disabled' };
     }
-    btn.click();
-    return { ok: true, method: 'click #previous-button' };
+    target.click();
+    return {
+      ok: true,
+      method: 'click ytmusic-player-bar .previous-button button',
+      control: { tag: host.tagName.toLowerCase(), className: String(host.className || ''),
+        title: host.getAttribute('title') || '', aria: target.getAttribute('aria-label') || '' },
+    };
   }
   return { ok: false, error: 'unknown action: ' + action };
 }
 """
 
-_SEARCH_INPUT_JS = """
-async (query) => {
-  let box = document.querySelector('ytmusic-search-box input')
-            || document.querySelector('input#input')
-            || document.querySelector('input[name="search_query"]');
-  if (!box) return { ok: false, error: 'no search box' };
-  box.focus();
-  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-  setter.call(box, query);
-  box.dispatchEvent(new Event('input', { bubbles: true }));
-  return { ok: true };
+_MEDIA_VOLUME_STATE_JS = r"""
+() => {
+  const ytmMediaVolumeState = true;
+  void ytmMediaVolumeState;
+  const video = document.querySelector('video');
+  if (!video) return { ok: false, volume: null, muted: null, error: 'no video element' };
+  return {
+    ok: true,
+    volume: Number.isFinite(video.volume) ? video.volume : null,
+    muted: !!video.muted,
+  };
+}
+"""
+
+_MEDIA_VOLUME_CONTROL_JS = r"""
+async (request) => {
+  const ytmMediaVolumeControl = true;
+  void ytmMediaVolumeControl;
+  const video = document.querySelector('video');
+  if (!video) return { ok: false, error: 'no video element' };
+  const action = String((request && request.action) || '');
+  const amount = Number(request && request.amount);
+  const level = Number(request && request.level);
+  const before = {
+    volume: Number.isFinite(video.volume) ? video.volume : null,
+    muted: !!video.muted,
+  };
+  if (action === 'volume_up') {
+    if (!Number.isFinite(amount) || amount < 1 || amount > 100) {
+      return { ok: false, error: 'volume amount must be between 1 and 100' };
+    }
+    video.volume = Math.min(1, Math.max(0, video.volume + amount / 100));
+  } else if (action === 'volume_down') {
+    if (!Number.isFinite(amount) || amount < 1 || amount > 100) {
+      return { ok: false, error: 'volume amount must be between 1 and 100' };
+    }
+    video.volume = Math.min(1, Math.max(0, video.volume - amount / 100));
+  } else if (action === 'volume_set') {
+    if (!Number.isFinite(level) || level < 0 || level > 100) {
+      return { ok: false, error: 'volume level must be between 0 and 100' };
+    }
+    video.volume = Math.min(1, Math.max(0, level / 100));
+  } else if (action === 'volume_mute') {
+    video.muted = !video.muted;
+  } else {
+    return { ok: false, error: 'unknown volume action: ' + action };
+  }
+  return {
+    ok: true,
+    method: 'html_media_element',
+    before,
+    requested: { action, amount: Number.isFinite(amount) ? amount : null,
+      level: Number.isFinite(level) ? level : null },
+  };
+}
+"""
+
+_SEARCH_RESULTS_STATE_JS = r"""
+() => {
+  const searchCandidateSnapshot = true;
+  void searchCandidateSnapshot;
+  const root = document.querySelector('ytmusic-search-page');
+  const rowSelector = [
+    'ytmusic-responsive-list-item-renderer',
+    'ytmusic-two-row-item-renderer',
+    'ytmusic-item-renderer',
+  ].join(',');
+  const text = (value, limit = 180) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+  const textFrom = (value) => {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value.simpleText === 'string') return value.simpleText;
+    if (Array.isArray(value.runs)) return value.runs.map((run) => run && run.text || '').join('');
+    if (typeof value.text === 'string') return value.text;
+    return '';
+  };
+  const inspectData = (element) => {
+    const seen = new Set();
+    const data = {
+      video_id: '',
+      has_watch_endpoint: false,
+      music_video_type: '',
+      title: '',
+      subtitle: '',
+      artist_from_runs: '',
+    };
+    const visit = (value, depth) => {
+      if (!value || typeof value !== 'object' || depth > 8 || seen.has(value)) return;
+      seen.add(value);
+      for (const key of Object.keys(value).slice(0, 180)) {
+        const child = value[key];
+        if (/^videoId$/i.test(key) && !data.video_id
+          && (typeof child === 'string' || typeof child === 'number')) {
+          data.video_id = String(child);
+        }
+        if (key === 'watchEndpoint') data.has_watch_endpoint = true;
+        if (key === 'musicVideoType' && typeof child === 'string' && !data.music_video_type) {
+          data.music_video_type = child;
+        }
+        if (child && typeof child === 'object') visit(child, depth + 1);
+      }
+    };
+    for (const key of ['data', '__data', 'item', 'song', 'video']) {
+      try { visit(element[key], 0); } catch (_) {}
+    }
+    try {
+      const columns = element.data && element.data.flexColumns;
+      const first = columns && columns[0] && columns[0].musicResponsiveListItemFlexColumnRenderer;
+      const second = columns && columns[1] && columns[1].musicResponsiveListItemFlexColumnRenderer;
+      data.title = textFrom(first && first.text);
+      data.subtitle = textFrom(second && second.text);
+      const runs = second && second.text && Array.isArray(second.text.runs) ? second.text.runs : [];
+      data.artist_from_runs = runs
+        .filter((run) => run && run.navigationEndpoint && run.navigationEndpoint.browseEndpoint)
+        .map((run) => text(run.text))
+        .filter(Boolean)
+        .join(', ');
+    } catch (_) {}
+    return data;
+  };
+  const rows = root ? Array.from(root.querySelectorAll(rowSelector)) : [];
+  const candidates = [];
+  rows.forEach((row, rowIndex) => {
+    if (candidates.length >= 24) return;
+    const data = inspectData(row);
+    if (!data.video_id) return;
+    const anchors = Array.from(row.querySelectorAll('a[href]'));
+    const watchAnchor = anchors.find((anchor) => {
+      try {
+        const url = new URL(anchor.href, location.href);
+        return url.pathname === '/watch' && url.searchParams.get('v') === data.video_id;
+      } catch (_) {
+        return false;
+      }
+    }) || null;
+    const playButton = Array.from(row.querySelectorAll('ytmusic-play-button-renderer'))
+      .find((button) => /^play\b/i.test(button.getAttribute('aria-label') || '')) || null;
+    if (!data.has_watch_endpoint || (!watchAnchor && !playButton)) return;
+    const channelAnchor = anchors.find((anchor) => {
+      try { return new URL(anchor.href, location.href).pathname.startsWith('/channel/'); }
+      catch (_) { return false; }
+    }) || null;
+    const playLabel = text(playButton && playButton.getAttribute('aria-label'));
+    const title = text(data.title)
+      || text(watchAnchor && (watchAnchor.getAttribute('aria-label') || watchAnchor.textContent))
+      || text(playLabel.replace(/^play\s*/i, '').split(/\s+-\s+/)[0]);
+    const artist = text(channelAnchor && channelAnchor.textContent)
+      || text(data.artist_from_runs)
+      || text(data.subtitle.split(/\s+•\s+/).find((part) => !/^(song|video|episode)$/i.test(part)));
+    const typeValue = String(data.music_video_type || '').toUpperCase();
+    const subtitleType = text(data.subtitle).split(/\s+•\s+/)[0].toLocaleLowerCase();
+    const resultType = typeValue.includes('ATV') || subtitleType === 'song'
+      ? 'song'
+      : (typeValue.includes('OMV') || typeValue.includes('UGC') || subtitleType === 'video')
+        ? 'video'
+        : 'unknown';
+    const shelf = row.closest('ytmusic-shelf-renderer, ytmusic-carousel-shelf-renderer');
+    const shelfTitle = shelf && shelf.querySelector('h2, yt-formatted-string#title, #title');
+    candidates.push({
+      video_id: data.video_id,
+      title,
+      artist,
+      component: row.tagName.toLowerCase(),
+      result_type: resultType,
+      section: text(shelfTitle && shelfTitle.textContent, 80),
+      row_index: rowIndex,
+      selection_method: watchAnchor ? 'watch_endpoint_anchor' : 'ytmusic_play_button_renderer',
+    });
+  });
+  const visible = !!root && !root.hidden
+    && getComputedStyle(root).display !== 'none'
+    && getComputedStyle(root).visibility !== 'hidden';
+  return {
+    path: location.pathname,
+    query: new URL(location.href).searchParams.get('q') || '',
+    surface_ready: visible,
+    rows_ready: rows.length > 0,
+    row_fingerprint: rows.slice(0, 12).map((row) =>
+      `${row.tagName.toLowerCase()}|${text(row.textContent, 220)}`),
+    fingerprint: candidates.slice(0, 12).map((candidate) =>
+      `${candidate.video_id}|${candidate.title}|${candidate.artist}|${candidate.result_type}`),
+    candidates,
+  };
+}
+"""
+
+_CLICK_PLAYABLE_SEARCH_RESULT_JS = r"""
+(expected) => {
+  const clickSelectedSearchResult = true;
+  void clickSelectedSearchResult;
+  const root = document.querySelector('ytmusic-search-page');
+  if (!root) return { ok: false, clicked: false, error: 'YT Music search page is unavailable' };
+  const rows = Array.from(root.querySelectorAll(
+    'ytmusic-responsive-list-item-renderer, ytmusic-two-row-item-renderer, ytmusic-item-renderer'
+  ));
+  const expectedId = String((expected && expected.video_id) || '');
+  const inspectVideoId = (element) => {
+    const seen = new Set();
+    let videoId = '';
+    const visit = (value, depth) => {
+      if (!value || typeof value !== 'object' || depth > 8 || seen.has(value) || videoId) return;
+      seen.add(value);
+      for (const key of Object.keys(value).slice(0, 180)) {
+        const child = value[key];
+        if (/^videoId$/i.test(key) && (typeof child === 'string' || typeof child === 'number')) {
+          videoId = String(child);
+          return;
+        }
+        if (child && typeof child === 'object') visit(child, depth + 1);
+      }
+    };
+    for (const key of ['data', '__data', 'item', 'song', 'video']) {
+      try { visit(element[key], 0); } catch (_) {}
+    }
+    return videoId;
+  };
+  const row = rows.find((candidateRow) => inspectVideoId(candidateRow) === expectedId);
+  if (!row) {
+    return { ok: false, clicked: false, error: 'selected YT Music candidate is no longer present' };
+  }
+  const watchAnchor = Array.from(row.querySelectorAll('a[href]')).find((anchor) => {
+    try {
+      const url = new URL(anchor.href, location.href);
+      return url.pathname === '/watch' && url.searchParams.get('v') === expectedId;
+    } catch (_) {
+      return false;
+    }
+  }) || null;
+  const playButton = Array.from(row.querySelectorAll('ytmusic-play-button-renderer'))
+    .find((button) => /^play\b/i.test(button.getAttribute('aria-label') || '')) || null;
+  const target = watchAnchor
+    || (playButton && playButton.querySelector('button, tp-yt-paper-icon-button'))
+    || playButton;
+  if (!target) {
+    return { ok: false, clicked: false, error: 'selected YT Music candidate has no click target' };
+  }
+  target.click();
+  return {
+    ok: true,
+    clicked: true,
+    clicked_video_id: expectedId,
+    selection_method: watchAnchor ? 'watch_endpoint_anchor' : 'ytmusic_play_button_renderer',
+    component: row.tagName.toLowerCase(),
+  };
+}
+"""
+
+_RESUME_SELECTED_PLAYER_JS = r"""
+async (expectedVideoId) => {
+  const resumeSelectedPlayer = true;
+  void resumeSelectedPlayer;
+  const moviePlayer = document.getElementById('movie_player');
+  let videoData = {};
+  try {
+    videoData = moviePlayer && typeof moviePlayer.getVideoData === 'function'
+      ? (moviePlayer.getVideoData() || {})
+      : {};
+  } catch (_) {}
+  const actualVideoId = String(videoData.video_id || videoData.videoId || '').trim();
+  if (!actualVideoId || actualVideoId !== String(expectedVideoId || '')) {
+    return { ok: false, delivered: false, error: 'selected track is not the loaded player item' };
+  }
+  const video = document.querySelector('video');
+  if (!video) return { ok: false, delivered: false, error: 'no video element' };
+  try {
+    await video.play();
+  } catch (error) {
+    return { ok: false, delivered: false, error: String(error && error.message || error) };
+  }
+  return { ok: true, delivered: true, method: 'verified_selected_video.play' };
 }
 """
 
 
+def _video_id_from_href(href: str | None) -> str | None:
+    if not href:
+        return None
+    try:
+        return urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("v", [None])[0]
+    except (TypeError, ValueError):
+        return None
+
+
+async def _read_search_results_state() -> dict[str, Any]:
+    """Read only the real ``ytmusic-search-page`` result surface."""
+    try:
+        result = await _ytm_page.evaluate(_SEARCH_RESULTS_STATE_JS)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "candidates": [], "fingerprint": []}
+    if not isinstance(result, dict):
+        return {
+            "ok": False,
+            "error": "unexpected YT Music search-surface response",
+            "candidates": [],
+            "fingerprint": [],
+        }
+    result["ok"] = True
+    return result
+
+
+def _normalize_search_text(value: Any) -> str:
+    text = unicodedata.normalize("NFD", str(value or "").casefold())
+    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
+    text = text.replace("đ", "d").replace("’", "").replace("'", "")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
+
+
+def _search_tokens(value: Any) -> list[str]:
+    return [token for token in _normalize_search_text(value).split() if len(token) > 1]
+
+
+def _rank_search_candidates(
+    query: str,
+    candidates: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Choose one strongly corresponding playable result.
+
+    The rule is intentionally identity-based rather than a loose percentage:
+    exact title+artist coverage wins, one extra STT token is tolerated only
+    when both title and artist still match, and artist/title-only requests
+    require a clear identity match. YTM ordering and result type break ties.
+    """
+    query_normalized = _normalize_search_text(query)
+    query_tokens = _search_tokens(query)
+    if not query_tokens:
+        return None, []
+    query_set = set(query_tokens)
+    scored: list[dict[str, Any]] = []
+    valid: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+    kind_priority = {
+        "exact_title_artist": 5,
+        "one_extra_token_title_artist": 4,
+        "exact_artist": 3,
+        "exact_title": 3,
+        "artist_alias": 2,
+        "rejected": 0,
+    }
+    type_priority = {"song": 3, "video": 2, "unknown": 1}
+
+    for position, raw_candidate in enumerate(candidates[:24]):
+        candidate = dict(raw_candidate)
+        title_normalized = _normalize_search_text(candidate.get("title"))
+        artist_normalized = _normalize_search_text(candidate.get("artist"))
+        title_tokens = set(_search_tokens(title_normalized))
+        artist_tokens = set(_search_tokens(artist_normalized))
+        title_matches = query_set & title_tokens
+        artist_matches = query_set & artist_tokens
+        identity_matches = title_matches | artist_matches
+        unmatched = query_set - identity_matches
+        match_kind = "rejected"
+
+        if not unmatched and title_matches and artist_matches:
+            match_kind = "exact_title_artist"
+        elif len(unmatched) == 1 and len(query_set) >= 4 and len(title_matches) >= 2 and bool(artist_matches):
+            match_kind = "one_extra_token_title_artist"
+        elif query_set.issubset(artist_tokens):
+            match_kind = "exact_artist"
+        elif title_normalized == query_normalized:
+            match_kind = "exact_title"
+        elif (
+            len(query_set) <= 3
+            and len(unmatched) == 1
+            and not title_matches
+            and bool(artist_matches)
+            and len(artist_tokens) == 1
+            and artist_tokens.issubset(query_set)
+            and query_tokens[0] in artist_tokens
+        ):
+            match_kind = "artist_alias"
+
+        row_index = candidate.get("row_index")
+        if not isinstance(row_index, int):
+            row_index = position
+        candidate.update(
+            {
+                "query_token_count": len(query_set),
+                "query_match_score": len(identity_matches),
+                "title_match_score": len(title_matches),
+                "artist_match_score": len(artist_matches),
+                "unmatched_query_tokens": sorted(unmatched),
+                "match_kind": match_kind,
+                "strong_match": match_kind != "rejected",
+                "row_index": row_index,
+            }
+        )
+        scored.append(candidate)
+        if match_kind == "rejected":
+            continue
+        score = (
+            kind_priority[match_kind],
+            type_priority.get(str(candidate.get("result_type") or "unknown"), 1),
+            len(identity_matches),
+            -row_index,
+        )
+        valid.append((score, candidate))
+
+    if not valid:
+        return None, scored
+    selected = max(valid, key=lambda item: item[0])[1]
+    return selected, scored
+
+
+def _search_fingerprint(state: dict[str, Any] | None) -> tuple[str, ...]:
+    if not isinstance(state, dict):
+        return ()
+    raw = state.get("row_fingerprint") or state.get("fingerprint")
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(item) for item in raw[:12])
+
+
+def _search_surface_is_fresh(
+    before: dict[str, Any] | None,
+    after: dict[str, Any],
+    query: str,
+) -> tuple[bool, str]:
+    if not (
+        after.get("surface_ready")
+        and after.get("rows_ready")
+        and after.get("path") == "/search"
+        and after.get("query") == query
+    ):
+        return False, "route_or_rows_not_ready"
+    before_fingerprint = _search_fingerprint(before)
+    after_fingerprint = _search_fingerprint(after)
+    if not after_fingerprint:
+        return False, "candidate_fingerprint_unavailable"
+    if isinstance(before, dict) and before.get("path") == "/search" and before.get("query") == query:
+        return True, "same_query_surface"
+    if not before_fingerprint or after_fingerprint != before_fingerprint:
+        return True, "candidate_fingerprint_changed"
+    return False, "candidate_fingerprint_stale"
+
+
+async def _wait_for_fresh_search_results(
+    query: str,
+    before: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None, list[dict[str, Any]], str]:
+    """Wait on positive route/result evidence, never on a blind sleep alone."""
+    last: dict[str, Any] = {"ok": False, "candidates": [], "fingerprint": []}
+    last_scored: list[dict[str, Any]] = []
+    freshness = "route_or_rows_not_ready"
+    stable_fresh_reads = 0
+    last_fresh_fingerprint: tuple[str, ...] = ()
+    for attempt in range(_YTM_SEARCH_MAX_READS):
+        if attempt:
+            await asyncio.sleep(_YTM_SEARCH_READ_DELAY)
+        last = await _read_search_results_state()
+        fresh, freshness = _search_surface_is_fresh(before, last, query)
+        raw_candidates = last.get("candidates")
+        candidates = raw_candidates if isinstance(raw_candidates, list) else []
+        selected, last_scored = _rank_search_candidates(query, candidates)
+        if fresh and selected is not None:
+            return last, selected, last_scored, freshness
+        if fresh:
+            fingerprint = _search_fingerprint(last)
+            stable_fresh_reads = stable_fresh_reads + 1 if fingerprint == last_fresh_fingerprint else 1
+            last_fresh_fingerprint = fingerprint
+            if stable_fresh_reads >= 3:
+                break
+    return last, None, last_scored, freshness
+
+
+async def _click_selected_search_result(selected: dict[str, Any]) -> dict[str, Any]:
+    """Click only the exact video ID selected from the fresh candidate table."""
+    try:
+        result = await _ytm_page.evaluate(
+            _CLICK_PLAYABLE_SEARCH_RESULT_JS,
+            {"video_id": selected.get("video_id", "")},
+        )
+    except Exception as exc:
+        return {"ok": False, "clicked": False, "error": str(exc)}
+    if not isinstance(result, dict):
+        return {"ok": False, "clicked": False, "error": "unexpected result-click response"}
+    clicked_id = str(result.get("clicked_video_id") or "")
+    expected_id = str(selected.get("video_id") or "")
+    if not result.get("clicked") or clicked_id != expected_id:
+        return {
+            **result,
+            "ok": False,
+            "clicked": False,
+            "error": result.get("error") or "selected YT Music candidate changed before click",
+        }
+    return result
+
+
+def _play_query_result(query: str, **values: Any) -> dict[str, Any]:
+    """Build a diagnostic result while preserving the live connection state."""
+    status = _status_payload()
+    result: dict[str, Any] = {
+        "ok": False,
+        "query": query,
+        "adapter": "ytm_web",
+        "connection_state": status["state"],
+        "page_ready": status["page_ready"],
+        "search_ready": status["search_ready"],
+        "player_loaded": status["player_loaded"],
+        "playing": status["playing"],
+        "stage": "unknown",
+        "search_submitted": False,
+        "result_found": False,
+        "selected_video_id": None,
+        "selected_title": "",
+        "selected_artist": "",
+        "search_method": None,
+        "delivered": False,
+        "verified": False,
+        "verification": "not_attempted",
+        "degraded": False,
+        "error_code": "PLAY_QUERY_FAILED",
+        "error": None,
+    }
+    result.update(values)
+    return result
+
+
+def _playback_metadata_matches(
+    state: dict[str, Any] | None,
+    selected_title: str,
+    selected_artist: str,
+) -> bool:
+    if not isinstance(state, dict) or state.get("playing") is not True:
+        return False
+    actual_title = _normalize_search_text(state.get("title"))
+    actual_artist = _normalize_search_text(state.get("artist"))
+    expected_title = _normalize_search_text(selected_title)
+    expected_artist = _normalize_search_text(selected_artist)
+    title_matches = bool(
+        expected_title
+        and actual_title
+        and (
+            actual_title == expected_title or actual_title in expected_title or expected_title in actual_title
+        )
+    )
+    artist_matches = not expected_artist or bool(
+        actual_artist and (expected_artist in actual_artist or actual_artist in expected_artist)
+    )
+    return title_matches and artist_matches
+
+
 async def get_state() -> dict[str, Any]:
-    """Pročitaj STVARNO stanje YTM player-a. Ako browser nije spreman,
-    vrati ok=False — pozivalac prelazi na fallback."""
+    """Read YTM DOM state; a connected page may legitimately have no track."""
     if not await ensure_ready():
-        return {"ok": False, "error": "ytm_web not ready", "playing": None,
-                "title": "", "artist": ""}
+        status = _status_payload()
+        return {
+            "ok": False,
+            "error": f"YT Music is {status['state'].lower()}",
+            "connection_state": status["state"],
+            "page_ready": status["page_ready"],
+            "search_ready": status["search_ready"],
+            "player_loaded": status["player_loaded"],
+            "playing": status["playing"],
+            "title": "",
+            "artist": "",
+        }
     try:
         result = await _ytm_page.evaluate(_STATE_JS)
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "playing": None,
-                "title": "", "artist": ""}
+        return {"ok": False, "error": str(exc), "playing": None, "title": "", "artist": ""}
     if not isinstance(result, dict):
-        return {"ok": False, "error": "unexpected eval", "playing": None,
-                "title": "", "artist": ""}
+        return {"ok": False, "error": "unexpected eval", "playing": None, "title": "", "artist": ""}
+    global _player_loaded, _playing
+    _player_loaded = bool(result.get("player_loaded") or _track_identity(result) is not None)
+    playing = result.get("playing")
+    _playing = playing if isinstance(playing, bool) else None
     return result
+
+
+def _playback_state_diagnostic(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(state, dict):
+        return None
+    return {
+        "ok": state.get("ok"),
+        "playing": state.get("playing"),
+        "player_loaded": state.get("player_loaded"),
+        "track_id": state.get("track_id"),
+        "identity_source": state.get("identity_source"),
+        "title": state.get("title"),
+        "artist": state.get("artist"),
+        "media_paused": state.get("media_paused"),
+        "media_ready_state": state.get("media_ready_state"),
+        "currentTime": state.get("currentTime"),
+    }
+
+
+def _verify_selected_playback(
+    before: dict[str, Any] | None,
+    state: dict[str, Any] | None,
+    selected: dict[str, Any],
+) -> tuple[bool, str, bool]:
+    """Verify before -> selected -> after using player ID whenever available."""
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        return False, "unavailable", False
+    selected_id = str(selected.get("video_id") or "").strip()
+    actual_id = str(state.get("track_id") or "").strip()
+    before_id = str((before or {}).get("track_id") or "").strip()
+    loaded_selected = bool(selected_id and actual_id == selected_id and state.get("player_loaded"))
+
+    if actual_id:
+        if not selected_id or actual_id != selected_id:
+            return False, "failed", False
+        if state.get("playing") is not True:
+            return False, "failed" if state.get("playing") is False else "unavailable", loaded_selected
+        if before_id and before_id != selected_id and actual_id == before_id:
+            return False, "failed", loaded_selected
+        return True, "verified_player_id", loaded_selected
+
+    metadata_matches = _playback_metadata_matches(
+        state,
+        str(selected.get("title") or ""),
+        str(selected.get("artist") or ""),
+    )
+    if not metadata_matches:
+        return False, "failed" if state.get("playing") is True else "unavailable", False
+    before_title = _normalize_search_text((before or {}).get("title"))
+    before_artist = _normalize_search_text((before or {}).get("artist"))
+    after_title = _normalize_search_text(state.get("title"))
+    after_artist = _normalize_search_text(state.get("artist"))
+    selected_title = _normalize_search_text(selected.get("title"))
+    selected_artist = _normalize_search_text(selected.get("artist"))
+    before_is_selected = bool(
+        selected_title
+        and before_title
+        and (
+            before_title == selected_title or before_title in selected_title or selected_title in before_title
+        )
+        and (
+            not selected_artist
+            or bool(before_artist and (before_artist in selected_artist or selected_artist in before_artist))
+        )
+    )
+    if not before_is_selected and (
+        not before_title or not after_title or (before_title, before_artist) == (after_title, after_artist)
+    ):
+        return False, "failed", False
+    return True, "verified_metadata", False
+
+
+async def _resume_verified_selected_track(selected_id: str) -> dict[str, Any]:
+    try:
+        result = await _ytm_page.evaluate(_RESUME_SELECTED_PLAYER_JS, selected_id)
+    except Exception as exc:
+        return {"ok": False, "delivered": False, "error": str(exc)}
+    if not isinstance(result, dict):
+        return {"ok": False, "delivered": False, "error": "unexpected video.play response"}
+    return result
+
+
+async def _observe_selected_playback(
+    before: dict[str, Any],
+    selected: dict[str, Any],
+) -> tuple[dict[str, Any] | None, bool, str, list[dict[str, Any]], dict[str, Any] | None]:
+    """Perform bounded state reads and at most one safe play continuation."""
+    reads: list[dict[str, Any]] = []
+    state: dict[str, Any] | None = None
+    verification = "unavailable"
+    continuation: dict[str, Any] | None = None
+    for attempt, delay in enumerate(_YTM_PLAYBACK_READ_DELAYS, start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        state = await get_state()
+        verified, verification, loaded_selected = _verify_selected_playback(before, state, selected)
+        reads.append(
+            {
+                "attempt": attempt,
+                "delay_s": delay,
+                "verification": verification,
+                "state": _playback_state_diagnostic(state),
+            }
+        )
+        if verified:
+            return state, True, verification, reads, continuation
+        if (
+            continuation is None
+            and attempt >= 3
+            and loaded_selected
+            and state.get("playing") is False
+            and state.get("media_paused") is True
+            and isinstance(state.get("media_ready_state"), int)
+            and state["media_ready_state"] >= 2
+        ):
+            continuation = await _resume_verified_selected_track(str(selected.get("video_id") or ""))
+    if continuation and continuation.get("delivered"):
+        await asyncio.sleep(_YTM_PLAYBACK_CONTINUATION_READ_DELAY)
+        state = await get_state()
+        verified, verification, _ = _verify_selected_playback(before, state, selected)
+        reads.append(
+            {
+                "attempt": len(reads) + 1,
+                "delay_s": _YTM_PLAYBACK_CONTINUATION_READ_DELAY,
+                "verification": verification,
+                "post_continuation": True,
+                "state": _playback_state_diagnostic(state),
+            }
+        )
+        if verified:
+            return state, True, verification, reads, continuation
+    return state, False, verification, reads, continuation
+
+
+async def _read_volume_state() -> dict[str, Any]:
+    if _ytm_page is None:
+        return {"ok": False, "volume": None, "muted": None, "error": "YT Music page is unavailable"}
+    try:
+        result = await _ytm_page.evaluate(_MEDIA_VOLUME_STATE_JS)
+    except Exception as exc:
+        return {"ok": False, "volume": None, "muted": None, "error": str(exc)}
+    if not isinstance(result, dict):
+        return {"ok": False, "volume": None, "muted": None, "error": "unexpected volume state"}
+    return result
+
+
+def _verify_volume_action(
+    action: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    *,
+    amount: int | None = None,
+    level: int | None = None,
+) -> tuple[bool, str]:
+    if not isinstance(after, dict) or not after.get("ok"):
+        return False, "unavailable"
+    if action == "volume_mute":
+        if not isinstance(before, dict) or not isinstance(before.get("muted"), bool):
+            return False, "unavailable"
+        if isinstance(after.get("muted"), bool) and after["muted"] != before["muted"]:
+            return True, "verified"
+        return False, "failed"
+    if not isinstance(before, dict) or not isinstance(before.get("volume"), (int, float)):
+        return False, "unavailable"
+    if not isinstance(after.get("volume"), (int, float)):
+        return False, "unavailable"
+    if action == "volume_set":
+        if level is None:
+            return False, "unavailable"
+        expected = level / 100
+    else:
+        if amount is None:
+            return False, "unavailable"
+        delta = amount / 100 if action == "volume_up" else -amount / 100
+        expected = min(1.0, max(0.0, float(before["volume"]) + delta))
+    if abs(float(after["volume"]) - expected) <= _YTM_VOLUME_TOLERANCE:
+        return True, "verified"
+    return False, "failed"
+
+
+def _volume_failure(
+    action: str,
+    *,
+    error: str,
+    error_code: str = "INVALID_ARGUMENTS",
+    amount: int | None = None,
+    level: int | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "action": action,
+        "adapter": "ytm_web",
+        "delivered": False,
+        "verified": False,
+        "verification": "not_attempted",
+        "degraded": False,
+        "error_code": error_code,
+        "error": error,
+    }
+    if amount is not None:
+        result["amount"] = amount
+    if level is not None:
+        result["level"] = level
+    return result
+
+
+async def control_volume(
+    action: str,
+    *,
+    amount: int | None = None,
+    level: int | None = None,
+) -> dict[str, Any]:
+    """Change only the connected YT Music HTML media element volume."""
+    if action not in ("volume_up", "volume_down", "volume_set", "volume_mute"):
+        return _volume_failure(action, error=f"unknown volume action: {action}", error_code="UNKNOWN_ACTION")
+
+    requested_amount: int | None = None
+    requested_level: int | None = None
+    if action in ("volume_up", "volume_down"):
+        requested_amount = _YTM_VOLUME_DEFAULT_AMOUNT if amount is None else amount
+        if isinstance(requested_amount, bool) or not isinstance(requested_amount, int):
+            return _volume_failure(
+                action,
+                amount=requested_amount if isinstance(requested_amount, int) else None,
+                error="volume amount must be an integer between 1 and 100",
+            )
+        if not 1 <= requested_amount <= 100:
+            return _volume_failure(
+                action,
+                amount=requested_amount,
+                error="volume amount must be between 1 and 100",
+            )
+    elif action == "volume_set":
+        requested_level = level
+        if isinstance(requested_level, bool) or not isinstance(requested_level, int):
+            return _volume_failure(
+                action,
+                error="volume level must be an integer between 0 and 100",
+            )
+        if not 0 <= requested_level <= 100:
+            return _volume_failure(
+                action,
+                level=requested_level,
+                error="volume level must be between 0 and 100",
+            )
+
+    if not await ensure_ready():
+        status = _status_payload()
+        result = _volume_failure(
+            action,
+            amount=requested_amount,
+            level=requested_level,
+            error=f"YT Music is {status['state'].lower()}",
+            error_code="NOT_READY",
+        )
+        result.update(
+            {
+                "connection_state": status["state"],
+                "page_ready": status["page_ready"],
+                "search_ready": status["search_ready"],
+                "player_loaded": status["player_loaded"],
+            }
+        )
+        return result
+
+    player_state = await get_state()
+    if not _state_has_player(player_state):
+        result = _volume_failure(
+            action,
+            amount=requested_amount,
+            level=requested_level,
+            error="YT Music player has no loaded track",
+            error_code="PLAYER_NOT_LOADED",
+        )
+        result.update(
+            {
+                "connection_state": _status_payload()["state"],
+                "before": player_state,
+                "after": None,
+            }
+        )
+        return result
+
+    before = await _read_volume_state()
+    if not before.get("ok"):
+        status = _status_payload()
+        result = _volume_failure(
+            action,
+            amount=requested_amount,
+            level=requested_level,
+            error=before.get("error", "YT Music media element is unavailable"),
+            error_code="MEDIA_ELEMENT_UNAVAILABLE",
+        )
+        result.update(
+            {
+                "connection_state": status["state"],
+                "before": before,
+                "after": None,
+            }
+        )
+        return result
+
+    request = {
+        "action": action,
+        "amount": requested_amount,
+        "level": requested_level,
+    }
+    try:
+        send_result = await _ytm_page.evaluate(_MEDIA_VOLUME_CONTROL_JS, request)
+    except Exception as exc:
+        send_result = {"ok": False, "error": str(exc)}
+    send_data = send_result if isinstance(send_result, dict) else {}
+    delivered = bool(send_data.get("ok"))
+    if not delivered:
+        status = _status_payload()
+        result = _volume_failure(
+            action,
+            amount=requested_amount,
+            level=requested_level,
+            error=send_data.get("error", "volume command was not delivered"),
+            error_code="DELIVERY_FAILED",
+        )
+        result.update(
+            {
+                "method": send_data.get("method"),
+                "connection_state": status["state"],
+                "before": before,
+                "after": None,
+            }
+        )
+        return result
+
+    await asyncio.sleep(0.05)
+    after = await _read_volume_state()
+    verified, verification = _verify_volume_action(
+        action,
+        before,
+        after,
+        amount=requested_amount,
+        level=requested_level,
+    )
+    await _enforce_background_window(reason=f"volume.{action}")
+    status = _status_payload()
+    result = {
+        "ok": bool(delivered and verified),
+        "action": action,
+        "method": send_data.get("method", "html_media_element"),
+        "adapter": "ytm_web",
+        "delivered": delivered,
+        "verified": verified,
+        "verification": verification,
+        "degraded": delivered and not verified and verification == "unavailable",
+        "error_code": None
+        if verified
+        else "VERIFICATION_UNAVAILABLE"
+        if verification == "unavailable"
+        else "VOLUME_NOT_REACHED",
+        "connection_state": status["state"],
+        "before": before,
+        "after": after,
+        "volume": after.get("volume") if isinstance(after, dict) else None,
+        "muted": after.get("muted") if isinstance(after, dict) else None,
+    }
+    if requested_amount is not None:
+        result["amount"] = requested_amount
+    if requested_level is not None:
+        result["requested_level"] = requested_level
+        actual_volume = result["volume"]
+        result["level"] = round(actual_volume * 100) if isinstance(actual_volume, (int, float)) else None
+    if not verified:
+        result["error"] = (
+            "YT Music volume change could not be verified"
+            if verification == "unavailable"
+            else "YT Music volume did not reach the requested value"
+        )
+    return result
+
+
+def _track_identity(state: dict[str, Any] | None) -> tuple[str, ...] | None:
+    """Return the strongest available identity for a loaded track."""
+    if not isinstance(state, dict) or not state.get("ok"):
+        return None
+    track_id = str(state.get("track_id") or state.get("trackId") or "").strip()
+    if track_id:
+        return ("id", track_id)
+    title = str(state.get("title") or "").strip().casefold()
+    artist = str(state.get("artist") or "").strip().casefold()
+    if title or artist:
+        return ("metadata", title, artist)
+    return None
+
+
+def _verify_action(
+    action: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    """Verify an action from observed state, never from command delivery."""
+    if not isinstance(after, dict) or not after.get("ok"):
+        return False, "unavailable"
+    if action == "pause":
+        if after.get("playing") is False:
+            return True, "verified"
+        return False, "unavailable" if after.get("playing") is None else "failed"
+    if action == "play":
+        if after.get("playing") is True:
+            return True, "verified"
+        return False, "unavailable" if after.get("playing") is None else "failed"
+
+    before_identity = _track_identity(before)
+    after_identity = _track_identity(after)
+    if before_identity is None or after_identity is None:
+        return False, "unavailable"
+    return (before_identity != after_identity, "verified" if before_identity != after_identity else "failed")
+
+
+def _native_previous_restart_detected(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> bool:
+    """Recognize YT Music's native restart-current Previous behavior.
+
+    A second Previous click is safe only when the same track is identified in
+    both reads and the media element demonstrably jumped from a progressed
+    position back to the beginning. Missing metadata is never enough.
+    """
+    if _track_identity(before) is None or _track_identity(after) is None:
+        return False
+    if _track_identity(before) != _track_identity(after):
+        return False
+    before_time = before.get("currentTime") if isinstance(before, dict) else None
+    after_time = after.get("currentTime") if isinstance(after, dict) else None
+    if isinstance(before_time, bool) or isinstance(after_time, bool):
+        return False
+    if not isinstance(before_time, (int, float)) or not isinstance(after_time, (int, float)):
+        return False
+    return (
+        before_time >= _YTM_PREVIOUS_RESTART_MIN_TIME
+        and after_time <= _YTM_PREVIOUS_RESTART_MAX_TIME
+        and after_time < before_time - 1.0
+    )
+
+
+async def _observe_after_delivery(
+    action: str,
+    before: dict[str, Any],
+    *,
+    detect_native_restart: bool = True,
+) -> tuple[dict[str, Any] | None, bool, str, bool]:
+    """Read bounded post-command state without sending another command."""
+    read_count = 4 if action in ("next", "previous") else 1
+    state: dict[str, Any] | None = None
+    verification = "unavailable"
+    for _ in range(read_count):
+        await asyncio.sleep(0.4)
+        state = await get_state()
+        verified, verification = _verify_action(action, before, state)
+        if verified:
+            return state, True, "verified", False
+        if (
+            action == "previous"
+            and detect_native_restart
+            and _native_previous_restart_detected(before, state)
+        ):
+            return state, False, verification, True
+    return state, False, verification, False
+
+
+def _state_has_player(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        return False
+    return bool(state.get("player_loaded") or _track_identity(state) is not None)
 
 
 async def control(action: str) -> dict[str, Any]:
@@ -354,96 +1857,436 @@ async def control(action: str) -> dict[str, Any]:
     if action not in ("play", "pause", "next", "previous"):
         return {"ok": False, "error": f"unknown action: {action}", "action": action}
     if not await ensure_ready():
-        return {"ok": False, "error": "ytm_web not ready", "action": action}
+        status = _status_payload()
+        return {
+            "ok": False,
+            "error": f"YT Music is {status['state'].lower()}",
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "connection_state": status["state"],
+            "page_ready": status["page_ready"],
+            "search_ready": status["search_ready"],
+            "player_loaded": status["player_loaded"],
+        }
+
+    before = await get_state()
+    if not _state_has_player(before):
+        status = _status_payload()
+        return {
+            "ok": False,
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "degraded": False,
+            "before": before,
+            "after": None,
+            "state": before,
+            "connection_state": status["state"],
+            "error": "YT Music player has no loaded track",
+        }
     try:
         send_result = await _ytm_page.evaluate(_CONTROL_JS, action)
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "action": action}
+        status = _status_payload()
+        return {
+            "ok": False,
+            "error": str(exc),
+            "action": action,
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "before": before,
+            "after": None,
+            "state": before,
+            "connection_state": status["state"],
+        }
 
-    await asyncio.sleep(0.4)
-    state = await get_state()
-    verified = bool(state.get("ok")) and (
-        (action in ("play", "next", "previous") and state.get("playing") is True)
-        or (action == "pause" and state.get("playing") is False)
-    )
+    send_data = send_result if isinstance(send_result, dict) else {}
+    delivered = bool(send_data.get("ok"))
+    if not delivered:
+        status = _status_payload()
+        return {
+            "ok": False,
+            "action": action,
+            "method": send_data.get("method"),
+            "adapter": "ytm_web",
+            "delivered": False,
+            "verified": False,
+            "verification": "not_attempted",
+            "before": before,
+            "after": None,
+            "state": before,
+            "connection_state": status["state"],
+            "error": send_data.get("error", "command was not delivered"),
+        }
 
-    if not verified and action in ("next", "previous"):
-        await asyncio.sleep(0.5)
-        state = await get_state()
-        verified = bool(state.get("ok")) and (
-            (action in ("next", "previous") and state.get("playing") is True)
+    state, verified, verification, native_restart_detected = await _observe_after_delivery(action, before)
+    click_count = 1 if action in ("next", "previous") else None
+    intermediate = None
+    second_click_attempted = False
+    second_delivered = None
+    transport_methods = [send_data.get("method")] if action in ("next", "previous") else None
+
+    if action == "previous" and native_restart_detected:
+        intermediate = state
+        second_click_attempted = True
+        try:
+            second_send_result = await _ytm_page.evaluate(_CONTROL_JS, action)
+        except Exception as exc:
+            second_send_result = {"ok": False, "error": str(exc)}
+        second_send_data = second_send_result if isinstance(second_send_result, dict) else {}
+        second_delivered = bool(second_send_data.get("ok"))
+        click_count = 1 + int(second_delivered)
+        if second_delivered:
+            transport_methods.append(second_send_data.get("method"))
+            state, verified, verification, _ = await _observe_after_delivery(
+                action,
+                before,
+                detect_native_restart=False,
+            )
+
+    track_changed = None
+    if action in ("next", "previous"):
+        before_identity = _track_identity(before)
+        after_identity = _track_identity(state)
+        track_changed = (
+            before_identity != after_identity
+            if before_identity is not None and after_identity is not None
+            else None
         )
 
-    return {
-        "ok": bool(send_result and send_result.get("ok") and verified),
+    if action in ("next", "previous"):
+        await _enforce_background_window(reason=f"control.{action}")
+
+    result = {
+        "ok": bool(delivered and verified),
         "action": action,
-        "method": (send_result or {}).get("method"),
+        "method": send_data.get("method"),
+        "adapter": "ytm_web",
+        "delivered": delivered,
         "verified": verified,
+        "verification": verification,
+        "degraded": delivered and not verified and verification == "unavailable",
+        "before": before,
+        "after": state,
         "state": state,
+        "connection_state": _status_payload()["state"],
+        "control": send_data.get("control"),
     }
+    if track_changed is not None or action in ("next", "previous"):
+        result["track_changed"] = track_changed
+    if action in ("next", "previous"):
+        result.update(
+            {
+                "click_count": click_count,
+                "transport_methods": transport_methods,
+                "intermediate": intermediate,
+                "native_restart_detected": native_restart_detected,
+                "second_click_attempted": second_click_attempted,
+                "second_delivered": second_delivered,
+            }
+        )
+        if action == "previous":
+            result["native_result"] = (
+                "restarted_current"
+                if native_restart_detected
+                else "changed_track"
+                if verified
+                else "unavailable"
+                if verification == "unavailable"
+                else "unchanged"
+            )
+    if not verified:
+        if action in ("next", "previous"):
+            if (
+                action == "previous"
+                and native_restart_detected
+                and track_changed is False
+                and second_delivered
+            ):
+                result["error_code"] = "NO_PREVIOUS_TRACK"
+                result["native_result"] = "no_previous_track"
+                result["error"] = "YT Music has no previous track"
+            elif verification == "unavailable":
+                result["error_code"] = "TRACK_TRANSITION_UNVERIFIED"
+                result["error"] = "track transition could not be verified"
+            else:
+                result["error_code"] = "TRACK_DID_NOT_CHANGE"
+                result["error"] = "track did not change"
+        else:
+            result["error"] = f"playback state did not reach {'playing' if action == 'play' else 'paused'}"
+    return result
 
 
 async def play_query(query: str) -> dict[str, Any]:
-    """Traži i pusti prvi rezultat. Koristi postojeći tab u browseru."""
-    if not query.strip():
-        return {"ok": False, "error": "empty query"}
+    """Search and play a real YTM video result in the connected browser."""
+    query = query.strip()
+    if not query:
+        return _play_query_result(
+            query,
+            stage="input",
+            error_code="INVALID_QUERY",
+            error="empty query",
+        )
+    if _RAW_VIDEO_ID_RE.fullmatch(query):
+        return _play_query_result(
+            query,
+            stage="input",
+            error_code="RAW_VIDEO_ID_NOT_SEARCHABLE",
+            error="a raw video ID is not a supported YT Music search query",
+        )
     if not await ensure_ready():
-        return {"ok": False, "error": "ytm_web not ready"}
+        status = _status_payload()
+        return _play_query_result(
+            query,
+            stage="connection",
+            error_code="CONNECTION_UNAVAILABLE",
+            error=f"YT Music is {status['state'].lower()}",
+        )
+
+    before = await get_state()
+    search_before = await _read_search_results_state()
+    window_trace: list[dict[str, Any]] = []
+
+    async def trace_window(reason: str, *, minimize: bool = True) -> dict[str, Any]:
+        snapshot = await _enforce_background_window(reason=reason, minimize=minimize)
+        window_trace.append(
+            {
+                "reason": reason,
+                "before": snapshot.get("window_state_before"),
+                "after": snapshot.get("window_state"),
+                "changed": snapshot.get("changed"),
+            }
+        )
+        return snapshot
+
+    await trace_window("play_query.before_search")
+    search_submitted = False
+    selected: dict[str, Any] = {}
+    search_after: dict[str, Any] = {}
+    candidates: list[dict[str, Any]] = []
+    freshness = "not_checked"
+    click_result: dict[str, Any] | None = None
+    clicked_result = False
+
+    async def result_failure(
+        *,
+        stage: str,
+        error_code: str,
+        error: str,
+        **values: Any,
+    ) -> dict[str, Any]:
+        await trace_window("play_query.final")
+        return _play_query_result(
+            query,
+            stage=stage,
+            search_submitted=search_submitted,
+            result_found=bool(selected.get("video_id")),
+            selected_video_id=selected.get("video_id"),
+            selected_title=selected.get("title", ""),
+            selected_artist=selected.get("artist", ""),
+            selection_method=selected.get("selection_method"),
+            query_match_score=selected.get("query_match_score"),
+            title_match_score=selected.get("title_match_score"),
+            artist_match_score=selected.get("artist_match_score"),
+            match_kind=selected.get("match_kind"),
+            search_method="ytm_search_box" if search_submitted else None,
+            delivered=clicked_result,
+            verified=False,
+            verification=values.pop(
+                "verification",
+                "unavailable" if clicked_result else "not_attempted",
+            ),
+            degraded=values.pop("degraded", clicked_result),
+            before=before,
+            search_before={
+                "path": search_before.get("path"),
+                "query": search_before.get("query"),
+                "fingerprint": list(_search_fingerprint(search_before)),
+            },
+            search_after={
+                "path": search_after.get("path"),
+                "query": search_after.get("query"),
+                "fingerprint": list(_search_fingerprint(search_after)),
+                "freshness": freshness,
+            },
+            candidates=candidates[:10],
+            click_result=click_result,
+            window_trace=window_trace,
+            error_code=error_code,
+            error=error,
+            **values,
+        )
 
     try:
         home = await _ytm_page.evaluate(
             "() => ({ url: location.href, hasSearch: !!document.querySelector('ytmusic-search-box input') })"
         )
-        if not home.get("hasSearch"):
-            await _ytm_page.goto(YTM_URL, wait_until="domcontentloaded", timeout=15000)
-            await _ytm_page.wait_for_function(_PLAYER_READY_JS, timeout=12000)
-
-        r = await _ytm_page.evaluate(_SEARCH_INPUT_JS, query)
-        if not (r and r.get("ok")):
-            return {"ok": False, "error": (r or {}).get("error", "search input failed"),
-                    "query": query}
-
-        await _ytm_page.keyboard.press("Enter")
-        await _ytm_page.wait_for_url("**/search**", timeout=8000)
-        await _ytm_page.wait_for_selector(
-            "ytmusic-responsive-list-item-renderer, ytmusic-card-shelf-renderer, ytmusic-shelf-renderer, ytmusic-two-column-browse-results-renderer",
-            timeout=12000,
-        )
-
-        for sel in [
-            "ytmusic-responsive-list-item-renderer a",
-            "ytmusic-card-shelf-renderer a",
-            "ytmusic-shelf-renderer a",
-        ]:
-            loc = _ytm_page.locator(sel).first
-            try:
-                await loc.wait_for(state="visible", timeout=3000)
-                await loc.click()
-                break
-            except Exception:
-                continue
-        else:
-            return {"ok": False, "error": "no clickable search results", "query": query}
+        if not isinstance(home, dict) or not home.get("hasSearch"):
+            return await result_failure(
+                stage="search_ready",
+                error_code="SEARCH_NOT_READY",
+                error="YT Music search is not ready",
+            )
 
         try:
-            await _ytm_page.wait_for_function(
-                "() => { const v = document.querySelector('video'); return v && !v.paused && v.currentTime > 0; }",
-                timeout=12000,
+            await trace_window("play_query.before_search_submit")
+            search_input = _ytm_page.locator(
+                "ytmusic-search-box input, input#input, input[name='search_query']"
+            ).first
+            await search_input.fill(query)
+            keyboard = getattr(_ytm_page, "keyboard", None)
+            if keyboard is None:
+                raise RuntimeError("YT Music keyboard control is unavailable")
+            await keyboard.press("Enter")
+        except Exception as exc:
+            return await result_failure(
+                stage="search_submit",
+                error_code="SEARCH_SUBMIT_FAILED",
+                error=f"YT Music search could not be submitted: {exc}",
             )
-        except Exception:
-            state = await get_state()
-            return {"ok": False, "error": "player did not start in time",
-                    "query": query, "state": state}
+        search_submitted = True
+        await trace_window("play_query.after_search_submit")
 
-        state = await get_state()
-        return {"ok": True, "query": query, "state": state}
+        try:
+            await _ytm_page.wait_for_url("**/search**", timeout=8000)
+        except Exception:
+            # The search surface probe below is authoritative. A URL wait can
+            # miss an SPA update or return immediately while an old search is
+            # still rendered.
+            pass
+
+        await trace_window("play_query.after_search_route")
+        search_after, selected_result, candidates, freshness = await _wait_for_fresh_search_results(
+            query,
+            search_before,
+        )
+        selected = selected_result or {}
+        if selected_result is None:
+            surface_fresh, _ = _search_surface_is_fresh(search_before, search_after, query)
+            if not surface_fresh and freshness == "candidate_fingerprint_stale":
+                return await result_failure(
+                    stage="search_results",
+                    error_code="SEARCH_RESULTS_STALE",
+                    error="YT Music search rows remained bound to the previous query",
+                )
+            if surface_fresh:
+                return await result_failure(
+                    stage="result_selection",
+                    error_code="NO_STRONG_MATCH",
+                    error="no YT Music result strongly matched the requested title/artist",
+                )
+            return await result_failure(
+                stage="search_results",
+                error_code="SEARCH_RESULTS_NOT_LOADED",
+                error="YT Music search results surface did not become ready",
+            )
+
+        await trace_window("play_query.before_result_click")
+        click_result = await _click_selected_search_result(selected)
+        clicked_result = bool(click_result.get("clicked"))
+        if not clicked_result:
+            return await result_failure(
+                stage="result_click",
+                error_code="RESULT_CLICK_TARGET_CHANGED",
+                error=click_result.get("error", "selected YT Music result could not be clicked"),
+            )
+        await trace_window("play_query.after_result_click")
+        state, verified, verification, verification_reads, continuation = await _observe_selected_playback(
+            before, selected
+        )
+        await trace_window("play_query.during_playback_verification")
+        actual_video_id = str((state or {}).get("track_id") or "").strip()
+        selected_video_id = str(selected.get("video_id") or "").strip()
+        selected_loaded = bool(actual_video_id and actual_video_id == selected_video_id)
+        playback_error_code = None
+        playback_error = None
+        if not verified:
+            playback_error_code = (
+                "PLAYBACK_DID_NOT_START"
+                if selected_loaded and (state or {}).get("playing") is not True
+                else "PLAYBACK_VERIFICATION_FAILED"
+            )
+            playback_error = (
+                "selected YT Music result loaded but did not start playing"
+                if playback_error_code == "PLAYBACK_DID_NOT_START"
+                else "selected YT Music result did not become the active player track"
+            )
+        result = _play_query_result(
+            query,
+            ok=verified,
+            stage="playback",
+            search_submitted=True,
+            result_found=True,
+            selected_video_id=selected_video_id,
+            selected_title=selected.get("title", ""),
+            selected_artist=selected.get("artist", ""),
+            selection_method=selected.get("selection_method"),
+            query_match_score=selected.get("query_match_score"),
+            title_match_score=selected.get("title_match_score"),
+            artist_match_score=selected.get("artist_match_score"),
+            match_kind=selected.get("match_kind"),
+            result_type=selected.get("result_type"),
+            search_method="ytm_search_box",
+            actual_video_id=actual_video_id,
+            method="dom_search_result",
+            delivered=True,
+            verified=verified,
+            verification=verification,
+            degraded=not verified and verification == "unavailable",
+            before=before,
+            search_before={
+                "path": search_before.get("path"),
+                "query": search_before.get("query"),
+                "fingerprint": list(_search_fingerprint(search_before)),
+            },
+            search_after={
+                "path": search_after.get("path"),
+                "query": search_after.get("query"),
+                "fingerprint": list(_search_fingerprint(search_after)),
+                "freshness": freshness,
+            },
+            candidates=candidates[:10],
+            click_result=click_result,
+            verification_reads=verification_reads,
+            play_continuation=continuation,
+            window_trace=window_trace,
+            state=state,
+            player_loaded=bool(isinstance(state, dict) and state.get("player_loaded")),
+            playing=(state or {}).get("playing"),
+            title=(state or {}).get("title", ""),
+            artist=(state or {}).get("artist", ""),
+            error_code=playback_error_code,
+            error=playback_error,
+        )
+        await trace_window("play_query.final")
+        result["window_trace"] = window_trace
+        return result
     except Exception as exc:
         log.warning("ytm_web.play_query failed: %s", exc)
-        return {"ok": False, "error": str(exc), "query": query}
+        return await result_failure(
+            stage="playback" if clicked_result else "search",
+            error_code="PLAY_QUERY_EXCEPTION",
+            error=str(exc),
+        )
 
 
 async def shutdown() -> None:
-    global _pw, _context, _ytm_page, _browser, _launched, _ready, _active_profile
+    global _pw, _context, _ytm_page, _browser, _launched, _active_profile
+    global _connection_state, _connection_error
+    global _warmup_task
+    if _warmup_task is not None and not _warmup_task.done() and _warmup_task is not asyncio.current_task():
+        _warmup_task.cancel()
+        try:
+            await _warmup_task
+        except asyncio.CancelledError:
+            pass
     try:
         if _context is not None:
             await _context.close()
@@ -459,8 +2302,11 @@ async def shutdown() -> None:
     _browser = None
     _pw = None
     _launched = False
-    _ready = False
     _active_profile = None
+    _warmup_task = None
+    _connection_state = DISCONNECTED
+    _connection_error = None
+    _clear_runtime_state()
 
 
 def active_profile() -> str | None:

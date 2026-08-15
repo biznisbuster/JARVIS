@@ -1,9 +1,10 @@
 """Reliable "now playing" state and media transport control for macOS.
 
 Primary channel is ``nowplaying-cli`` (stable MediaRemote wrapper); every
-command is followed by a state read that verifies the ACTUAL effect, with one
-retry and a fallback chain (MediaRemote ctypes -> registered keystroke
-fallback). Results always report the real state, never just the intent.
+command is followed by a state read that verifies the ACTUAL effect. The
+idempotent play/pause actions retain their retry and fallback chain, while a
+delivered next/previous command is never blindly repeated. Results always
+report the real state, never just the intent.
 """
 
 from __future__ import annotations
@@ -120,83 +121,195 @@ async def get_state() -> dict[str, Any]:
 
 
 _VERIFY_WAIT = 0.45
+_TRANSITION_VERIFY_READS = 2
+_NON_IDEMPOTENT_ACTIONS = {"next", "previous"}
 
 _NPC_ACTIONS = {"pause": "pause", "play": "play", "next": "next", "previous": "previous"}
 _MR_ACTIONS = {"pause": _MR_PAUSE, "play": _MR_PLAY, "next": _MR_NEXT_TRACK, "previous": _MR_PREVIOUS_TRACK}
 
 
-def _verified(action: str, before: dict[str, Any], after: dict[str, Any]) -> bool:
-    if not after.get("ok"):
-        return False
+def _track_identity(state: dict[str, Any] | None) -> tuple[str, ...] | None:
+    """Return track metadata suitable for before/after comparison."""
+    if not isinstance(state, dict) or not state.get("ok"):
+        return None
+    track_id = str(state.get("track_id") or state.get("trackId") or "").strip()
+    if track_id:
+        return ("id", track_id)
+    title = str(state.get("title") or "").strip().casefold()
+    artist = str(state.get("artist") or "").strip().casefold()
+    if title or artist:
+        return ("metadata", title, artist)
+    return None
+
+
+def _verification_result(
+    action: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    """Return whether an observed state verifies the requested action."""
+    if not isinstance(after, dict) or not after.get("ok"):
+        return False, "unavailable"
     playing = after.get("playing")
     if action == "pause":
-        return playing is False
+        if playing is False:
+            return True, "verified"
+        return False, "unavailable" if playing is None else "failed"
     if action == "play":
-        return playing is True
-    if playing is False:
-        return False
-    if before.get("ok") and (before.get("title") or before.get("artist")):
-        return (after.get("title"), after.get("artist")) != (
-            before.get("title"),
-            before.get("artist"),
-        )
-    return playing is True
+        if playing is True:
+            return True, "verified"
+        return False, "unavailable" if playing is None else "failed"
+    before_identity = _track_identity(before)
+    after_identity = _track_identity(after)
+    if before_identity is None or after_identity is None:
+        return False, "unavailable"
+    changed = before_identity != after_identity
+    return changed, "verified" if changed else "failed"
+
+
+def _verified(action: str, before: dict[str, Any], after: dict[str, Any]) -> bool:
+    return _verification_result(action, before, after)[0]
 
 
 async def control(action: str) -> dict[str, Any]:
-    """Run a transport command (pause/play/next/previous) and verify the
-    effect. Channels: nowplaying-cli (with one retry) -> MediaRemote ctypes
-    -> keystroke fallback. The result reports the FINAL real state."""
+    """Run a transport command and verify its observed effect.
+
+    Play/pause may retry because they are state-setting actions. Next/previous
+    are non-idempotent: once a transport reports delivery, only bounded state
+    reads are allowed before returning a verified or explicit unverified
+    result.
+    """
     if action not in _NPC_ACTIONS:
         return {"ok": False, "error": f"unknown action: {action}"}
     before = await get_state()
     attempts: list[str] = []
+    verification_reads = _TRANSITION_VERIFY_READS if action in _NON_IDEMPOTENT_ACTIONS else 1
 
-    async def attempt(method: str, sent: bool) -> dict[str, Any] | None:
+    async def attempt(
+        method: str,
+        sent: bool,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
         if not sent:
-            return None
-        await asyncio.sleep(_VERIFY_WAIT)
-        after = await get_state()
-        if _verified(action, before, after):
-            return {
-                "ok": True,
-                "action": action,
-                "method": method,
-                "attempts": attempts,
-                "verified": True,
-                "state": after,
-            }
-        return None
+            return None, None, "not_attempted"
+        after: dict[str, Any] | None = None
+        verification = "unavailable"
+        for _ in range(verification_reads):
+            await asyncio.sleep(_VERIFY_WAIT)
+            after = await get_state()
+            verified, verification = _verification_result(action, before, after)
+            if verified:
+                return (
+                    {
+                        "ok": True,
+                        "action": action,
+                        "method": method,
+                        "adapter": "nowplaying",
+                        "attempts": attempts,
+                        "delivered": True,
+                        "verified": True,
+                        "verification": "verified",
+                        "degraded": False,
+                        "before": before,
+                        "after": after,
+                        "state": after,
+                    },
+                    after,
+                    "verified",
+                )
+        return None, after, verification
 
-    for _ in range(2):
+    def failure(
+        *,
+        method: str | None,
+        delivered: bool,
+        after: dict[str, Any] | None,
+        verification: str,
+        error: str,
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "action": action,
+            "method": method,
+            "adapter": "nowplaying",
+            "attempts": attempts,
+            "delivered": delivered,
+            "verified": False,
+            "verification": verification,
+            "degraded": delivered and verification == "unavailable",
+            "before": before,
+            "after": after,
+            "state": after,
+            "error": error,
+        }
+
+    def transition_failure(method: str, after: dict[str, Any] | None, verification: str) -> dict[str, Any]:
+        error = (
+            "track transition could not be verified after command delivery"
+            if verification == "unavailable"
+            else "track did not change after command delivery"
+        )
+        return failure(
+            method=method,
+            delivered=True,
+            after=after,
+            verification=verification,
+            error=error,
+        )
+
+    non_idempotent = action in _NON_IDEMPOTENT_ACTIONS
+    last_method: str | None = None
+    last_verification = "not_attempted"
+    for _ in range(1 if non_idempotent else 2):
         attempts.append("nowplaying-cli")
         rc, _, _ = await _npc([_NPC_ACTIONS[action]])
-        res = await attempt("nowplaying-cli", rc == 0)
-        if res:
-            return res
+        result, after, verification = await attempt("nowplaying-cli", rc == 0)
+        if result is not None:
+            return result
+        if rc == 0:
+            if non_idempotent:
+                return transition_failure("nowplaying-cli", after, verification)
+            last_method = "nowplaying-cli"
+            last_verification = verification
         if rc != 0:
             break
 
     attempts.append("media_remote")
     sent = await asyncio.to_thread(_media_remote_send, _MR_ACTIONS[action])
-    res = await attempt("media_remote", sent)
-    if res:
-        return res
+    result, after, verification = await attempt("media_remote", sent)
+    if result is not None:
+        return result
+    if sent:
+        if non_idempotent:
+            return transition_failure("media_remote", after, verification)
+        last_method = "media_remote"
+        last_verification = verification
 
     if _keystroke_fallback is not None:
         attempts.append("keystroke")
         sent = await _keystroke_fallback(action)
-        res = await attempt("keystroke", sent)
-        if res:
-            return res
+        result, after, verification = await attempt("keystroke", sent)
+        if result is not None:
+            return result
+        if sent:
+            if non_idempotent:
+                return transition_failure("keystroke", after, verification)
+            last_method = "keystroke"
+            last_verification = verification
 
     after = await get_state()
-    return {
-        "ok": False,
-        "action": action,
-        "method": None,
-        "attempts": attempts,
-        "verified": False,
-        "state": after,
-        "error": "no channel produced the expected effect",
-    }
+    if last_method is None:
+        return failure(
+            method=None,
+            delivered=False,
+            after=after,
+            verification="not_attempted",
+            error="no channel delivered the command",
+        )
+    expected = "playing" if action == "play" else "paused"
+    return failure(
+        method=last_method,
+        delivered=True,
+        after=after,
+        verification=last_verification,
+        error=f"playback state did not reach {expected}",
+    )

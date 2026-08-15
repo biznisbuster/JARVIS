@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { jfetch, jpost } from '../lib/api';
 import { store, useApp } from '../store';
 import type { PttState } from '../store';
+import { ytmConnectLabel, ytmStatusLabel } from '../lib/ytm-connection';
+import type { YtmConnectionStatus } from '../lib/ytm-connection';
 
 interface ConnectionsPayload {
   llm: {
@@ -33,6 +35,7 @@ interface ConnectionsPayload {
   };
   ptt: PttState | null;
   listen: { active: boolean; reasons: string[]; prev_volume: number | null; restore_pending: boolean };
+  ytm: YtmConnectionStatus;
 }
 
 const LISTEN_HINT = 'sav zvuk na macOS-u se utiše na 0 dok snimaš i vraća posle 0.6 s';
@@ -40,11 +43,15 @@ const LISTEN_HINT = 'sav zvuk na macOS-u se utiše na 0 dok snimaš i vraća pos
 export default function ConnectionsTab() {
   const [data, setData] = useState<ConnectionsPayload | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [ytmBusy, setYtmBusy] = useState(false);
+  const [ytmNotice, setYtmNotice] = useState<string | null>(null);
   const ptt = useApp((s) => s.ptt);
   const listenReasons = useApp((s) => s.listenReasons);
 
   useEffect(() => {
     void load();
+    const id = setInterval(() => void loadYtm(), 5000);
+    return () => clearInterval(id);
   }, []);
 
   useEffect(() => {
@@ -65,6 +72,42 @@ export default function ConnectionsTab() {
       if (c.ptt) store.set({ ptt: c.ptt });
     } catch (e) {
       setErr((e as Error).message);
+    }
+  }
+
+  async function loadYtm() {
+    try {
+      const ytm = await jfetch<YtmConnectionStatus>('/api/ytm/connection');
+      setData((current) => (current ? { ...current, ytm } : current));
+      setYtmNotice((current) => {
+        if (!current) return null;
+        if (ytm.state === 'CONNECTED') return 'YouTube Music je povezan.';
+        if (ytm.state === 'NEEDS_LOGIN') return 'Prijavi se u otvorenom YouTube Music prozoru.';
+        if (ytm.state === 'ERROR' && ytm.error) return ytm.error;
+        return current;
+      });
+    } catch (e) {
+      setYtmNotice(`YouTube Music status nije dostupan: ${(e as Error).message}`);
+    }
+  }
+
+  async function connectYtm() {
+    setYtmBusy(true);
+    setYtmNotice('Otvaram YouTube Music prijavu…');
+    try {
+      const ytm = await jpost<YtmConnectionStatus>('/api/ytm/connect', {});
+      setData((current) => (current ? { ...current, ytm } : current));
+      if (ytm.state === 'CONNECTED') {
+        setYtmNotice('YouTube Music je povezan.');
+      } else if (ytm.state === 'NEEDS_LOGIN') {
+        setYtmNotice('Prijavi se u otvorenom YouTube Music prozoru.');
+      } else if (ytm.state === 'ERROR') {
+        setYtmNotice(ytm.error || 'YouTube Music prijava nije mogla da se otvori.');
+      }
+    } catch (e) {
+      setYtmNotice(`YouTube Music greška: ${(e as Error).message}`);
+    } finally {
+      setYtmBusy(false);
     }
   }
 
@@ -116,10 +159,32 @@ export default function ConnectionsTab() {
         <KV k="active" v={`${data.tts.active.backend} / ${data.tts.active.voice}`} />
       </ConnCard>
 
+      <ConnCard title="YouTube Music">
+        <KV k="status" v={ytmStatusLabel(data.ytm)} />
+        <KV k="stranica" v={data.ytm.page_ready ? '✓ spremna' : '○ nije spremna'} />
+        <KV k="pretraga" v={data.ytm.search_ready ? '✓ spremna' : '○ nije spremna'} />
+        <KV k="player" v={data.ytm.player_loaded ? '✓ učitan' : '○ nema učitane pesme'} />
+        {data.ytm.error && <p className="hint err">⚠ {data.ytm.error}</p>}
+        {ytmNotice && <p className="hint" aria-live="polite">{ytmNotice}</p>}
+        {data.ytm.state === 'NEEDS_LOGIN' && (
+          <p className="hint">Prijavi se direktno u Google/YT Music prozoru. JARVIS ne prima niti čuva lozinku.</p>
+        )}
+        <div className="row">
+          <button
+            type="button"
+            className="primary"
+            disabled={ytmBusy || data.ytm.state === 'CONNECTING'}
+            onClick={() => void connectYtm()}
+          >
+            {ytmConnectLabel(data.ytm)}
+          </button>
+        </div>
+      </ConnCard>
+
       <ConnCard title="Global Push-to-Talk">
         <KV k="key" v={ptt?.key || '—'} />
         <KV k="auto-send" v={ptt?.auto_send ? 'uključen — transkript se odmah šalje' : 'isključen — transkript ide u input'} />
-        <KV k="status" v={ptt?.enabled ? '● ACTIVE — drži taster da snimaš' : '○ ugašen'} />
+        <KV k="status" v={ptt?.enabled ? `● ACTIVE — drži ${pttTriggerLabel(ptt)} da snimaš` : '○ ugašen'} />
         <p className="hint">{renderPttHint(ptt, listenHint, listenReasons.length > 0)}</p>
         <div className="row">
           <button type="button" className="primary" onClick={() => void togglePtt()}>
@@ -149,6 +214,11 @@ function KV({ k, v }: { k: string; v: string }) {
   );
 }
 
+function pttTriggerLabel(ptt: PttState | null): string {
+  const key = ptt?.key || 'taster';
+  return key.includes('+') ? `kombinaciju ${key}` : `taster ${key}`;
+}
+
 function renderPttHint(ptt: PttState | null, listenHint: string, isListening: boolean): React.ReactNode {
   const tail = ptt?.auto_send
     ? 'transkript se odmah šalje kao poruka.'
@@ -165,7 +235,7 @@ function renderPttHint(ptt: PttState | null, listenHint: string, isListening: bo
         </>
       );
     }
-    return `Drži taster bilo gde na macOS-u. Kad pustiš, ${listenHint}; ${tail}`;
+    return `Drži ${pttTriggerLabel(ptt)} bilo gde na macOS-u. Kad pustiš, ${listenHint}; ${tail}`;
   }
   if (ptt?.error) {
     return `Greška: ${ptt.error} — verovatno treba Accessibility dozvola (System Settings → Privacy & Security → Accessibility).`;
