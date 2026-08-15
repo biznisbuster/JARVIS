@@ -123,6 +123,7 @@ class FakeAdapter:
         )
         self.play_started = asyncio.Event()
         self.release_play = asyncio.Event()
+        self.connect_started = asyncio.Event()
         self.block_play = False
 
     async def health(self) -> AdapterHealth:
@@ -132,6 +133,7 @@ class FakeAdapter:
         return self.state.health.to_dict()
 
     async def connect(self) -> dict[str, Any]:
+        self.connect_started.set()
         self.calls.append("connect")
         return self.state.health.to_dict()
 
@@ -371,6 +373,30 @@ async def test_mutations_are_serialized_but_status_reads_are_not_blocked() -> No
     adapter.release_play.set()
     result = await asyncio.wait_for(play_task, timeout=1)
     assert result.ok is True
+
+
+async def test_connect_waits_for_mutation_boundary_but_status_does_not() -> None:
+    adapter = FakeAdapter()
+    adapter.block_play = True
+    service = MediaService(adapter)
+
+    play_task = asyncio.create_task(service.play_query("Song A"))
+    await asyncio.wait_for(adapter.play_started.wait(), timeout=1)
+
+    connect_task = asyncio.create_task(service.connect())
+    await asyncio.sleep(0)
+    assert not adapter.connect_started.is_set()
+
+    status = await asyncio.wait_for(service.get_state(), timeout=1)
+    assert status.track_id == "track-a"
+    assert not adapter.connect_started.is_set()
+
+    adapter.release_play.set()
+    await asyncio.wait_for(play_task, timeout=1)
+    connection = await asyncio.wait_for(connect_task, timeout=1)
+
+    assert connection["connected"] is True
+    assert adapter.calls == ["play_query:Song A", "get_state", "connect"]
 
 
 async def test_two_mutations_cannot_run_on_the_shared_adapter_at_once() -> None:

@@ -159,7 +159,10 @@ class MediaService:
         return dict(await self.adapter.connection_status())
 
     async def connect(self) -> dict[str, Any]:
-        return dict(await self.adapter.connect())
+        """Connect under the same mutation boundary as playback actions."""
+
+        async with self._get_mutation_lock():
+            return dict(await self.adapter.connect())
 
     async def health(self) -> AdapterHealth:
         return await self.adapter.health()
