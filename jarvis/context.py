@@ -11,7 +11,7 @@ import asyncio
 import datetime as dt
 import subprocess
 
-from .media import nowplaying as _np
+from .media.service import MEDIA
 
 _WEEKDAYS = (
     "ponedeljak",
@@ -41,7 +41,7 @@ def _volume_sync() -> int | None:
 
 def _media_line(st: dict) -> str:
     if not st.get("ok"):
-        return "muzika: nepoznato (nowplaying nedostupan)"
+        return "muzika: nepoznato (YT Music status nedostupan)"
     playing = st.get("playing")
     title = st.get("title") or ""
     artist = st.get("artist") or ""
@@ -55,9 +55,10 @@ def _media_line(st: dict) -> str:
 
 async def build_world_state() -> str:
     now = dt.datetime.now()
-    media_task = asyncio.create_task(_np.get_state())
+    media_task = asyncio.create_task(MEDIA.get_state())
     volume_task = asyncio.create_task(asyncio.to_thread(_volume_sync))
-    st = await media_task
+    media_state = await media_task
+    st = media_state.to_dict()
     volume = await volume_task
 
     lines = [

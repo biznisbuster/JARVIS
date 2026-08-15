@@ -1117,7 +1117,9 @@ audible from the dedicated browser and repeat the check after a restart.
   still require manual confirmation on this macOS session.
 - YT Music may change its Polymer component data or click behavior again;
   failures now remain explicit and include adapter/stage diagnostics.
-- Phase 2 `MediaService` and state-ownership work has not started.
+- Phase 2 `MediaService` and state-ownership work is tracked in the current
+  Phase 2 checkpoint below; the Phase 1 merge gate is now satisfied on
+  `origin/main`.
 
 ### Ready for next phase
 
@@ -1680,7 +1682,9 @@ exact visible ytmusic-search-page
 - Artist-only stage-name matching intentionally uses fresh YTM result ordering
   plus a strict one-token artist alias; a weak unrelated candidate remains
   rejected.
-- Phase 2 `MediaService` and wider tool-executor policy have not started.
+- Phase 2 `MediaService` and state-ownership work is tracked in the current
+  Phase 2 checkpoint below; wider tool-executor policy remains later roadmap
+  work.
 
 ### Ready for next phase
 
@@ -1710,26 +1714,40 @@ Suggested new structure:
 jarvis/media/models.py
 jarvis/media/service.py
 jarvis/media/ytm_web.py
-jarvis/media/ytm_desktop.py
-jarvis/media/nowplaying.py
-jarvis/tools/media.py           later/optional in this phase
+jarvis/media/nowplaying.py      generic system-media only
+jarvis/agent/tools.py           thin compatibility wrappers
+jarvis/context.py
+jarvis/app.py
 ```
+
+Phase 2 policy: `YtmWebAdapter` is the authoritative production YT Music
+adapter. It must wrap the existing authenticated persistent browser/session
+runtime in `ytm_web.py`. The historical Safari Web App/deep-link/Quartz YTM
+path is not an automatic fallback. It is either removed when dead or retained
+only as explicitly legacy/experimental code that no public tool selects.
+Any future fallback must prove the correct provider target, command delivery,
+provider-specific state and semantic effect; otherwise the service returns an
+explicit failure.
 
 ## Tasks
 
-- [ ] Define `PlaybackState`.
-- [ ] Define adapter health/state types.
-- [ ] Extract desktop-YTM implementation out of `agent/tools.py`.
-- [ ] Add `YtmWebAdapter`.
-- [ ] Add `YtmDesktopAdapter`.
-- [ ] Create `MediaService`.
-- [ ] Define primary/fallback selection.
-- [ ] Make service own action verification.
-- [ ] Make service own playback state normalization.
-- [ ] Reduce/remove `_YTM_STATE` as authoritative state.
-- [ ] Make `ytm_status` call `MediaService`.
-- [ ] Make `context.py` call `MediaService`.
-- [ ] Tool functions become thin wrappers.
+- [x] Define `PlaybackState`.
+- [x] Define adapter health/state types.
+- [x] Remove dead Safari Web App/deep-link/Quartz YTM implementation from
+      `agent/tools.py`, or isolate any retained experimental code outside the
+      production service path.
+- [x] Add `YtmWebAdapter`.
+- [x] Create `MediaService`.
+- [x] Select `YtmWebAdapter` as the sole production YT Music adapter; do not
+      add an automatic desktop/YouTube fallback chain.
+- [x] Make service own action verification.
+- [x] Make service own playback state normalization.
+- [x] Remove `_YTM_STATE`, or prove it is presentation-only and cannot
+      override service state.
+- [x] Make `ytm_status` call `MediaService`.
+- [x] Make `context.py` call `MediaService`.
+- [x] Route YTM connection/startup/shutdown calls through `MediaService`.
+- [x] Tool functions become thin wrappers.
 
 ## Required state distinction
 
@@ -1746,18 +1764,18 @@ playback state
 
 A YTM page can be healthy with no active track.
 
-## YTM web recovery
+## YTM web recovery (inherited from the Phase 1 adapter)
 
-- [ ] Validate browser/context connection.
-- [ ] Validate page is open.
-- [ ] Validate expected origin.
-- [ ] Validate a small DOM probe.
-- [ ] Invalidate stale ready state.
-- [ ] Recreate page/context when needed.
-- [ ] Prevent concurrent duplicate launches with one lifecycle lock/task.
-- [ ] Shutdown must cancel warmup/recovery work and close browser resources.
+- [x] Validate browser/context connection.
+- [x] Validate page is open.
+- [x] Validate expected origin.
+- [x] Validate a small DOM probe.
+- [x] Invalidate stale ready state.
+- [x] Recreate page/context when needed.
+- [x] Prevent concurrent duplicate launches with one lifecycle lock/task.
+- [x] Shutdown must cancel warmup/recovery work and close browser resources.
 
-## Definition of done
+## Definition of done — PASS (2026-08-15)
 
 The following all read the same service:
 
@@ -1771,20 +1789,30 @@ ytm_play
 
 No module is allowed to claim a different authoritative playback state.
 
+Ordinary YT Music failures never silently activate generic now-playing,
+Safari/desktop YTM, or normal YouTube playback. The service reports an
+explicit unavailable, not-ready, or verification failure instead.
+
+User-led real-machine checkpoint: PASS. Through the normal JARVIS application,
+the user confirmed audible YT Music playback, successive artist/song requests,
+pause/resume, next/previous, absolute and relative YT Music volume,
+mute/unmute, world-state agreement, bounded failed requests, no automatic
+fallback, backgrounded browser behavior, global PTT media control, globally
+audible PTT responses, barge-in speech cancellation and coherent restart
+behavior.
+
 ## Suggested commits
 
 ```text
-add media service state model
-extract ytm desktop adapter
+add media service state model and adapter boundary
 route ytm tools through media service
-use media service in world state
+use media service in world state and lifecycle
 ```
 
 ## Checkpoint
 
-Run automated tests + manual YTM test.
-
-STOP before local-model refactor.
+Automated validation: PASS. User-led real-machine YT Music/PTT checkpoint:
+PASS. STOP before local-model refactor; Phase 3 remains unstarted.
 
 ---
 
@@ -2081,6 +2109,19 @@ Running setup again does not change an existing `.env`.
 - [ ] Add subscriber identity/metrics if debugging multi-tab overflow is hard.
 - [ ] Verify cancellation events cannot be lost in a way that leaves UI stuck.
 
+## Deferred PTT ownership handoff from Phase 1
+
+Phase 1 made capture, silence gating and server-side speech playback bounded,
+but intentionally left transcript execution ownership for this phase:
+
+- [ ] Define one backend-owned global PTT transcript dispatch authority.
+- [ ] Define the explicit target-session policy for PTT commands.
+- [ ] Define zero-UI-client behavior.
+- [ ] Guarantee exactly-once PTT command execution.
+- [ ] Give PTT startup/shutdown and dispatch lifecycle clear ownership.
+- [ ] Remove any requirement that a frontend client be present to execute a
+      global PTT command.
+
 ## Definition of done
 
 Starting/stopping the app repeatedly does not leave browser/process resources
@@ -2112,6 +2153,14 @@ Parallel sessions cannot corrupt `sessions.json`.
 - [ ] Verify switching session mid-stream does not pollute the new transcript.
 - [ ] Add frontend tests if test framework is introduced; otherwise isolate
       pure state reducers/functions for unit testing.
+
+## Deferred PTT/frontend ownership handoff from Phase 1
+
+- [ ] Prevent duplicate PTT dispatch from multiple browser tabs.
+- [ ] Define frontend observer/leader semantics if the frontend still
+      participates in PTT dispatch.
+- [ ] Test PTT/session switching races.
+- [ ] Coordinate browser microphone focus and PTT capture lifecycle races.
 
 ## Definition of done
 
@@ -2352,7 +2401,7 @@ Before declaring stabilization complete:
 - [ ] previous repeatedly
 - [ ] status
 - [ ] kill/close Playwright page -> recovery
-- [ ] desktop fallback
+- [ ] legacy desktop path does not activate unexpectedly
 - [ ] server restart
 - [ ] no unwanted foreground focus
 
