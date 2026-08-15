@@ -15,21 +15,16 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
-import logging
-import re
 import subprocess
-import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from pathlib import Path
 from typing import Any
 
 from .. import state as runtime_state
-from ..media import ytm_web as _ytm_web
+from ..media.models import MediaActionResult
+from ..media.service import MEDIA
 from .kilo_bridge import run_kilo
-
-log = logging.getLogger("jarvis.agent.tools")
 
 
 @dataclass
@@ -423,645 +418,44 @@ async def play_youtube(args: dict[str, Any]) -> str:
         return json.dumps({"ok": False, "query": query, "error": repr(exc)})
 
 
-# ---- YouTube Music (macOS app) ---------------------------------------------
+# ---- YouTube Music ---------------------------------------------------------
 #
-# YouTube Music je Electron aplikacija i ne izvozi AppleScript rečnik, pa
-# upravljanje ide kroz "System Events" + kombinaciju aktivacije i slanja
-# tasterskih prečica koje YTM podržava:
-#   /        → fokus search
-#   Space    → play/pause
-#   N / P    → sledeća / prethodna pesma
-#   ↑ / ↓    → pojačaj / smanji zvuk
-#   M        → mute / unmute
-# Pre svakog slanja tastera MORAMO prvo da aktiviramo YTM (inače tipke idu
-# aktivnom prozoru, ne YTM-u).
-#
-# NOTE: YTM je podrazumevani izbor kad korisnik traži "pesmu". Za videe
-# (spotove, klipove, tutoriale) agent koristi `play_youtube` (Chrome/Web).
-#
-# Na macOS-u se app zove "YT Music" (process i `open -a` prihvataju to ime).
-# Pored toga, instalacija može biti u `/Applications` ili u `~/Applications`.
-#
-# Kontrola se šalje DIREKTNO u YTM proces preko Quartz `CGEventPostToPid`
-# (bez activate/restore ciklusa) — YTM ne bljesne u foreground kad korisnik
-# samo kaže "pauziraj" / "sledeća". Fallback: klasičan AppleScript
-# activate+keystroke+restore kad Quartz ne može da nađe PID.
+# Legacy Safari Web App/Quartz YT Music transport was removed from the tool
+# layer in Phase 2. The authenticated Playwright runtime is owned by
+# YtmWebAdapter and exposed through MediaService.
 
 
-_YTM_APP_NAME = "YT Music"
-_YTM_APP_PATHS = (
-    Path("/Applications/YT Music.app"),
-    Path("/Applications/YouTube Music.app"),
-    Path.home() / "Applications" / "YT Music.app",
-    Path.home() / "Applications" / "YouTube Music.app",
-)
-# YTM je na macOS-u Safari Web App: executable je generički `Web App`, a
-# njegov bundle path jedinstveno identifikuje instalaciju. `pgrep -x` ne
-# valja (comm je "Web App"), koristimo `pgrep -f` po celoj komandnoj liniji
-# koja sadrži "YT Music.app".
-_YTM_PGREP_PATTERN = "YT Music.app"
+def _media_result_payload(result: MediaActionResult | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(result, MediaActionResult):
+        return result.to_dict()
+    return dict(result)
 
-# HID key codes (US/ISO; fizičke pozicije, ne zavise od layout-a karaktera).
-# kVK_ANSI_Space=49, kVK_ANSI_N=45, kVK_ANSI_P=35.
-_YTM_KEY_CODES = {
-    "pause": 49,
-    "play": 49,
-    "next": 45,
-    "previous": 35,
-}
 
-_YTM_BUNDLE_ID: str | None = None
-_YTM_LAST_LAUNCH_AT: float = 0.0
-_YTM_LAUNCH_DEDUP_S = 5.0
-_YTM_LAST_PID: int | None = None
-_YTM_PID_AT: float = 0.0
-_YTM_PID_TTL_S = 30.0
-
-
-class _YtmPlaybackState:
-    """Best-effort mirrored play/pause state. Apple-ov MediaRemote ne vidi
-    YTM (Safari Web App wrapper), tako da 100% tačan signal nemamo.
-    Prati naše akcije i inicijalno je ``None`` (unknown)."""
-
-    def __init__(self) -> None:
-        self._playing: bool | None = None
-
-    def is_playing(self) -> bool | None:
-        return self._playing
-
-    def mark_playing(self) -> None:
-        self._playing = True
-        log.debug("ytm state: playing")
-
-    def mark_paused(self) -> None:
-        self._playing = False
-        log.debug("ytm state: paused")
-
-    def mark_unknown(self) -> None:
-        if self._playing is not None:
-            log.debug("ytm state: reset to unknown")
-        self._playing = None
-
-
-_YTM_STATE = _YtmPlaybackState()
-
-_YTM_BUNDLE_ID: str | None = None
-_YTM_LAST_LAUNCH_AT: float = 0.0
-_YTM_LAUNCH_DEDUP_S = 5.0
-
-
-def _ytm_app_installed() -> bool:
-    return any(p.exists() for p in _YTM_APP_PATHS)
-
-
-def _ytm_bundle_id_sync() -> str | None:
-    for app_path in (p for p in _YTM_APP_PATHS if p.exists()):
-        plist = app_path / "Contents" / "Info.plist"
-        try:
-            out = subprocess.run(
-                ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIdentifier", str(plist)],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            if out.returncode == 0 and out.stdout.strip():
-                return out.stdout.strip()
-        except Exception:
-            continue
-    return None
-
-
-async def _ytm_bundle_id() -> str | None:
-    global _YTM_BUNDLE_ID
-    if _YTM_BUNDLE_ID is None:
-        bid = await asyncio.to_thread(_ytm_bundle_id_sync)
-        _YTM_BUNDLE_ID = bid or ""
-    return _YTM_BUNDLE_ID or None
-
-
-async def _ytm_pid() -> int | None:
-    """Vrati PID YTM glavnog procesa. Kešira 30s; potvrđuje sa
-    `kill -0` da proces nije zamenjen novim.app launch."""
-    global _YTM_LAST_PID, _YTM_PID_AT
-    now = time.monotonic()
-    if _YTM_LAST_PID and now - _YTM_PID_AT < _YTM_PID_TTL_S:
-        rc, _, _ = await _run(["kill", "-0", str(_YTM_LAST_PID)], timeout=2)
-        if rc == 0:
-            return _YTM_LAST_PID
-        _YTM_LAST_PID = None
-
-    bid = await _ytm_bundle_id()
-    if bid:
-        script = (
-            'tell application "System Events"\n'
-            f'  set procs to (every process whose bundle identifier is "{bid}")\n'
-            "  if (count of procs) > 0 then\n"
-            "    return unix id of (item 1 of procs)\n"
-            "  else\n"
-            '    return ""\n'
-            "  end if\n"
-            "end tell"
-        )
-        rc, out, _ = await _osascript(script, timeout=4)
-        if rc == 0:
-            try:
-                pid = int(out.strip())
-                _YTM_LAST_PID = pid
-                _YTM_PID_AT = now
-                return pid
-            except ValueError:
-                pass
-
-    rc, out, _ = await _run(["pgrep", "-f", _YTM_PGREP_PATTERN], timeout=3)
-    if rc == 0:
-        for line in out.splitlines():
-            line = line.strip()
-            if line.isdigit():
-                pid = int(line)
-                _YTM_LAST_PID = pid
-                _YTM_PID_AT = now
-                return pid
-    return None
-
-
-def _post_key_to_pid_sync(pid: int, key_code: int) -> bool:
-    """Pošalji key-down + key-up DIREKTNO u proces preko Quartz
-    `CGEventPostToPid` — NEMA aktiviranja YTM-a u foreground, NEMA
-    bljeska fokusa. Sinkrono radi zato što Quartz API-ja su C-binding,
-    brzi su; `await asyncio.to_thread` ih drži van event loop-a."""
-    try:
-        from Quartz import CGEventCreateKeyboardEvent, CGEventPostToPid
-    except Exception:
-        return False
-    try:
-        down = CGEventCreateKeyboardEvent(None, key_code, True)
-        up = CGEventCreateKeyboardEvent(None, key_code, False)
-        if down is None or up is None:
-            return False
-        CGEventPostToPid(pid, down)
-        time.sleep(0.04)
-        CGEventPostToPid(pid, up)
-        return True
-    except Exception:
-        return False
-
-
-async def _post_key_to_pid(pid: int, key_code: int) -> bool:
-    return await asyncio.to_thread(_post_key_to_pid_sync, pid, key_code)
-
-
-async def _ytm_is_running() -> bool:
-    """Pouzdana provera da li YTM radi: System Events sa bundle id-em
-    (YTM je Safari Web App, pa 'pgrep -x Web App' hvata i druge Web
-    App-ove). Fallback na `pgrep -f` ako se bundle id ne može pročitati."""
-    bid = await _ytm_bundle_id()
-    if bid:
-        script = (
-            'tell application "System Events"\n'
-            f'  return (count of (every process whose bundle identifier is "{bid}")) > 0\n'
-            "end tell"
-        )
-        rc, out, _ = await _osascript(script, timeout=4)
-        if rc == 0:
-            running = out.strip().lower() == "true"
-            log.debug("ytm_is_running: System Events → %s (bid=%s)", running, bid)
-            return running
-        log.debug("ytm_is_running: SE failed rc=%s, falling back to pgrep", rc)
-    rc, _, _ = await _run(["pgrep", "-f", _YTM_PGREP_PATTERN], timeout=3)
-    running = rc == 0
-    log.debug("ytm_is_running: pgrep → %s", running)
-    return running
-
-
-async def _ytm_ensure_running() -> bool:
-    """Start YTM ako ne radi, NE diraj fokus. Ako smo upravo pokušali
-    launch, NE pozivaj `open` ponovo (dedup prozor) — samo poll-uj dok
-    process ne bude vidljiv. Kad se vid prvi put, sačekaj još malo da
-    Electron registruje URL handler pre nego što vratimo True."""
-    global _YTM_LAST_LAUNCH_AT
-    if await _ytm_is_running():
-        log.info("ytm_ensure_running: already running")
-        return True
-
-    now = time.monotonic()
-    if now - _YTM_LAST_LAUNCH_AT < _YTM_LAUNCH_DEDUP_S:
-        log.info("ytm_ensure_running: dedup window — polling without launch")
-        for _ in range(int(_YTM_LAUNCH_DEDUP_S / 0.25)):
-            await asyncio.sleep(0.25)
-            if await _ytm_is_running():
-                log.info("ytm_ensure_running: appeared during dedup window")
-                await asyncio.sleep(0.5)
-                return True
-        return await _ytm_is_running()
-
-    bid = await _ytm_bundle_id()
-    if bid:
-        cmd = ["open", "-g", "-b", bid]
-    else:
-        cmd = ["open", "-ga", _YTM_APP_NAME]
-    log.info("ytm_ensure_running: launching via %s", " ".join(cmd))
-    rc, _, err = await _run(cmd, timeout=15)
-    if rc != 0:
-        log.warning("ytm_ensure_running: launch failed rc=%s err=%s", rc, err)
-        return False
-    _YTM_LAST_LAUNCH_AT = time.monotonic()
-    for _ in range(40):
-        await asyncio.sleep(0.2)
-        if await _ytm_is_running():
-            log.info("ytm_ensure_running: process visible after launch")
-            await asyncio.sleep(0.6)
-            return True
-    log.warning("ytm_ensure_running: process never appeared after launch")
-    return False
-
-
-async def _ytm_dismiss_beforeunload() -> bool:
-    """Ako YTM (Safari Web App) ima 'leave this page?' dialog (sheet na
-    prozoru), automatski ga potvrdi Enterom. Radi BEZ fokusiranja YTM-a."""
-    script = (
-        'tell application "System Events"\n'
-        "  repeat with p in processes\n"
-        "    try\n"
-        '      set bn to ""\n'
-        "      try\n"
-        "        set bn to bundle identifier of p\n"
-        "      end try\n"
-        '      if bn contains "Safari.WebApp" or (name of p) is "YT Music" then\n'
-        "        repeat with w in windows of p\n"
-        "          if (count of sheets of w) > 0 then\n"
-        '            return "yes"\n'
-        "          end if\n"
-        "        end repeat\n"
-        "      end if\n"
-        "    end try\n"
-        "  end repeat\n"
-        '  return "no"\n'
-        "end tell"
-    )
-    for _ in range(12):
-        rc, out, _ = await _osascript(script, timeout=4)
-        if rc == 0 and out.strip() == "yes":
-            await _osascript('tell application "System Events" to keystroke return')
-            await asyncio.sleep(0.3)
-            return True
-        await asyncio.sleep(0.25)
-    return False
-
-
-async def _ytm_open_url(url: str) -> bool:
-    """Otvori URL u YT Music. Koristi `open -g -b <BID>` (g=don't bring
-    to foreground) — Safari Web App inače bljesne u foreground, što
-    korisniku izgleda kao "otvara mi YTM ponovo". URL ide u background,
-    zatim kroz Quartz pošaljemo Space ako treba da playback krene."""
-    bid = await _ytm_bundle_id()
-    if bid and await _ytm_is_running():
-        rc, _, err = await _run(["open", "-g", "-b", bid, url], timeout=15)
-    elif bid:
-        rc, _, err = await _run(["open", "-g", "-b", bid, url], timeout=15)
-    else:
-        rc, _, err = await _run(["open", "-ga", _YTM_APP_NAME, url], timeout=15)
-    if rc != 0:
-        return False
-    asyncio.create_task(_ytm_dismiss_beforeunload())
-    return True
-
-
-async def _ytm_activate() -> bool:
-    """Start YTM (in background) if not running, then bring it to the
-    foreground. Koristi se za media kontrole jer nam treba fokus."""
-    if not await _ytm_is_running():
-        if not await _ytm_ensure_running():
-            return False
-    bid = await _ytm_bundle_id()
-    activate_target = bid if bid else _YTM_APP_NAME
-    rc4, _, _ = await _osascript(f'tell application id "{activate_target}" to activate')
-    if rc4 != 0:
-        rc4, _, _ = await _osascript(f'tell application "{_YTM_APP_NAME}" to activate')
-    await asyncio.sleep(0.4)
-    return rc4 == 0
-
-
-def _ytm_escape(s: str) -> str:
-    """Escape a string for embedding inside an AppleScript double-quoted literal."""
-    return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
-# ---- MediaRemote global media keys (no focus required) --------------------
-#
-# Transport komande (pause/play/next/prev) žive u `jarvis/media/nowplaying.py`
-# sa verifikacijom efekta i fallback lancem; keystroke fallback se registruje
-# ispod posle definicije `_ytm_send_keys_quiet`.
-
-
-async def _ytm_send_keystrokes(steps: list[tuple[str, float]]) -> tuple[int, str, str]:
-    """Activate YTM, then run a sequence of (applescript_line, delay_s_after)
-    steps inside `tell application "System Events"`. Ovo TRAJNO fokusira
-    YTM — koristi se samo za ytm_play fallback."""
-    bid = await _ytm_bundle_id()
-    activate_line = (
-        f'tell application id "{bid}" to activate'
-        if bid
-        else f'tell application "{_YTM_APP_NAME}" to activate'
-    )
-    parts = [
-        activate_line,
-        "delay 0.6",
-        'tell application "System Events"',
-    ]
-    for line, d in steps:
-        parts.append("  " + line)
-        if d:
-            parts.append(f"  delay {d}")
-    parts.append("end tell")
-    script = "\n".join(parts)
-    return await _osascript(script, timeout=30)
-
-
-async def _ytm_get_frontmost_app() -> str | None:
-    """Vrati ime frontmost app-a (pre nego što fokusiramo YTM)."""
-    script = (
-        'tell application "System Events"\n'
-        "  try\n"
-        "    set frontApp to first application process whose frontmost is true\n"
-        "    return name of frontApp\n"
-        "  on error\n"
-        '    return ""\n'
-        "  end try\n"
-        "end tell"
-    )
-    rc, out, _ = await _osascript(script, timeout=5)
-    if rc == 0:
-        return out.strip() or None
-    return None
-
-
-async def _ytm_send_keys_quiet(steps: list[tuple[str, float]]) -> bool:
-    """Pošalji tastere YTM-u bez trajnog fokusa: zapamti frontmost app,
-    aktiviraj YTM, pošalji tastere, vrati fokus."""
-    prev_app = await _ytm_get_frontmost_app()
-    bid = await _ytm_bundle_id()
-    activate_line = (
-        f'tell application id "{bid}" to activate'
-        if bid
-        else f'tell application "{_YTM_APP_NAME}" to activate'
-    )
-    rc, _, _ = await _osascript(activate_line)
-    if rc != 0:
-        return False
-    await asyncio.sleep(0.2)
-    parts = ['tell application "System Events"']
-    for line, d in steps:
-        parts.append("  " + line)
-        if d:
-            parts.append(f"  delay {d}")
-    parts.append("end tell")
-    rc2, _, _ = await _osascript("\n".join(parts), timeout=30)
-    await asyncio.sleep(0.1)
-    if prev_app and prev_app != _YTM_APP_NAME:
-        try:
-            await _osascript(f'tell application "{prev_app}" to activate')
-        except Exception:
-            pass
-    return rc2 == 0
-
-
-_YTM_KEY_FOR_ACTION = {
-    "pause": 'keystroke " "',
-    "play": 'keystroke " "',
-    "next": 'keystroke "n"',
-    "previous": 'keystroke "p"',
-}
-
-_YTM_KEY_LINE_FOR_CODE = {
-    49: 'keystroke " "',
-    45: 'keystroke "n"',
-    35: 'keystroke "p"',
-}
-
-
-def _ytm_unavailable() -> str:
-    return json.dumps({"ok": False, "error": f"'{_YTM_APP_NAME}' app not installed"})
-
-
-def _ytm_play_result(path: str, result: dict[str, Any]) -> str:
-    """Serialize and log the complete YT Music play result for diagnosis."""
-    serialized = json.dumps(result, ensure_ascii=False, default=str)
-    log.info("ytm_play: path=%s result=%s", path, serialized)
-    return serialized
-
-
-# Pouzdano biranje prvog rezultata: scrape-ujemo YTM search HTML, izvučemo
-# prvi videoId, i otvorimo `https://music.youtube.com/watch?v=ID` — YTM tamo
-# uvek kreće pesmu od početka, bez obzira na prethodni queue.
-_YTM_VIDEO_ID_RE = re.compile(r'videoId(?:\\x22|")\s*:\s*(?:\\x22|")([A-Za-z0-9_-]{11})(?:\\x22|")')
-_YTM_WATCH_RE = re.compile(r"/watch\?v=([A-Za-z0-9_-]{11})")
-
-
-async def _search_ytm_video_id(query: str) -> str | None:
-    """Vraća prvi video ID iz YouTube Music search rezultata ili None."""
-    import urllib.parse
-
-    import httpx
-
-    url = f"https://music.youtube.com/search?q={urllib.parse.quote_plus(query)}"
-    try:
-        async with httpx.AsyncClient(
-            timeout=15,
-            follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9,sr;q=0.8",
-            },
-        ) as client:
-            r = await client.get(url)
-            if r.status_code != 200:
-                return None
-            html = r.text
-    except Exception:
-        return None
-
-    m = _YTM_VIDEO_ID_RE.search(html)
-    if m:
-        return m.group(1)
-    m = _YTM_WATCH_RE.search(html)
-    if m:
-        return m.group(1)
-    return None
+def _serialize_media_result(result: MediaActionResult | dict[str, Any]) -> str:
+    return json.dumps(_media_result_payload(result), ensure_ascii=False, default=str)
 
 
 async def ytm_play(args: dict[str, Any]) -> str:
-    """Play a query in the authenticated, dedicated YTM browser session."""
     query = (args.get("query") or "").strip()
-
     if not query:
-        status = await _ytm_web.connection_status()
-        result = {
-            **status,
-            "ok": bool(status.get("connected")),
-            "action": "opened" if status.get("connected") else "connect",
-            "adapter": "ytm_web",
-            "error": None if status.get("connected") else "YouTube Music connection is required",
-        }
-        return _ytm_play_result("ytm_web", result)
-
-    log.info("ytm_play: query=%r", query)
-    try:
-        result = await _ytm_web.play_query(query)
-    except Exception as exc:
-        status = await _ytm_web.connection_status()
-        result = {
-            "ok": False,
-            "query": query,
-            "adapter": "ytm_web",
-            "connection_state": status.get("state"),
-            "page_ready": status.get("page_ready"),
-            "search_ready": status.get("search_ready"),
-            "player_loaded": status.get("player_loaded"),
-            "playing": status.get("playing"),
-            "stage": "playback",
-            "search_submitted": False,
-            "result_found": False,
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "degraded": False,
-            "error_code": "PLAY_QUERY_EXCEPTION",
-            "error": str(exc),
-        }
-    state = result.get("state") or result.get("after")
-    if result.get("verified"):
-        _ytm_update_mirrored_state(state)
-    else:
-        _YTM_STATE.mark_unknown()
-    return _ytm_play_result("ytm_web", {"query": query, **result, "adapter": "ytm_web"})
-
-
-async def _ytm_read_state_via_dom() -> dict[str, Any] | None:
-    if not _ytm_web.is_available():
-        return None
-    try:
-        return await _ytm_web.get_state()
-    except Exception as exc:
-        log.debug("ytm_read_state_via_dom failed: %s", exc)
-        return None
-
-
-async def _ytm_read_transport_state() -> dict[str, Any] | None:
-    """Read transport state from the strongest currently available channel.
-
-    Only the dedicated YT Music DOM is trusted. Generic macOS now-playing
-    state may belong to JARVIS TTS, a browser tab, or another audio app, so it
-    is not valid evidence for a YT Music action. The mirrored state is also
-    intentionally not used as verification evidence.
-    """
-    web_state = await _ytm_read_state_via_dom()
-    if web_state is not None and web_state.get("ok"):
-        return {**web_state, "source": "ytm_web"}
-    log.debug("ytm transport state unavailable; refusing generic now-playing evidence")
-    return None
-
-
-def _ytm_state_is_specific(state: dict[str, Any] | None) -> bool:
-    """Return whether state came from the dedicated YT Music adapter."""
-    return isinstance(state, dict) and state.get("ok") is True and state.get("source") == "ytm_web"
-
-
-def _ytm_track_identity(state: dict[str, Any] | None) -> tuple[str, ...] | None:
-    """Return track id first, then title/artist metadata as a fallback."""
-    if not isinstance(state, dict) or not state.get("ok"):
-        return None
-    track_id = str(state.get("track_id") or state.get("trackId") or "").strip()
-    if track_id:
-        return ("id", track_id)
-    title = str(state.get("title") or "").strip().casefold()
-    artist = str(state.get("artist") or "").strip().casefold()
-    if title or artist:
-        return ("metadata", title, artist)
-    return None
-
-
-def _ytm_verify_transport(
-    action: str,
-    before: dict[str, Any] | None,
-    after: dict[str, Any] | None,
-) -> tuple[bool, str]:
-    """Verify the requested effect from observed state, not delivery."""
-    if not _ytm_state_is_specific(after):
-        return False, "unavailable"
-    if action == "pause":
-        if after.get("playing") is False:
-            return True, "verified"
-        return False, "unavailable" if after.get("playing") is None else "failed"
-    if action == "play":
-        if after.get("playing") is True:
-            return True, "verified"
-        return False, "unavailable" if after.get("playing") is None else "failed"
-
-    before_identity = _ytm_track_identity(before)
-    if not _ytm_state_is_specific(before):
-        return False, "unavailable"
-    after_identity = _ytm_track_identity(after)
-    if before_identity is None or after_identity is None:
-        return False, "unavailable"
-    return (before_identity != after_identity, "verified" if before_identity != after_identity else "failed")
-
-
-def _ytm_update_mirrored_state(state: dict[str, Any] | None) -> None:
-    """Update the non-authoritative mirror only from observed playback state."""
-    if isinstance(state, dict) and state.get("playing") is True:
-        _YTM_STATE.mark_playing()
-    elif isinstance(state, dict) and state.get("playing") is False:
-        _YTM_STATE.mark_paused()
-    else:
-        _YTM_STATE.mark_unknown()
-
-
-async def _ytm_post_keycode(pid: int | None, key_code: int) -> bool:
-    """Šalje keycode u YTM proces. Quartz primarno, AppleScript fallback.
-    Vraca True ako je event isporučen YTM-u (ne garantuje da je YTM
-    reagovao kako treba — YTM ponekad ignoriše input kad UI nije
-    potpuno učitan)."""
-    sent = False
-    if pid is not None:
-        sent = await _post_key_to_pid(pid, key_code)
-        if sent:
-            return True
-    log.warning("ytm transport: quartz fail pid=%s kc=%s, AS fallback", pid, key_code)
-    fallback_line = _YTM_KEY_LINE_FOR_CODE.get(key_code, 'keystroke " "')
-    return await _ytm_send_keys_quiet([(fallback_line, 0.0)])
+        status = await MEDIA.connection_status()
+        return json.dumps(
+            {
+                **status,
+                "ok": bool(status.get("connected")),
+                "action": "opened" if status.get("connected") else "connect",
+                "error": None if status.get("connected") else "YouTube Music connection is required",
+            },
+            ensure_ascii=False,
+        )
+    result = await MEDIA.play_query(query)
+    payload = _media_result_payload(result)
+    payload.setdefault("query", query)
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 async def _ytm_send_transport(action: str) -> dict[str, Any]:
-    """Send and verify transport only through the connected YTM DOM session."""
-    if action not in _YTM_KEY_CODES:
-        return {"ok": False, "error": f"unknown action: {action}"}
-
-    try:
-        result = await _ytm_web.control(action)
-    except Exception as exc:
-        result = {
-            "ok": False,
-            "action": action,
-            "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "error": str(exc),
-        }
-    log.info(
-        "ytm transport %s → web result=%s",
-        action,
-        json.dumps(result, ensure_ascii=False, default=str),
-    )
-    if result.get("verified"):
-        _ytm_update_mirrored_state(result.get("after") or result.get("state"))
-    else:
-        _YTM_STATE.mark_unknown()
-    return {**result, "adapter": result.get("adapter", "ytm_web")}
+    return _media_result_payload(await MEDIA.control(action))
 
 
 async def _ytm_send_volume(
@@ -1070,107 +464,46 @@ async def _ytm_send_volume(
     amount: int | None = None,
     level: int | None = None,
 ) -> dict[str, Any]:
-    """Change and verify volume on the dedicated YT Music media element."""
-    try:
-        result = await _ytm_web.control_volume(action, amount=amount, level=level)
-    except Exception as exc:
-        result = {
-            "ok": False,
-            "action": action,
-            "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "error": str(exc),
-        }
-    log.info(
-        "ytm volume %s → web result=%s",
-        action,
-        json.dumps(result, ensure_ascii=False, default=str),
-    )
-    return {**result, "adapter": result.get("adapter", "ytm_web")}
+    return _media_result_payload(await MEDIA.control_volume(action, amount=amount, level=level))
 
 
 async def ytm_pause(args: dict[str, Any]) -> str:
-    return json.dumps(await _ytm_send_transport("pause"), ensure_ascii=False)
+    return _serialize_media_result(await MEDIA.pause())
 
 
 async def ytm_resume(args: dict[str, Any]) -> str:
-    return json.dumps(await _ytm_send_transport("play"), ensure_ascii=False)
+    return _serialize_media_result(await MEDIA.resume())
 
 
 async def ytm_next(args: dict[str, Any]) -> str:
-    return json.dumps(await _ytm_send_transport("next"), ensure_ascii=False)
+    return _serialize_media_result(await MEDIA.next())
 
 
 async def ytm_previous(args: dict[str, Any]) -> str:
-    return json.dumps(await _ytm_send_transport("previous"), ensure_ascii=False)
+    return _serialize_media_result(await MEDIA.previous())
 
 
 async def ytm_volume_up(args: dict[str, Any]) -> str:
     amount = (args or {}).get("amount", 10)
-    return json.dumps(await _ytm_send_volume("volume_up", amount=amount), ensure_ascii=False)
+    return _serialize_media_result(await MEDIA.volume_up(amount))
 
 
 async def ytm_volume_down(args: dict[str, Any]) -> str:
     amount = (args or {}).get("amount", 10)
-    return json.dumps(await _ytm_send_volume("volume_down", amount=amount), ensure_ascii=False)
+    return _serialize_media_result(await MEDIA.volume_down(amount))
 
 
 async def ytm_volume_mute(args: dict[str, Any]) -> str:
-    return json.dumps(await _ytm_send_volume("volume_mute"), ensure_ascii=False)
+    return _serialize_media_result(await MEDIA.volume_mute())
 
 
 async def ytm_volume_set(args: dict[str, Any]) -> str:
     level = (args or {}).get("level")
-    return json.dumps(await _ytm_send_volume("volume_set", level=level), ensure_ascii=False)
+    return _serialize_media_result(await MEDIA.volume_set(level))
 
 
 async def ytm_status(args: dict[str, Any]) -> str:
-    """Return only dedicated YTM connection and DOM player state."""
-    status = await _ytm_web.connection_status()
-    if not status.get("connected"):
-        return json.dumps(
-            {
-                "ok": False,
-                "source": "ytm_web",
-                **status,
-                "error": status.get("error") or "YouTube Music is not connected",
-            },
-            ensure_ascii=False,
-        )
-
-    web_state = await _ytm_web.get_state()
-    if not web_state.get("ok"):
-        return json.dumps(
-            {
-                "ok": False,
-                "source": "ytm_web",
-                **status,
-                "error": web_state.get("error") or "YT Music state is unavailable",
-            },
-            ensure_ascii=False,
-        )
-
-    playing = web_state.get("playing")
-    if playing is True:
-        _YTM_STATE.mark_playing()
-    elif playing is False:
-        _YTM_STATE.mark_paused()
-    return json.dumps(
-        {
-            "ok": True,
-            "source": "ytm_web",
-            **status,
-            "playing": playing,
-            "title": web_state.get("title", ""),
-            "artist": web_state.get("artist", ""),
-            "track_id": web_state.get("track_id", ""),
-            "currentTime": web_state.get("currentTime", 0),
-            "duration": web_state.get("duration", 0),
-        },
-        ensure_ascii=False,
-    )
+    return json.dumps(await MEDIA.status(), ensure_ascii=False, default=str)
 
 
 async def open_url(args: dict[str, Any]) -> str:

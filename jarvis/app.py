@@ -19,6 +19,7 @@ from . import state as runtime_state
 from .agent import loop as agent_loop
 from .bus import BUS
 from .config import ROOT, SETTINGS
+from .media.service import MEDIA
 
 ROOT_PATH = ROOT
 WEB_DIR = ROOT / "web"
@@ -38,6 +39,7 @@ def _active_ui_dir() -> Path | None:
         return WEB_DIR
     return None
 
+
 permission_store = runtime_state.permission_store
 
 
@@ -53,9 +55,7 @@ async def lifespan(app: FastAPI):
     # before. A fresh install remains DISCONNECTED until the user clicks the
     # explicit Connect YouTube Music action in the UI.
     try:
-        from .media import ytm_web as _ytm_web
-
-        _ytm_web.warm_up()
+        MEDIA.warm_up()
     except Exception:
         pass
     # Best-effort: warm up the STT model in the background so the first
@@ -81,9 +81,7 @@ async def lifespan(app: FastAPI):
     # Close the dedicated YT Music context cleanly while retaining its
     # persistent on-device profile for the next server start.
     try:
-        from .media import ytm_web as _ytm_web
-
-        await _ytm_web.shutdown()
+        await MEDIA.close()
     except Exception:
         pass
     # Teardown: stop the listener so we don't leave a key tap dangling.
@@ -228,16 +226,12 @@ async def api_permissions_pending() -> JSONResponse:
 
 @app.get("/api/ytm/connection")
 async def api_ytm_connection() -> JSONResponse:
-    from .media import ytm_web
-
-    return JSONResponse(await ytm_web.connection_status())
+    return JSONResponse(await MEDIA.connection_status())
 
 
 @app.post("/api/ytm/connect")
 async def api_ytm_connect() -> JSONResponse:
-    from .media import ytm_web
-
-    return JSONResponse(await ytm_web.connect())
+    return JSONResponse(await MEDIA.connect())
 
 
 @app.get("/api/connections")
@@ -249,7 +243,6 @@ async def _connections_payload() -> dict:
     from .audio import tts as tts_mod
     from .audio.focus import FOCUS
     from .hotkey import PTT
-    from .media import ytm_web
 
     voice_info = await asyncio.to_thread(tts_mod.current_voice_info)
     return {
@@ -293,7 +286,7 @@ async def _connections_payload() -> dict:
         },
         "ptt": PTT.status(),
         "listen": FOCUS.status(),
-        "ytm": await ytm_web.connection_status(),
+        "ytm": await MEDIA.connection_status(),
     }
 
 

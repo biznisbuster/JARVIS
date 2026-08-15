@@ -1,4 +1,4 @@
-"""Regression tests for YTM verification provenance and fallback policy."""
+"""Regression tests for the authoritative YT Music service boundary."""
 
 from __future__ import annotations
 
@@ -9,74 +9,103 @@ import pytest
 from jarvis.agent import tools
 
 
-@pytest.fixture(autouse=True)
-def _reset_mirrored_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tools._YTM_STATE, "_playing", None)
-
-
 @pytest.mark.parametrize("action", ["pause", "play", "next", "previous"])
-async def test_ytm_transport_uses_only_web_adapter(
+async def test_ytm_transport_uses_media_service(
     monkeypatch: pytest.MonkeyPatch,
     action: str,
 ) -> None:
-    desktop_calls: list[str] = []
+    calls: list[str] = []
 
-    async def fake_control(requested: str) -> dict[str, object]:
-        assert requested == action
-        return {
-            "ok": False,
-            "action": action,
-            "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "error": "YT Music is needs_login",
-        }
+    class FakeMedia:
+        async def control(self, requested: str) -> dict[str, object]:
+            calls.append(requested)
+            return {
+                "ok": False,
+                "action": requested,
+                "adapter": "ytm_web",
+                "delivered": False,
+                "verified": False,
+                "verification": "not_attempted",
+                "error": "YT Music is needs_login",
+            }
 
-    async def forbidden_desktop(*args, **kwargs) -> bool:  # noqa: ANN002, ANN003
-        desktop_calls.append(action)
-        return True
-
-    monkeypatch.setattr(tools._ytm_web, "control", fake_control)
-    monkeypatch.setattr(tools, "_ytm_post_keycode", forbidden_desktop)
+    monkeypatch.setattr(tools, "MEDIA", FakeMedia())
 
     result = await tools._ytm_send_transport(action)
 
     assert result["ok"] is False
     assert result["adapter"] == "ytm_web"
     assert result["delivered"] is False
-    assert desktop_calls == []
+    assert calls == [action]
 
 
-async def test_ytm_play_does_not_use_desktop_deeplink_when_web_unavailable(
+@pytest.mark.parametrize(
+    ("tool_name", "method"),
+    [
+        ("ytm_pause", "pause"),
+        ("ytm_resume", "resume"),
+        ("ytm_next", "next"),
+        ("ytm_previous", "previous"),
+    ],
+)
+async def test_public_ytm_transport_tools_use_media_service(
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    method: str,
 ) -> None:
-    desktop_calls: list[str] = []
+    calls: list[str] = []
 
-    async def fake_play_query(query: str) -> dict[str, object]:
+    class FakeMedia:
+        pass
+
+    async def transport() -> dict[str, object]:
+        calls.append(method)
         return {
-            "ok": False,
-            "query": query,
+            "ok": True,
+            "action": method,
             "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "error": "YT Music is needs_login",
+            "delivered": True,
+            "verified": True,
+            "verification": "verified",
         }
 
-    async def forbidden_open_url(url: str) -> bool:
-        desktop_calls.append(url)
-        return True
+    fake_media = FakeMedia()
+    setattr(fake_media, method, transport)
+    monkeypatch.setattr(tools, "MEDIA", fake_media)
 
-    monkeypatch.setattr(tools._ytm_web, "play_query", fake_play_query)
-    monkeypatch.setattr(tools, "_ytm_open_url", forbidden_open_url)
+    result = json.loads(await getattr(tools, tool_name)({}))
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert calls == [method]
+
+
+async def test_ytm_play_does_not_use_an_automatic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeMedia:
+        async def play_query(self, query: str) -> dict[str, object]:
+            calls.append(query)
+            return {
+                "ok": False,
+                "query": query,
+                "adapter": "ytm_web",
+                "delivered": False,
+                "verified": False,
+                "verification": "not_attempted",
+                "error": "YT Music is needs_login",
+            }
+
+    monkeypatch.setattr(tools, "MEDIA", FakeMedia())
 
     result = json.loads(await tools.ytm_play({"query": "Vlado Georgiev"}))
 
     assert result["ok"] is False
     assert result["verified"] is False
     assert result["adapter"] == "ytm_web"
-    assert desktop_calls == []
+    assert calls == ["Vlado Georgiev"]
 
 
 async def test_connected_ytm_play_failure_preserves_connection_diagnostics(
@@ -98,7 +127,11 @@ async def test_connected_ytm_play_failure_preserves_connection_diagnostics(
             "error": "no playable YT Music search result",
         }
 
-    monkeypatch.setattr(tools._ytm_web, "play_query", connected_search_failure)
+    class FakeMedia:
+        async def play_query(self, query: str) -> dict[str, object]:
+            return await connected_search_failure(query)
+
+    monkeypatch.setattr(tools, "MEDIA", FakeMedia())
 
     result = json.loads(await tools.ytm_play({"query": "Unknown artist"}))
 
@@ -108,35 +141,28 @@ async def test_connected_ytm_play_failure_preserves_connection_diagnostics(
     assert result["stage"] == "result_selection"
 
 
-async def test_missing_loaded_player_does_not_fall_back_to_desktop_transport(
+async def test_missing_loaded_player_does_not_fall_back_to_another_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    desktop_calls: list[str] = []
+    class FakeMedia:
+        async def control(self, action: str) -> dict[str, object]:
+            return {
+                "ok": False,
+                "action": action,
+                "adapter": "ytm_web",
+                "delivered": False,
+                "verified": False,
+                "verification": "not_attempted",
+                "error": "YT Music player has no loaded track",
+            }
 
-    async def no_loaded_player(action: str) -> dict[str, object]:
-        return {
-            "ok": False,
-            "action": action,
-            "adapter": "ytm_web",
-            "delivered": False,
-            "verified": False,
-            "verification": "not_attempted",
-            "error": "YT Music player has no loaded track",
-        }
-
-    async def forbidden_desktop(*args, **kwargs) -> bool:  # noqa: ANN002, ANN003
-        desktop_calls.append("desktop")
-        return True
-
-    monkeypatch.setattr(tools._ytm_web, "control", no_loaded_player)
-    monkeypatch.setattr(tools, "_ytm_post_keycode", forbidden_desktop)
+    monkeypatch.setattr(tools, "MEDIA", FakeMedia())
 
     result = await tools._ytm_send_transport("next")
 
     assert result["ok"] is False
     assert result["delivered"] is False
     assert "no loaded track" in result["error"]
-    assert desktop_calls == []
 
 
 @pytest.mark.parametrize(
@@ -148,37 +174,35 @@ async def test_missing_loaded_player_does_not_fall_back_to_desktop_transport(
         ("ytm_volume_set", "volume_set", {"level": 30}),
     ],
 )
-async def test_ytm_volume_uses_dedicated_media_element_not_system_volume(
+async def test_ytm_volume_routes_through_media_service(
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
     action: str,
     args: dict[str, int],
 ) -> None:
-    web_calls: list[tuple[str, int | None, int | None]] = []
+    service_calls: list[tuple[str, int | None]] = []
 
-    async def fake_control_volume(
-        requested: str,
-        *,
-        amount: int | None = None,
-        level: int | None = None,
-    ) -> dict[str, object]:
-        web_calls.append((requested, amount, level))
-        volume = level / 100 if requested == "volume_set" and level is not None else 0.6
-        return {
-            "ok": True,
-            "action": requested,
-            "adapter": "ytm_web",
-            "delivered": True,
-            "verified": True,
-            "verification": "verified",
-            "before": {"volume": 0.5, "muted": False},
-            "after": {"volume": volume, "muted": requested == "volume_mute"},
-        }
+    class FakeMedia:
+        async def volume_up(self, amount: int | None) -> dict[str, object]:
+            service_calls.append(("volume_up", amount))
+            return {"ok": True, "adapter": "ytm_web", "delivered": True, "verified": True}
+
+        async def volume_down(self, amount: int | None) -> dict[str, object]:
+            service_calls.append(("volume_down", amount))
+            return {"ok": True, "adapter": "ytm_web", "delivered": True, "verified": True}
+
+        async def volume_mute(self) -> dict[str, object]:
+            service_calls.append(("volume_mute", None))
+            return {"ok": True, "adapter": "ytm_web", "delivered": True, "verified": True}
+
+        async def volume_set(self, level: int | None) -> dict[str, object]:
+            service_calls.append(("volume_set", level))
+            return {"ok": True, "adapter": "ytm_web", "delivered": True, "verified": True}
 
     async def forbidden_system_volume(*args, **kwargs):  # noqa: ANN002, ANN003
         raise AssertionError("YT Music volume must not call macOS system volume")
 
-    monkeypatch.setattr(tools._ytm_web, "control_volume", fake_control_volume)
+    monkeypatch.setattr(tools, "MEDIA", FakeMedia())
     monkeypatch.setattr(tools, "_osascript", forbidden_system_volume)
 
     result = json.loads(await getattr(tools, tool_name)(args))
@@ -186,13 +210,9 @@ async def test_ytm_volume_uses_dedicated_media_element_not_system_volume(
     assert result["ok"] is True
     assert result["adapter"] == "ytm_web"
     assert result["verified"] is True
-    assert web_calls == [
-        (
-            action,
-            args.get("amount", 10) if action in ("volume_up", "volume_down") else None,
-            args.get("level") if action == "volume_set" else None,
-        )
-    ]
+    expected_amount = args.get("amount", 10) if action in ("volume_up", "volume_down") else None
+    expected_value = args.get("level") if action == "volume_set" else expected_amount
+    assert service_calls == [(action, expected_value)]
 
 
 def test_ytm_volume_schemas_expose_absolute_and_relative_percentages() -> None:
@@ -210,48 +230,12 @@ def test_ytm_volume_schemas_expose_absolute_and_relative_percentages() -> None:
         assert amount["maximum"] == 100
 
 
-async def test_transport_state_refuses_generic_nowplaying_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def generic_state() -> dict[str, object]:
-        return {
-            "ok": True,
-            "playing": True,
-            "title": "Jarvis — lični AI asistent",
-            "artist": "JARVIS",
-            "source": "nowplaying",
-        }
-
-    monkeypatch.setattr(tools._ytm_web, "is_available", lambda: False)
-    monkeypatch.setattr(tools._ytm_web, "get_state", generic_state)
-
-    assert await tools._ytm_read_transport_state() is None
-
-
-def test_generic_nowplaying_cannot_verify_ytm_transition() -> None:
-    before = {
-        "ok": True,
-        "playing": True,
-        "title": "Top Gun",
-        "artist": "Relja",
-        "source": "nowplaying",
-    }
-    after = {
-        "ok": True,
-        "playing": True,
-        "title": "Jarvis — lični AI asistent",
-        "artist": "JARVIS",
-        "source": "nowplaying",
-    }
-
-    assert tools._ytm_verify_transport("next", before, after) == (False, "unavailable")
-
-
 async def test_ytm_status_does_not_report_generic_audio_as_ytm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def disconnected() -> dict[str, object]:
         return {
+            "ok": False,
             "state": "NEEDS_LOGIN",
             "connected": False,
             "needs_login": True,
@@ -262,10 +246,26 @@ async def test_ytm_status_does_not_report_generic_audio_as_ytm(
             "error": None,
         }
 
-    monkeypatch.setattr(tools._ytm_web, "connection_status", disconnected)
+    class FakeMedia:
+        async def status(self) -> dict[str, object]:
+            return await disconnected()
+
+    monkeypatch.setattr(tools, "MEDIA", FakeMedia())
 
     result = json.loads(await tools.ytm_status({}))
 
     assert result["ok"] is False
-    assert result["source"] == "ytm_web"
+    assert result["state"] == "NEEDS_LOGIN"
     assert "Jarvis" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_dead_legacy_ytm_helpers_are_not_in_the_tool_layer() -> None:
+    for name in (
+        "_YTM_STATE",
+        "_ytm_post_keycode",
+        "_ytm_open_url",
+        "_ytm_activate",
+        "_ytm_send_keys_quiet",
+        "_ytm_bundle_id",
+    ):
+        assert not hasattr(tools, name)

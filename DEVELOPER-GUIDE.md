@@ -404,19 +404,20 @@ Media is a domain service, not a collection of unrelated tools.
 ```text
 MediaService
    |
-   +--> YtmWebAdapter       preferred when healthy
-   +--> YtmDesktopAdapter   fallback
-   +--> SystemMediaAdapter  generic media where appropriate
+   +--> YtmWebAdapter       authoritative YT Music adapter
 ```
 
 The service owns:
 
-- active adapter,
+- the authoritative YT Music adapter,
 - health,
 - playback state,
-- fallback policy,
 - verification,
-- retry policy.
+- mutation serialization,
+- explicit failure when YT Music is unavailable.
+
+Generic macOS now-playing remains a separate system-media capability. It is
+not an automatic YT Music fallback and cannot verify YT Music actions.
 
 ## 7.2 Playback state
 
@@ -424,12 +425,14 @@ Use one normalized object:
 
 ```python
 PlaybackState(
-    available=True,
+    ok=True,
+    health=AdapterHealth(...),
+    player_available=True,
     playing=True,
     title="...",
     artist="...",
-    position_s=12.3,
-    duration_s=201.0,
+    current_time=12.3,
+    duration=201.0,
     source="ytm_web",
     track_id="...",
 )
@@ -855,7 +858,9 @@ async def previous() -> PlaybackState
 async def close() -> None
 ```
 
-The domain service decides fallback behavior.
+The domain service owns the canonical result and verification boundary. The
+current YT Music service deliberately has no automatic desktop or normal
+YouTube fallback.
 
 ---
 

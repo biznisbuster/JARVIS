@@ -21,7 +21,7 @@ async def test_ytm_connection_get_returns_backend_truth(monkeypatch) -> None:
             "error": None,
         }
 
-    monkeypatch.setattr(ytm_web, "connection_status", status)
+    monkeypatch.setattr(app_module.MEDIA, "connection_status", status)
 
     response = await app_module.api_ytm_connection()
 
@@ -43,7 +43,7 @@ async def test_ytm_connect_endpoint_returns_connection_result(monkeypatch) -> No
     async def connect() -> dict[str, object]:
         return expected
 
-    monkeypatch.setattr(ytm_web, "connect", connect)
+    monkeypatch.setattr(app_module.MEDIA, "connect", connect)
 
     response = await app_module.api_ytm_connect()
 
