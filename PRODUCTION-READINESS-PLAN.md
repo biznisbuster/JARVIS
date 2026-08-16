@@ -1835,35 +1835,35 @@ tests for local models / tool streaming
 
 ### Shared ToolCallAccumulator
 
-- [ ] Extract cloud tool delta assembly into reusable component.
-- [ ] Support:
+- [x] Extract cloud tool delta assembly into reusable component.
+- [x] Support:
   - call index,
   - streamed id,
   - streamed function name,
   - streamed JSON arguments,
   - final full-call repetition.
-- [ ] Use the same accumulator for cloud provider and Ollama.
-- [ ] Validate final arguments as JSON or preserve explicit parse error.
-- [ ] Never execute raw per-delta fragments.
+- [x] Use the same accumulator for cloud provider and Ollama.
+- [x] Validate final arguments as JSON or preserve explicit parse error.
+- [x] Never execute raw per-delta fragments.
 
 ### Capability detection
 
-- [ ] Rewrite probe prompt so success requires a tool call.
-- [ ] Parse the response.
-- [ ] `tools` only if valid structured tool call exists.
-- [ ] Distinguish:
+- [x] Rewrite probe prompt so success requires a tool call.
+- [x] Parse the response.
+- [x] `tools` only if valid structured tool call exists.
+- [x] Distinguish:
   - `tools`,
   - `notools`,
   - `unknown`.
-- [ ] Preserve explicit `.env` override precedence.
-- [ ] Persist probe result with enough version identity that a changed model
+- [x] Preserve explicit `.env` override precedence.
+- [x] Persist probe result with enough version identity that a changed model
       tag/build can be reprobed later.
 
 ### Tool/no-tool history
 
-- [ ] Continue sanitizing tool mechanics for notools models.
-- [ ] Add tests proving tool messages do not leak into notools history.
-- [ ] Ensure the no-tools system prompt contains no executable-looking tool
+- [x] Continue sanitizing tool mechanics for notools models.
+- [x] Add tests proving tool messages do not leak into notools history.
+- [x] Ensure the no-tools system prompt contains no executable-looking tool
       patterns.
 
 ## Definition of done
@@ -1888,6 +1888,103 @@ Test at least:
 - cloud model afterward in same session.
 
 STOP before UI lifecycle work.
+
+## Phase 3 report (2026-08-17)
+
+### Root cause
+
+Cloud `ChatStream` had private indexed assembly, while the Ollama path appended
+each streamed delta as a new call. Capability probing treated any HTTP 200 as
+tool support, persisted only a lowercased tag, and the agent loop still passed
+tool schemas to known no-tools local models. Malformed arguments were converted
+into a fake object before execution.
+
+### Completed
+
+- Added one provider-neutral `ToolCallAccumulator` used by cloud and Ollama.
+- Added indexed/interleaved assembly, stable generated IDs, dict/string
+  arguments, repeated-full-call de-duplication and explicit malformed-JSON
+  diagnostics.
+- Finalized calls are the only calls exposed to the agent loop; empty function
+  names are rejected and invalid/non-object arguments cannot execute.
+- Reworked the probe to require a matching structured `time_now` call and to
+  classify `tools`, `notools` and `unknown` from response evidence.
+- Added identity-aware capability persistence using Ollama `digest`,
+  `modified_at` and `size`; legacy string caches normalize safely and changed
+  identities invalidate cached results.
+- Preserved `.env` `tools`/`notools` overrides over cache/probe results.
+- Kept no-tools history as a derived request-time copy, suppressed schemas for
+  known no-tools models, hardened the no-tools prompt and preserved canonical
+  history for a later cloud turn.
+- Kept Phase 4 model-readiness/UI work and Phase 5 ToolExecutor work untouched.
+
+### Files changed
+
+- `jarvis/tool_calls.py`
+- `jarvis/llm.py`
+- `jarvis/local_models.py`
+- `jarvis/agent/loop.py`
+- `jarvis/agent/prompts.py`
+- `tests/fakes/ollama.py`
+- `tests/test_tool_calls.py`
+- `tests/test_llm.py`
+- `tests/test_local_models.py`
+- `tests/test_loop_tool_events.py`
+- `tests/test_integration_chat.py`
+- `tests/test_prompts.py`
+- `PRODUCTION-READINESS-PLAN.md`
+
+### Tests
+
+- `./.venv/bin/pytest -q` -> PASS (`278 passed`)
+- Former Phase 3 xfails -> PASS as normal tests:
+  - `test_local_fragmented_tool_call_is_one_call`
+  - `test_local_multiple_tool_calls_are_assembled_by_index`
+  - `test_tool_capability_probe_requires_real_tool_call`
+- `./.venv/bin/ruff check` on all changed Python files -> PASS
+- `./.venv/bin/ruff format --check` on all changed Python files -> PASS
+- `git diff --check` -> PASS
+
+### Frontend validation
+
+- `npm run typecheck` -> PASS
+- `npm run test` -> PASS (`8 tests`)
+- `npm run build` -> PASS
+- No frontend source files were changed.
+
+### Real validation
+
+- Installed Ollama catalogue inspected without downloading models.
+- `gemma3:4b` -> `notools`; identity recorded from Ollama tags.
+- `gemma4:e2b` -> `tools`; identity recorded from Ollama tags.
+- Real `gemma4:e2b` stream -> one structured `time_now` call, finish
+  `tool_calls`.
+- Real `gemma3:4b` stream -> no tool calls, finish `stop`.
+- Cloud MiniMax continuation after canonical local assistant/tool history ->
+  PASS (`stop`, no tool call, response `OK`). No real tool was executed.
+
+### Manual validation still required
+
+- Repeat the local/cloud sequence through the normal JARVIS UI if user-visible
+  transcript, TTS and model-selection behavior are needed; Phase 4 owns the
+  readiness/loading UI lifecycle.
+
+### New issues discovered
+
+- None within Phase 3. Full repository Ruff/format checks retain the existing
+  unrelated findings documented in the Phase 0/Phase 1 reports.
+
+### Remaining risks
+
+- Local model capability can still be `unknown` when Ollama is unreachable or
+  returns an ambiguous response; the bounded policy makes one native attempt
+  and never treats unknown as confirmed tools support.
+- Provider-specific Ollama behavior remains dependent on its installed API and
+  model build; the identity-aware cache will re-probe changed builds.
+
+### Ready for next phase
+
+YES for the Phase 3 code checkpoint. Stop here; do not start Phase 4.
 
 ---
 

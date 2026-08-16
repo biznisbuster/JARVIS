@@ -7,9 +7,10 @@ from typing import Any
 
 
 class FakeStreamResponse:
-    def __init__(self, lines: Iterable[str], *, status_code: int = 200) -> None:
+    def __init__(self, lines: Iterable[str], *, status_code: int = 200, body: bytes = b"") -> None:
         self._lines = list(lines)
         self.status_code = status_code
+        self._body = body
 
     async def __aenter__(self) -> FakeStreamResponse:
         return self
@@ -22,7 +23,7 @@ class FakeStreamResponse:
             yield line
 
     async def aread(self) -> bytes:
-        return b""
+        return self._body
 
 
 class FakeAsyncOllamaClient:

@@ -405,9 +405,10 @@ async def run_turn(
                 full_text = ""
                 tool_calls: list[dict[str, Any]] = []
                 finish_reason: str | None = None
-                async for kind, value in stream_clean(
-                    msgs, model=active_model, tools=tools_mod.all_schemas()
-                ):
+                model_tools = tools_mod.all_schemas()
+                if active_model and active_model.startswith("local:") and capability == "notools":
+                    model_tools = None
+                async for kind, value in stream_clean(msgs, model=active_model, tools=model_tools):
                     if kind == "delta":
                         full_text += value
                         SPEECH.feed(session.id, value)
@@ -472,9 +473,45 @@ async def _execute_tool(session: Session, tc: dict[str, Any], store: perm_mod.Pe
     raw_args = fn.get("arguments") or "{}"
     try:
         args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-    except json.JSONDecodeError:
-        args = {"_raw": raw_args}
+    except json.JSONDecodeError as exc:
+        call_id = tc.get("id") or uuid.uuid4().hex[:10]
+        result_text = json.dumps(
+            {
+                "ok": False,
+                "error_code": "INVALID_ARGUMENTS",
+                "error": f"invalid tool arguments JSON: {exc.msg}",
+            }
+        )
+        session.messages.append(
+            {"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text}
+        )
+        await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
+        return
+    if not isinstance(args, dict):
+        call_id = tc.get("id") or uuid.uuid4().hex[:10]
+        result_text = json.dumps(
+            {
+                "ok": False,
+                "error_code": "INVALID_ARGUMENTS",
+                "error": "tool arguments must be a JSON object",
+            }
+        )
+        session.messages.append(
+            {"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text}
+        )
+        await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
+        return
     call_id = tc.get("id") or uuid.uuid4().hex[:10]
+
+    if not name:
+        result_text = json.dumps(
+            {"ok": False, "error_code": "INVALID_ARGUMENTS", "error": "tool call is missing a function name"}
+        )
+        session.messages.append(
+            {"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text}
+        )
+        await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
+        return
 
     await BUS.publish(
         "tool_call",

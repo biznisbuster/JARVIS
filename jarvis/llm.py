@@ -24,6 +24,7 @@ import httpx
 
 from .bus import BUS
 from .config import SETTINGS
+from .tool_calls import ToolCallAccumulator
 
 _MAX_RETRIES = 2
 _RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
@@ -53,6 +54,8 @@ class AssistantMessage:
         out: dict[str, Any] = {"role": self.role, "content": self.content}
         if self.tool_calls:
             out["tool_calls"] = self.tool_calls
+        if self.finish_reason is not None:
+            out["finish_reason"] = self.finish_reason
         return out
 
 
@@ -98,7 +101,10 @@ class ChatStream:
         self._tools = tools
         self._temperature = temperature
         self._timeout = timeout
-        self._tool_slots: dict[int, dict[str, Any]] = {}
+        self._tool_accumulator = ToolCallAccumulator()
+        # Backwards-compatible diagnostic alias; assembly itself lives only
+        # in ToolCallAccumulator and is shared with the local provider.
+        self._tool_slots = self._tool_accumulator.slots
         self._assistant = AssistantMessage()
 
     @property
@@ -243,49 +249,10 @@ class ChatStream:
         return content
 
     def _absorb_tool_delta(self, tc: dict[str, Any]) -> None:
-        idx = tc.get("index", 0)
-        slot = self._tool_slots.setdefault(idx, {"id": None, "name": "", "arguments": ""})
-        if tc.get("id"):
-            slot["id"] = tc["id"]
-        fn = tc.get("function") or {}
-        name = fn.get("name") or ""
-        args = fn.get("arguments") or ""
-        # MiniMax streams fragments, then repeats the full call in the final
-        # chunk. Only append when the incoming piece is not already a suffix.
-        if name and not (slot["name"] and slot["name"].endswith(name)):
-            slot["name"] += name
-        if not args:
-            return
-        cur = slot["arguments"]
-        if not cur:
-            slot["arguments"] = args
-        elif cur.endswith(args):
-            pass
-        elif args.startswith(cur):
-            slot["arguments"] = args
-        else:
-            slot["arguments"] = cur + args
+        self._tool_accumulator.absorb(tc)
 
     def _finalize_tool_calls(self) -> None:
-        calls: list[dict[str, Any]] = []
-        for idx in sorted(self._tool_slots):
-            slot = self._tool_slots[idx]
-            raw = (slot.get("arguments") or "").strip()
-            try:
-                args = json.loads(raw) if raw else {}
-            except json.JSONDecodeError:
-                args = {"_raw": raw}
-            calls.append(
-                {
-                    "id": slot.get("id") or f"call_{idx}",
-                    "type": "function",
-                    "function": {
-                        "name": slot.get("name") or "",
-                        "arguments": json.dumps(args, ensure_ascii=False),
-                    },
-                }
-            )
-        self._assistant.tool_calls = calls
+        self._assistant.tool_calls = self._tool_accumulator.finalize()
 
 
 _THINKING_MARKER = re.compile(r"(?:^|\n)\s*response\s*(?=\n|$)")
@@ -447,4 +414,6 @@ class _LocalStreamAdapter:
                 yield "finish", value
             elif kind == "done":
                 self._assistant.tool_calls = value.get("tool_calls") or []
+                if value.get("finish_reason") is not None:
+                    self._assistant.finish_reason = str(value["finish_reason"])
                 yield "done", self._assistant.to_openai()

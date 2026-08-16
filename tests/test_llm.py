@@ -109,3 +109,20 @@ def test_absorb_tool_delta_arguments_appends_then_replaces_on_full() -> None:
     assert '"x"' in s._tool_slots[0]["arguments"]
     s._absorb_tool_delta({"index": 0, "function": {"arguments": '{"q": "x"}'}})
     assert s._tool_slots[0]["arguments"] == '{"q": "x"}'
+
+
+def test_cloud_finalizes_shared_tool_accumulator_into_one_call() -> None:
+    s = _new_stream()
+    s._absorb_tool_delta({"index": 0, "id": "call-0", "function": {"name": "rem", "arguments": '{"q":'}})
+    s._absorb_tool_delta({"index": 0, "function": {"name": "inders_create", "arguments": ' "x"}'}})
+    s._absorb_tool_delta({"index": 0, "function": {"name": "reminders_create", "arguments": '{"q": "x"}'}})
+
+    s._finalize_tool_calls()
+
+    assert s.assistant.tool_calls == [
+        {
+            "id": "call-0",
+            "type": "function",
+            "function": {"name": "reminders_create", "arguments": '{"q": "x"}'},
+        }
+    ]
