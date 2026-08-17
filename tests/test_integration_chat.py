@@ -23,6 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from jarvis import llm as llm_mod
+from jarvis import local_models
 from jarvis.agent import loop as agent_loop
 from jarvis.audio import player as player_mod
 from jarvis.audio import speech as speech_mod
@@ -254,6 +255,76 @@ async def test_tool_call_loop(store: PermissionStore, clean_sessions) -> None:
     assert tool_msg["tool_call_id"] == "call_t1"
     assert "iso" in json.loads(tool_msg["content"])
     assert sess.messages[3]["content"] == "Gotovo, alat je odgovorio."
+
+
+@pytest.mark.asyncio
+async def test_local_tool_loop_then_cloud_preserves_canonical_history(
+    store: PermissionStore,
+    clean_sessions,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadyToolsRunner:
+        def is_ready(self, model_id: str) -> bool:
+            return model_id == "fake:model"
+
+        async def capability_for_model(self, model_id: str) -> str:
+            return "tools"
+
+    monkeypatch.setattr(local_models, "RUNNER", ReadyToolsRunner())
+    captured: list[tuple[str | None, list[dict[str, Any]] | None, list[dict[str, Any]]]] = []
+
+    async def fake_stream_clean(
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ):
+        captured.append((model, tools, messages))
+        if len(captured) == 1:
+            yield "finish", "tool_calls"
+            yield (
+                "done",
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "local-call-1",
+                            "type": "function",
+                            "function": {"name": "time_now", "arguments": "{}"},
+                        }
+                    ],
+                    "finish_reason": "tool_calls",
+                },
+            )
+            return
+        yield "delta", "Gotovo."
+        yield "finish", "stop"
+        yield "done", {"role": "assistant", "content": "Gotovo.", "tool_calls": [], "finish_reason": "stop"}
+
+    monkeypatch.setattr(agent_loop, "stream_clean", fake_stream_clean)
+
+    sid = await agent_loop.chat("KOLIKO JE SAT?", model="local:fake:model", store=store)
+    await _wait_idle(sid)
+
+    sess = agent_loop.SESSIONS[sid]
+    assert [message["role"] for message in sess.messages] == ["user", "assistant", "tool", "assistant"]
+    assert sess.messages[1]["tool_calls"][0]["id"] == "local-call-1"
+    assert captured[0][0] == "local:fake:model"
+    assert captured[0][1]
+    assert any(message.get("role") == "tool" for message in captured[1][2])
+
+    await agent_loop.chat("Nastavi preko clouda", session_id=sid, store=store, model="fake-cloud")
+    await _wait_idle(sid)
+
+    assert captured[2][0] == "fake-cloud"
+    cloud_history = captured[2][2]
+    assert any(message.get("tool_calls") for message in cloud_history)
+    assert any(
+        message.get("role") == "tool" and message.get("tool_call_id") == "local-call-1"
+        for message in cloud_history
+    )
 
 
 @pytest.mark.asyncio

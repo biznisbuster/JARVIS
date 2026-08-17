@@ -22,21 +22,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
 from . import state_store
 from .bus import BUS
 from .config import SETTINGS
+from .tool_calls import ToolCallAccumulator
 
 _OLLAMA_BASE = "http://localhost:11434"
 _OLLAMA_OPENAI = f"{_OLLAMA_BASE}/v1"
 
 _DISCOVER_TTL = 5.0
 _CAPABILITIES_KEY = "local_model_capabilities"
+Capability = Literal["tools", "notools", "unknown"]
+_CAPABILITIES = frozenset({"tools", "notools", "unknown"})
 
 _PROBE_TOOL = {
     "type": "function",
@@ -46,6 +50,14 @@ _PROBE_TOOL = {
         "parameters": {"type": "object", "properties": {}},
     },
 }
+
+
+_TOOL_MECHANICS_RE = re.compile(
+    r"(?:\b(?:tool|function)[ _-]?call\b|[\"'](?:id|name|arguments|tool_calls)[\"']\s*:"
+    r"|\b(?:poziv|pozva\w*|pozovi\w*)\s+(?:alat|funkc\w*)"
+    r"|\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b)",
+    re.IGNORECASE,
+)
 
 
 def sanitize_history_for_notools(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -64,10 +76,13 @@ def sanitize_history_for_notools(messages: list[dict[str, Any]]) -> list[dict[st
             continue
         if role == "assistant" and m.get("tool_calls"):
             content = (m.get("content") or "").strip()
-            if content:
+            if content and not _TOOL_MECHANICS_RE.search(content):
                 out.append({"role": "assistant", "content": content})
             continue
-        out.append(m)
+        # Return a derived request-time history.  The canonical session
+        # history must retain its valid OpenAI tool-call groups for a later
+        # cloud-model turn.
+        out.append(dict(m))
     return out
 
 
@@ -145,7 +160,8 @@ class LocalModelRunner:
         self._loading_lock = asyncio.Lock()
         self._discover_cache: list[dict[str, Any]] | None = None
         self._discover_ts: float = 0.0
-        self._capabilities: dict[str, str] | None = None
+        self._capabilities: dict[str, dict[str, Any]] | None = None
+        self._tag_identities: dict[str, dict[str, Any]] = {}
         self._pulls: dict[str, asyncio.Task] = {}
         self._pull_progress: dict[str, dict[str, Any]] = {}
 
@@ -179,19 +195,120 @@ class LocalModelRunner:
                 return e
         return None
 
-    async def _capabilities_map(self) -> dict[str, str]:
-        """tag -> "tools" | "notools". Explicit .env flags win over probes."""
+    def _explicit_capability(self, tag: str) -> Capability | None:
+        """Return a configured override, if one exists for ``tag``."""
+
+        for entry in SETTINGS.local_models.entries:
+            if entry["tag"].lower() != tag.lower():
+                continue
+            flags = {f.strip().lower() for f in (entry.get("flags") or "").split(",") if f.strip()}
+            if "notools" in flags:
+                return "notools"
+            if "tools" in flags:
+                return "tools"
+        return None
+
+    @staticmethod
+    def _identity_from_tag_record(record: dict[str, Any]) -> dict[str, Any]:
+        """Keep only stable model identity fields exposed by Ollama."""
+
+        identity: dict[str, Any] = {}
+        for key in ("digest", "modified_at", "size"):
+            value = record.get(key)
+            if value is not None and value != "":
+                identity[key] = value
+        return identity
+
+    def _remember_tag_identities(self, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            tag = record.get("name") or record.get("model")
+            if isinstance(tag, str) and tag:
+                self._tag_identities[tag.lower()] = self._identity_from_tag_record(record)
+
+    @staticmethod
+    def _normalize_capability_cache(raw: Any) -> dict[str, dict[str, Any]]:
+        """Normalize both the Phase 0 string cache and the identity-aware form."""
+
+        if not isinstance(raw, dict):
+            return {}
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw_tag, raw_entry in raw.items():
+            if not isinstance(raw_tag, str):
+                continue
+            if isinstance(raw_entry, str) and raw_entry in _CAPABILITIES:
+                # Legacy entries have no identity and must be re-probed when
+                # a current Ollama identity is available.
+                normalized[raw_tag.lower()] = {"capability": raw_entry, "identity": None}
+                continue
+            if not isinstance(raw_entry, dict):
+                continue
+            capability = raw_entry.get("capability")
+            if capability not in _CAPABILITIES:
+                continue
+            identity = raw_entry.get("identity")
+            normalized[raw_tag.lower()] = {
+                "capability": capability,
+                "identity": dict(identity) if isinstance(identity, dict) else None,
+            }
+        return normalized
+
+    async def _load_capability_cache(self) -> None:
         if self._capabilities is None:
             cached = await state_store.get_state_value(_CAPABILITIES_KEY, {})
-            self._capabilities = cached if isinstance(cached, dict) else {}
-        merged: dict[str, str] = dict(self._capabilities)
-        for e in SETTINGS.local_models.entries:
-            flags = {f.strip() for f in (e.get("flags") or "").split(",") if f.strip()}
-            if "notools" in flags:
-                merged[e["tag"].lower()] = "notools"
-            elif "tools" in flags:
-                merged[e["tag"].lower()] = "tools"
+            self._capabilities = self._normalize_capability_cache(cached)
+
+    def _cache_entry_is_valid(self, tag: str, entry: dict[str, Any] | None) -> bool:
+        if entry is None or entry.get("identity") is None:
+            return False
+        current = self._tag_identities.get(tag.lower())
+        stored = entry.get("identity")
+        # A direct probe can legitimately run when /api/tags does not expose
+        # identity data.  Such an empty identity remains usable until Ollama
+        # later supplies real metadata, at which point it is invalidated.
+        if current is None:
+            return stored == {}
+        return stored == current
+
+    def _effective_capability(self, tag: str) -> Capability:
+        explicit = self._explicit_capability(tag)
+        if explicit is not None:
+            return explicit
+        if self._capabilities is None:
+            return "unknown"
+        raw_entry = self._capabilities.get(tag.lower())
+        if isinstance(raw_entry, str):  # defensive compatibility for tests/callers
+            return raw_entry if raw_entry in _CAPABILITIES else "unknown"
+        if not isinstance(raw_entry, dict) or not self._cache_entry_is_valid(tag, raw_entry):
+            return "unknown"
+        capability = raw_entry.get("capability")
+        return capability if capability in _CAPABILITIES else "unknown"
+
+    async def _capabilities_map(self) -> dict[str, Capability]:
+        """Return effective capabilities; explicit .env flags always win."""
+
+        await self._load_capability_cache()
+        merged: dict[str, Capability] = {
+            tag: self._effective_capability(tag) for tag in (self._capabilities or {})
+        }
+        for entry in SETTINGS.local_models.entries:
+            merged[entry["tag"].lower()] = self._effective_capability(entry["tag"])
         return merged
+
+    async def _capability_cache_valid(self, tag: str) -> bool:
+        await self._load_capability_cache()
+        entry = (self._capabilities or {}).get(tag.lower())
+        return bool(
+            isinstance(entry, dict)
+            and entry.get("capability") in {"tools", "notools"}
+            and self._cache_entry_is_valid(tag, entry)
+        )
+
+    async def _persist_capability(self, tag: str, capability: Capability) -> None:
+        await self._load_capability_cache()
+        identity = dict(self._tag_identities.get(tag.lower(), {}))
+        self._capabilities[tag.lower()] = {"capability": capability, "identity": identity}
+        await state_store.set_state_value(_CAPABILITIES_KEY, self._capabilities)
+        self.invalidate_discovery()
 
     async def discover(self, *, force: bool = False) -> list[dict[str, Any]]:
         """Every model Ollama has on disk, merged with .env overrides.
@@ -200,7 +317,7 @@ class LocalModelRunner:
         hammer the daemon. Each entry:
         ``{id, label, tag, n_ctx, keep_alive, size, modified_at, in_ram,
            ready, capability}`` where capability is ``"tools" | "notools" |
-           None`` (None = not probed yet).
+           "unknown"``.
         """
         now = time.monotonic()
         if not force and self._discover_cache is not None and now - self._discover_ts < _DISCOVER_TTL:
@@ -238,7 +355,7 @@ class LocalModelRunner:
                     "modified_at": m.get("modified_at") or "",
                     "in_ram": tag.lower() in {t.lower() for t in ps_tags},
                     "ready": self.is_ready(mid),
-                    "capability": caps.get(tag.lower()),
+                    "capability": caps.get(tag.lower(), "unknown"),
                 }
             )
         for e in SETTINGS.local_models.entries:
@@ -255,7 +372,7 @@ class LocalModelRunner:
                     "modified_at": "",
                     "in_ram": False,
                     "ready": self.is_ready(e["id"]),
-                    "capability": caps.get(e["tag"].lower()),
+                    "capability": caps.get(e["tag"].lower(), "unknown"),
                 }
             )
         self._discover_cache = out
@@ -277,7 +394,9 @@ class LocalModelRunner:
             except Exception:
                 return []
 
-        return await asyncio.to_thread(_do)
+        records = await asyncio.to_thread(_do)
+        self._remember_tag_identities(records)
+        return records
 
     # ---- status --------------------------------------------------------------
 
@@ -302,19 +421,25 @@ class LocalModelRunner:
     def is_ready(self, model_id: str) -> bool:
         return self._state == "ready" and self._loaded_id == model_id
 
-    def capability_for(self, tag: str) -> str | None:
-        if self._capabilities is None:
-            return None
-        return self._capabilities.get(tag.lower())
+    def capability_for(self, tag: str) -> Capability:
+        """Return ``tools``, ``notools`` or ``unknown`` for a model tag."""
 
-    async def capability_for_model(self, model_id: str) -> str | None:
-        """Capability ("tools" | "notools" | None) for a catalogue model id,
-        resolving .env flags and the persisted probe cache."""
+        return self._effective_capability(tag)
+
+    async def capability_for_model(self, model_id: str) -> Capability:
+        """Resolve a catalogue model's identity-aware capability."""
+
         entry = await self._resolve_entry(model_id)
         if entry is None:
-            return None
-        caps = await self._capabilities_map()
-        return caps.get(entry["tag"].lower())
+            return "unknown"
+        if self._explicit_capability(entry["tag"]) is not None:
+            return self._explicit_capability(entry["tag"]) or "unknown"
+        # Refresh the identity before trusting a persisted capability.  The
+        # caller is already asking about a local model, so this bounded tags
+        # request is the point where changed digests/modified_at are noticed.
+        await self._api_tags()
+        await self._capabilities_map()
+        return self.capability_for(entry["tag"])
 
     # ---- pulls (background, never block the server) --------------------------
 
@@ -396,39 +521,151 @@ class LocalModelRunner:
 
     # ---- capability probe ------------------------------------------------------
 
-    async def probe_tools(self, tag: str) -> bool | None:
-        """One short request with a tool schema. True = supports function
-        calling, False = rejects tools (HTTP 400), None = inconclusive."""
+    @staticmethod
+    def _probe_tool_calls(payload: Any) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        calls: list[dict[str, Any]] = []
 
-        def _do() -> bool | None:
+        def add(value: Any) -> None:
+            if isinstance(value, list):
+                calls.extend(call for call in value if isinstance(call, dict))
+
+        add(payload.get("tool_calls"))
+        message = payload.get("message")
+        if isinstance(message, dict):
+            add(message.get("tool_calls"))
+        for choice in payload.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            add(choice.get("tool_calls"))
+            choice_message = choice.get("message") or choice.get("delta")
+            if isinstance(choice_message, dict):
+                add(choice_message.get("tool_calls"))
+        return calls
+
+    @classmethod
+    def _probe_has_valid_tool_call(cls, payload: Any) -> bool:
+        for call in cls._probe_tool_calls(payload):
+            function = call.get("function") or {}
+            if not isinstance(function, dict) or function.get("name") != "time_now":
+                continue
+            arguments = function.get("arguments")
+            if arguments in (None, "") or isinstance(arguments, dict):
+                return True
+            if isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments) if arguments.strip() else {}
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    return True
+        return False
+
+    @staticmethod
+    def _probe_has_plain_text(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if isinstance(payload.get("response"), str) and payload["response"].strip():
+            return True
+        message = payload.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            return bool(message["content"].strip())
+        for choice in payload.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            for candidate in (choice.get("message"), choice.get("delta"), choice):
+                if isinstance(candidate, dict) and isinstance(candidate.get("content"), str):
+                    if candidate["content"].strip():
+                        return True
+        return False
+
+    @classmethod
+    def _classify_probe_response(cls, response: Any) -> Capability:
+        if response.status_code == 400:
+            text = str(getattr(response, "text", "")).lower()
+            if "does not support tools" in text or "function calling" in text:
+                return "notools"
+            return "unknown"
+        if response.status_code != 200:
+            return "unknown"
+        try:
+            payload = response.json()
+        except (AttributeError, TypeError, ValueError):
+            return "unknown"
+        if cls._probe_has_valid_tool_call(payload):
+            return "tools"
+        # A well-formed ordinary answer to a probe that explicitly required a
+        # call is positive evidence of a no-tools model, not tool support.
+        if cls._probe_has_plain_text(payload):
+            return "notools"
+        return "unknown"
+
+    @staticmethod
+    def _has_valid_runtime_tool_call(tool_calls: list[dict[str, Any]]) -> bool:
+        """Return whether runtime output is positive native-tool evidence.
+
+        The finalized public calls deliberately retain malformed arguments so
+        the agent execution boundary can reject them.  Capability promotion
+        needs the stricter semantic check: a named call whose arguments are
+        valid JSON representing an object.
+        """
+
+        for call in tool_calls:
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            arguments = function.get("arguments")
+            if isinstance(arguments, dict):
+                parsed = arguments
+            elif isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments)
+                except (TypeError, ValueError):
+                    continue
+            else:
+                continue
+            if isinstance(parsed, dict):
+                return True
+        return False
+
+    async def probe_tools(self, tag: str) -> Capability:
+        """Probe native tool calling and persist ``tools/notools/unknown``."""
+
+        explicit = self._explicit_capability(tag)
+        if explicit is not None:
+            return explicit
+
+        def _do() -> Capability:
             body = {
                 "model": tag,
-                "messages": [{"role": "user", "content": "Koliko je 2+2?"}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "You must answer by calling the provided time_now function. "
+                            "Do not answer in plain text."
+                        ),
+                    }
+                ],
                 "tools": [_PROBE_TOOL],
                 "stream": False,
                 "think": False,
+                "options": {"temperature": 0},
             }
             try:
                 with httpx.Client(timeout=120) as client:
                     r = client.post(f"{_OLLAMA_BASE}/api/chat", json=body)
             except Exception:
-                return None
-            if r.status_code == 400:
-                text = r.text.lower()
-                if "does not support tools" in text or "function calling" in text:
-                    return False
-                return None
-            if r.status_code == 200:
-                return True
-            return None
+                return "unknown"
+            return self._classify_probe_response(r)
 
         result = await asyncio.to_thread(_do)
-        if result is not None:
-            if self._capabilities is None:
-                cached = await state_store.get_state_value(_CAPABILITIES_KEY, {})
-                self._capabilities = cached if isinstance(cached, dict) else {}
-            self._capabilities[tag.lower()] = "tools" if result else "notools"
-            await state_store.set_state_value(_CAPABILITIES_KEY, self._capabilities)
+        await self._persist_capability(tag, result)
         return result
 
     # ---- lifecycle --------------------------------------------------------------
@@ -466,7 +703,7 @@ class LocalModelRunner:
                 loaded_tags = await self._ps_tags()
                 if tag.lower() not in {t.lower() for t in loaded_tags}:
                     raise RuntimeError(f"Ollama nije učitao {tag!r} posle warmup-a (učitano: {loaded_tags})")
-                if self.capability_for(tag) is None:
+                if self._explicit_capability(tag) is None and not await self._capability_cache_valid(tag):
                     await self.probe_tools(tag)
             except Exception as exc:  # noqa: BLE001
                 self._state = "error"
@@ -604,7 +841,7 @@ class LocalModelRunner:
         finish_reason: str | None = None
         text_buf: str = ""
         reasoning_buf: str = ""
-        tool_calls_out: list[dict[str, Any]] = []
+        tool_accumulator = ToolCallAccumulator()
         stripper = _ThinkTagStripper()
 
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -619,11 +856,15 @@ class LocalModelRunner:
                         if resp.status_code == 400 and use_tools:
                             peek = await resp.aread()
                             decoded = peek.decode(errors="replace")
-                            if "does not support tools" in decoded or "function calling" in decoded.lower():
+                            decoded_lower = decoded.lower()
+                            if (
+                                "does not support tools" in decoded_lower
+                                or "function calling" in decoded_lower
+                            ):
                                 use_tools = False
-                                if self._capabilities is not None:
-                                    self._capabilities[tag.lower()] = "notools"
-                                    await state_store.set_state_value(_CAPABILITIES_KEY, self._capabilities)
+                                await self._persist_capability(tag, "notools")
+                                messages = sanitize_history_for_notools(messages)
+                                body["messages"] = messages
                                 continue
                             raise RuntimeError(f"Ollama HTTP 400: {decoded[:500]}")
                         if resp.status_code >= 400:
@@ -658,21 +899,9 @@ class LocalModelRunner:
                                 if reasoning:
                                     reasoning_buf += reasoning
                                     yield "reasoning", reasoning
-                                for tc in delta.get("tool_calls") or []:
-                                    fn = tc.get("function") or {}
-                                    args = fn.get("arguments") or ""
-                                    if isinstance(args, dict):
-                                        args = json.dumps(args, ensure_ascii=False)
-                                    tool_calls_out.append(
-                                        {
-                                            "id": tc.get("id") or f"call_local_{len(tool_calls_out)}",
-                                            "type": "function",
-                                            "function": {
-                                                "name": fn.get("name") or "",
-                                                "arguments": args,
-                                            },
-                                        }
-                                    )
+                                for container in (delta, choice.get("message") or {}):
+                                    for tc in container.get("tool_calls") or []:
+                                        tool_accumulator.absorb(tc)
                             if "error" in evt and not finish_reason:
                                 raise RuntimeError(f"Ollama stream error: {evt.get('error')}")
                         break
@@ -683,6 +912,14 @@ class LocalModelRunner:
         if tail:
             text_buf += tail
             yield "delta", tail
+
+        tool_calls_out = tool_accumulator.finalize()
+        if use_tools and self._has_valid_runtime_tool_call(tool_calls_out):
+            # Keep the probe/cache identity consistent with the model
+            # currently loaded in Ollama.  Malformed or non-object arguments
+            # remain in the public calls for execution-boundary rejection but
+            # are not positive capability evidence.
+            await self._persist_capability(tag, "tools")
 
         done = {
             "role": "assistant",

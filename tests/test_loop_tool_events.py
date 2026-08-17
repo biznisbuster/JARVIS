@@ -56,3 +56,50 @@ async def test_tool_done_reflects_structured_tool_failure(monkeypatch: pytest.Mo
     assert done["degraded"] is True
     assert done["verification"] == "unavailable"
     assert done["error"] == "track transition could not be verified"
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_arguments_are_rejected_before_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    executed = False
+
+    async def execute(args: dict[str, object]) -> str:
+        nonlocal executed
+        executed = True
+        return "{}"
+
+    tool = ToolDef("fake_tool", "", {}, execute)
+    monkeypatch.setattr(loop.tools_mod, "get", lambda name: tool if name == tool.name else None)
+
+    session = loop.Session(id="session-1")
+    await loop._execute_tool(
+        session,
+        {"id": "call-1", "function": {"name": tool.name, "arguments": '{"broken"'}},
+        _AllowStore(),
+    )
+
+    assert executed is False
+    result = json.loads(session.messages[-1]["content"])
+    assert result["error_code"] == "INVALID_ARGUMENTS"
+
+
+@pytest.mark.asyncio
+async def test_empty_tool_name_is_rejected_before_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    looked_up = False
+
+    def get_tool(name: str) -> None:
+        nonlocal looked_up
+        looked_up = True
+        return None
+
+    monkeypatch.setattr(loop.tools_mod, "get", get_tool)
+
+    session = loop.Session(id="session-1")
+    await loop._execute_tool(
+        session,
+        {"id": "call-1", "function": {"name": "", "arguments": "{}"}},
+        _AllowStore(),
+    )
+
+    assert looked_up is False
+    result = json.loads(session.messages[-1]["content"])
+    assert result["error_code"] == "INVALID_ARGUMENTS"
