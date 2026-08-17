@@ -23,7 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from jarvis import llm as llm_mod
-from jarvis import local_models
+from jarvis import local_models, state_store
 from jarvis.agent import loop as agent_loop
 from jarvis.audio import player as player_mod
 from jarvis.audio import speech as speech_mod
@@ -325,6 +325,87 @@ async def test_local_tool_loop_then_cloud_preserves_canonical_history(
         message.get("role") == "tool" and message.get("tool_call_id") == "local-call-1"
         for message in cloud_history
     )
+
+
+@pytest.mark.asyncio
+async def test_local_not_ready_preflight_does_not_fallback_to_cloud(
+    store: PermissionStore,
+    clean_sessions,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NotReadyRunner:
+        def is_ready(self, model_id: str) -> bool:
+            return False
+
+    called = False
+
+    async def should_not_stream(*args: Any, **kwargs: Any):
+        nonlocal called
+        called = True
+        raise AssertionError("a not-ready local turn must not reach any model")
+        yield "done", {}
+
+    monkeypatch.setattr(local_models, "RUNNER", NotReadyRunner())
+    monkeypatch.setattr(agent_loop, "stream_clean", should_not_stream)
+
+    with pytest.raises(local_models.LocalModelNotReadyError):
+        await agent_loop.chat("ne šalji ovo", store=store, model="local:fake:model")
+
+    assert called is False
+    assert agent_loop.SESSIONS == {}
+
+
+@pytest.mark.asyncio
+async def test_runtime_local_failure_falls_back_without_changing_preference(
+    store: PermissionStore,
+    clean_sessions,
+    tmp_data_dir,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadyRunner:
+        def is_ready(self, model_id: str) -> bool:
+            return model_id == "fake:model"
+
+        async def capability_for_model(self, model_id: str) -> str:
+            return "tools"
+
+    calls: list[str | None] = []
+
+    async def fake_stream_clean(
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ):
+        calls.append(model)
+        if len(calls) == 1:
+            raise RuntimeError("local stream disconnected")
+        yield "delta", "cloud recovery"
+        yield "finish", "stop"
+        yield "done", {"role": "assistant", "content": "cloud recovery", "tool_calls": []}
+
+    monkeypatch.setattr(local_models, "RUNNER", ReadyRunner())
+    monkeypatch.setattr(agent_loop, "stream_clean", fake_stream_clean)
+    await state_store.set_state_value("ui", {"model": "local:fake:model"})
+
+    q = await BUS.subscribe()
+    sid = await agent_loop.chat("oprezno", store=store, model="local:fake:model")
+    await _wait_idle(sid)
+
+    events = []
+    while not q.empty():
+        events.append(json.loads(q.get_nowait()))
+    BUS.unsubscribe(q)
+
+    fallbacks = [event["payload"] for event in events if event["kind"] == "model_fallback"]
+    assert calls == ["local:fake:model", None]
+    assert len(fallbacks) == 1
+    assert fallbacks[0]["model"] == "local:fake:model"
+    assert fallbacks[0]["fallback_model"] == SETTINGS.llm.model
+    assert fallbacks[0]["stage"] == "runtime"
+    assert await state_store.get_state_value("ui") == {"model": "local:fake:model"}
+    assert agent_loop.SESSIONS[sid].messages[-1]["content"] == "cloud recovery"
 
 
 @pytest.mark.asyncio

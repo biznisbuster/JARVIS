@@ -116,14 +116,24 @@ async def api_chat(body: ChatIn) -> ChatOut:
     text = (body.text or "").strip()
     if not text:
         raise HTTPException(400, "text is required")
-    sid = await agent_loop.chat(
-        text,
-        session_id=body.session_id,
-        store=permission_store,
-        model=body.model,
-        interrupt=body.interrupt,
-        source=body.source,
-    )
+    try:
+        sid = await agent_loop.chat(
+            text,
+            session_id=body.session_id,
+            store=permission_store,
+            model=body.model,
+            interrupt=body.interrupt,
+            source=body.source,
+        )
+    except Exception as exc:
+        from .local_models import LocalModelNotReadyError
+
+        if isinstance(exc, LocalModelNotReadyError):
+            return JSONResponse(
+                {"ok": False, "error_code": exc.code, "error": str(exc)},
+                status_code=409,
+            )
+        raise
     return ChatOut(session_id=sid)
 
 
@@ -315,6 +325,10 @@ async def api_models() -> JSONResponse:
             "current": SETTINGS.llm.model,
             "small": SETTINGS.llm.small_model,
             "available": SETTINGS.llm.models + local,
+            # `current` above is the configured cloud default, not the
+            # frontend's confirmed execution selection. Local readiness is
+            # authoritative only in this runner snapshot.
+            "runner": await RUNNER.astatus(),
         }
     )
 
@@ -381,7 +395,19 @@ async def api_local_models_load(body: LocalModelIdIn) -> JSONResponse:
     try:
         status = await RUNNER.load(body.model_id)
     except Exception as exc:  # noqa: BLE001
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        from .local_models import LocalModelBusyError
+
+        error_code = exc.code if hasattr(exc, "code") else "EXECUTION_FAILED"
+        status_code = 409 if isinstance(exc, LocalModelBusyError) else 400
+        return JSONResponse(
+            {
+                "ok": False,
+                "error_code": error_code,
+                "error": str(exc),
+                "runner": await RUNNER.astatus(),
+            },
+            status_code=status_code,
+        )
     return JSONResponse({"ok": True, "runner": status})
 
 
@@ -389,7 +415,22 @@ async def api_local_models_load(body: LocalModelIdIn) -> JSONResponse:
 async def api_local_models_unload() -> JSONResponse:
     from .local_models import RUNNER
 
-    status = await RUNNER.unload()
+    try:
+        status = await RUNNER.unload()
+    except Exception as exc:  # noqa: BLE001
+        from .local_models import LocalModelBusyError
+
+        error_code = exc.code if hasattr(exc, "code") else "EXECUTION_FAILED"
+        status_code = 409 if isinstance(exc, LocalModelBusyError) else 500
+        return JSONResponse(
+            {
+                "ok": False,
+                "error_code": error_code,
+                "error": str(exc),
+                "runner": await RUNNER.astatus(),
+            },
+            status_code=status_code,
+        )
     return JSONResponse({"ok": True, "runner": status})
 
 

@@ -38,8 +38,11 @@ _OLLAMA_BASE = "http://localhost:11434"
 _OLLAMA_OPENAI = f"{_OLLAMA_BASE}/v1"
 
 _DISCOVER_TTL = 5.0
+_UNLOAD_VERIFY_TIMEOUT = 5.0
+_UNLOAD_VERIFY_INTERVAL = 0.1
 _CAPABILITIES_KEY = "local_model_capabilities"
 Capability = Literal["tools", "notools", "unknown"]
+RunnerState = Literal["idle", "loading", "ready", "error", "unloading"]
 _CAPABILITIES = frozenset({"tools", "notools", "unknown"})
 
 _PROBE_TOOL = {
@@ -149,14 +152,45 @@ class _ThinkTagStripper:
         return out
 
 
+class LocalModelError(RuntimeError):
+    """Base error for a local-model lifecycle or readiness failure."""
+
+    code = "EXECUTION_FAILED"
+
+
+class LocalModelNotReadyError(LocalModelError):
+    """The requested local model was not confirmed ready before generation."""
+
+    code = "NOT_READY"
+
+
+class LocalModelBusyError(LocalModelError):
+    """A lifecycle operation would interfere with an active local stream."""
+
+    code = "NOT_AVAILABLE"
+
+
 class LocalModelRunner:
-    """Auto-discovered catalogue + Ollama bridge (load/unload/stream/pull)."""
+    """Auto-discovered Ollama bridge with an explicit runner state machine.
+
+    ``loaded_id``/``loaded_tag`` are only populated after warmup and an Ollama
+    ``/api/ps`` check positively confirm residency. ``target_id``/
+    ``target_tag`` identify the model involved in a loading or unloading
+    transition and are never used as readiness evidence. Lifecycle operations
+    are serialized in request order by ``_loading_lock``; a later load waits
+    for an in-flight load and then performs its own verified transition. Local
+    generation increments ``active_streams`` before opening the provider
+    stream and decrements it in ``finally`` so unload cannot interrupt it.
+    """
 
     def __init__(self) -> None:
-        self._state: str = "idle"
+        self._state: RunnerState = "idle"
         self._loaded_id: str | None = None
         self._loaded_tag: str | None = None
+        self._target_id: str | None = None
+        self._target_tag: str | None = None
         self._load_error: str | None = None
+        self._active_streams = 0
         self._loading_lock = asyncio.Lock()
         self._discover_cache: list[dict[str, Any]] | None = None
         self._discover_ts: float = 0.0
@@ -400,23 +434,23 @@ class LocalModelRunner:
 
     # ---- status --------------------------------------------------------------
 
-    async def astatus(self) -> dict[str, Any]:
+    def _status_snapshot(self, *, engine_available: bool) -> dict[str, Any]:
         return {
-            "engine_available": await self.available_async(),
+            "engine_available": engine_available,
             "state": self._state,
             "loaded_id": self._loaded_id,
             "loaded_tag": self._loaded_tag,
+            "target_id": self._target_id,
+            "target_tag": self._target_tag,
             "error": self._load_error,
+            "active_streams": self._active_streams,
         }
 
+    async def astatus(self) -> dict[str, Any]:
+        return self._status_snapshot(engine_available=await self.available_async())
+
     def status(self) -> dict[str, Any]:
-        return {
-            "engine_available": self.available(),
-            "state": self._state,
-            "loaded_id": self._loaded_id,
-            "loaded_tag": self._loaded_tag,
-            "error": self._load_error,
-        }
+        return self._status_snapshot(engine_available=self.available())
 
     def is_ready(self, model_id: str) -> bool:
         return self._state == "ready" and self._loaded_id == model_id
@@ -684,15 +718,19 @@ class LocalModelRunner:
 
         async with self._loading_lock:
             if self._state == "ready" and self._loaded_id == model_id:
+                self._load_error = None
                 return await self.astatus()
-            if self._state == "loading":
-                raise RuntimeError("another local model load is already in progress")
+            if self._active_streams:
+                raise LocalModelBusyError("ne mogu da promenim lokalni model dok generacija traje")
+
+            previous_id = self._loaded_id if self._state == "ready" else None
+            previous_tag = self._loaded_tag if self._state == "ready" else None
 
             self._state = "loading"
             self._load_error = None
-            self._loaded_id = model_id
-            self._loaded_tag = tag
-            await BUS.publish("local_model_loading", {"id": model_id, "tag": tag})
+            self._target_id = model_id
+            self._target_tag = tag
+            await self._publish_lifecycle("local_model_loading", id=model_id, tag=tag)
             try:
                 if not await self._has_model(tag):
                     raise RuntimeError(
@@ -706,20 +744,67 @@ class LocalModelRunner:
                 if self._explicit_capability(tag) is None and not await self._capability_cache_valid(tag):
                     await self.probe_tools(tag)
             except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+                self._target_id = None
+                self._target_tag = None
+                if previous_id is not None and previous_tag is not None:
+                    previous_tags = await self._ps_tags()
+                    if previous_tag.lower() in {item.lower() for item in previous_tags}:
+                        self._state = "ready"
+                        self._loaded_id = previous_id
+                        self._loaded_tag = previous_tag
+                        self._load_error = error
+                        await self._publish_lifecycle(
+                            "local_model_error",
+                            id=model_id,
+                            tag=tag,
+                            failed_id=model_id,
+                            failed_tag=tag,
+                        )
+                        raise RuntimeError(f"failed to load {tag}: {exc}") from exc
                 self._state = "error"
-                self._load_error = str(exc)
+                self._load_error = error
                 self._loaded_id = None
                 self._loaded_tag = None
-                payload = await self.astatus()
-                await BUS.publish("local_model_error", payload)
+                await self._publish_lifecycle(
+                    "local_model_error",
+                    id=model_id,
+                    tag=tag,
+                    failed_id=model_id,
+                    failed_tag=tag,
+                )
                 raise RuntimeError(f"failed to load {tag}: {exc}") from exc
 
             self._state = "ready"
+            self._loaded_id = model_id
+            self._loaded_tag = tag
+            self._target_id = None
+            self._target_tag = None
+            self._load_error = None
             self.invalidate_discovery()
-            payload = await self.astatus()
-            payload["capability"] = self.capability_for(tag)
-            await BUS.publish("local_model_ready", payload)
-            return payload
+            return await self._publish_lifecycle(
+                "local_model_ready",
+                id=model_id,
+                tag=tag,
+                capability=self.capability_for(tag),
+            )
+
+    async def _publish_lifecycle(
+        self,
+        kind: str,
+        *,
+        id: str | None = None,
+        tag: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        payload = await self.astatus()
+        if id is not None:
+            payload["id"] = id
+        if tag is not None:
+            payload["tag"] = tag
+        payload.update(extra)
+        await BUS.publish(kind, payload)
+        return payload
 
     async def _resolve_entry(self, model_id: str) -> dict[str, Any] | None:
         for e in SETTINGS.local_models.entries:
@@ -743,19 +828,71 @@ class LocalModelRunner:
     async def unload(self) -> dict[str, Any]:
         """Tell Ollama to drop the loaded model immediately (`keep_alive=0`)."""
         async with self._loading_lock:
-            if self._loaded_tag is not None:
-                try:
-                    await self._unload_tag(self._loaded_tag)
-                except Exception:  # noqa: BLE001
-                    pass
+            if self._active_streams:
+                raise LocalModelBusyError("ne mogu da oslobodim lokalni model dok generacija traje")
+
+            model_id = self._loaded_id
+            tag = self._loaded_tag
+            if model_id is None or tag is None:
+                self._state = "idle"
+                self._target_id = None
+                self._target_tag = None
+                self._load_error = None
+                self.invalidate_discovery()
+                return await self._publish_lifecycle("local_model_unloaded")
+
+            self._state = "unloading"
+            self._target_id = model_id
+            self._target_tag = tag
+            await self._publish_lifecycle("local_model_unloading", id=model_id, tag=tag)
+            try:
+                await self._unload_tag(tag)
+                if not await self._wait_until_unloaded(tag):
+                    raise RuntimeError(f"Ollama i dalje drži {tag!r} u RAM-u posle unload-a")
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+                self._target_id = None
+                self._target_tag = None
+                resident_tags = await self._ps_tags()
+                if tag.lower() in {item.lower() for item in resident_tags}:
+                    self._state = "ready"
+                    self._loaded_id = model_id
+                    self._loaded_tag = tag
+                else:
+                    self._state = "error"
+                    self._loaded_id = None
+                    self._loaded_tag = None
+                self._load_error = error
+                await self._publish_lifecycle(
+                    "local_model_error",
+                    id=model_id,
+                    tag=tag,
+                    failed_id=model_id,
+                    failed_tag=tag,
+                )
+                raise RuntimeError(f"failed to unload {tag}: {exc}") from exc
+
             self._state = "idle"
             self._loaded_id = None
             self._loaded_tag = None
+            self._target_id = None
+            self._target_tag = None
             self._load_error = None
             self.invalidate_discovery()
-            payload = await self.astatus()
-            await BUS.publish("local_model_unloaded", payload)
-            return payload
+            return await self._publish_lifecycle("local_model_unloaded", id=model_id, tag=tag)
+
+    async def _wait_until_unloaded(self, tag: str) -> bool:
+        """Wait briefly for Ollama's asynchronous keep-alive eviction."""
+
+        deadline = time.monotonic() + _UNLOAD_VERIFY_TIMEOUT
+        while True:
+            loaded_tags = await self._ps_tags()
+            if tag.lower() not in {item.lower() for item in loaded_tags}:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_UNLOAD_VERIFY_INTERVAL, remaining))
 
     async def _warmup(self, tag: str, *, keep_alive: str) -> None:
         body = {"model": tag, "prompt": "hi", "stream": False, "keep_alive": keep_alive}
@@ -808,126 +945,131 @@ class LocalModelRunner:
         for reasoning models (Qwen3); a streaming stripper catches any
         ``<think>`` blocks that still leak into content.
         """
-        if not self.is_ready(model_id):
-            raise RuntimeError(f"lokalni model {model_id!r} nije učitan u RAM")
+        async with self._loading_lock:
+            if not self.is_ready(model_id):
+                raise LocalModelNotReadyError(f"lokalni model {model_id!r} nije spreman za chat")
+            self._active_streams += 1
 
-        entry = await self._resolve_entry(model_id)
-        if entry is None:
-            raise RuntimeError(f"lokalni model {model_id!r} više ne postoji u katalogu")
-        tag = entry["tag"]
-        keep_alive = entry.get("keep_alive") or "24h"
+        try:
+            entry = await self._resolve_entry(model_id)
+            if entry is None:
+                raise LocalModelNotReadyError(f"lokalni model {model_id!r} više ne postoji u katalogu")
+            tag = entry["tag"]
+            keep_alive = entry.get("keep_alive") or "24h"
 
-        capability = self.capability_for(tag)
-        if capability == "notools":
-            tools = None
-            messages = sanitize_history_for_notools(messages)
+            capability = self.capability_for(tag)
+            if capability == "notools":
+                tools = None
+                messages = sanitize_history_for_notools(messages)
 
-        body: dict[str, Any] = {
-            "model": tag,
-            "messages": messages,
-            "stream": True,
-            "keep_alive": keep_alive,
-            "think": False,
-        }
-        if tools:
-            body["tools"] = tools
-            body["tool_choice"] = "auto"
-        if temperature is not None:
-            body["temperature"] = float(temperature)
+            body: dict[str, Any] = {
+                "model": tag,
+                "messages": messages,
+                "stream": True,
+                "keep_alive": keep_alive,
+                "think": False,
+            }
+            if tools:
+                body["tools"] = tools
+                body["tool_choice"] = "auto"
+            if temperature is not None:
+                body["temperature"] = float(temperature)
 
-        url = f"{_OLLAMA_OPENAI}/chat/completions"
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+            url = f"{_OLLAMA_OPENAI}/chat/completions"
+            headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
 
-        finish_reason: str | None = None
-        text_buf: str = ""
-        reasoning_buf: str = ""
-        tool_accumulator = ToolCallAccumulator()
-        stripper = _ThinkTagStripper()
+            finish_reason: str | None = None
+            text_buf: str = ""
+            reasoning_buf: str = ""
+            tool_accumulator = ToolCallAccumulator()
+            stripper = _ThinkTagStripper()
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            try:
-                use_tools = bool(tools)
-                while True:
-                    body_now = dict(body)
-                    if not use_tools:
-                        body_now.pop("tools", None)
-                        body_now.pop("tool_choice", None)
-                    async with client.stream("POST", url, json=body_now, headers=headers) as resp:
-                        if resp.status_code == 400 and use_tools:
-                            peek = await resp.aread()
-                            decoded = peek.decode(errors="replace")
-                            decoded_lower = decoded.lower()
-                            if (
-                                "does not support tools" in decoded_lower
-                                or "function calling" in decoded_lower
-                            ):
-                                use_tools = False
-                                await self._persist_capability(tag, "notools")
-                                messages = sanitize_history_for_notools(messages)
-                                body["messages"] = messages
-                                continue
-                            raise RuntimeError(f"Ollama HTTP 400: {decoded[:500]}")
-                        if resp.status_code >= 400:
-                            text = await resp.aread()
-                            raise RuntimeError(
-                                f"Ollama HTTP {resp.status_code}: {text.decode(errors='replace')[:500]}"
-                            )
-                        async for raw in resp.aiter_lines():
-                            if not raw:
-                                continue
-                            if raw.startswith(":"):
-                                continue
-                            payload = raw[5:].strip() if raw.startswith("data:") else raw.strip()
-                            if not payload or payload == "[DONE]":
-                                continue
-                            try:
-                                evt = json.loads(payload)
-                            except json.JSONDecodeError:
-                                continue
-                            for choice in evt.get("choices") or []:
-                                delta = choice.get("delta") or {}
-                                if choice.get("finish_reason"):
-                                    finish_reason = str(choice["finish_reason"])
-                                    yield "finish", finish_reason
-                                content = delta.get("content") or ""
-                                reasoning = delta.get("reasoning") or ""
-                                if content:
-                                    clean = stripper.feed(content)
-                                    if clean:
-                                        text_buf += clean
-                                        yield "delta", clean
-                                if reasoning:
-                                    reasoning_buf += reasoning
-                                    yield "reasoning", reasoning
-                                for container in (delta, choice.get("message") or {}):
-                                    for tc in container.get("tool_calls") or []:
-                                        tool_accumulator.absorb(tc)
-                            if "error" in evt and not finish_reason:
-                                raise RuntimeError(f"Ollama stream error: {evt.get('error')}")
-                        break
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"Ollama network error: {exc}") from exc
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                try:
+                    use_tools = bool(tools)
+                    while True:
+                        body_now = dict(body)
+                        if not use_tools:
+                            body_now.pop("tools", None)
+                            body_now.pop("tool_choice", None)
+                        async with client.stream("POST", url, json=body_now, headers=headers) as resp:
+                            if resp.status_code == 400 and use_tools:
+                                peek = await resp.aread()
+                                decoded = peek.decode(errors="replace")
+                                decoded_lower = decoded.lower()
+                                if (
+                                    "does not support tools" in decoded_lower
+                                    or "function calling" in decoded_lower
+                                ):
+                                    use_tools = False
+                                    await self._persist_capability(tag, "notools")
+                                    messages = sanitize_history_for_notools(messages)
+                                    body["messages"] = messages
+                                    continue
+                                raise RuntimeError(f"Ollama HTTP 400: {decoded[:500]}")
+                            if resp.status_code >= 400:
+                                text = await resp.aread()
+                                raise RuntimeError(
+                                    f"Ollama HTTP {resp.status_code}: {text.decode(errors='replace')[:500]}"
+                                )
+                            async for raw in resp.aiter_lines():
+                                if not raw:
+                                    continue
+                                if raw.startswith(":"):
+                                    continue
+                                payload = raw[5:].strip() if raw.startswith("data:") else raw.strip()
+                                if not payload or payload == "[DONE]":
+                                    continue
+                                try:
+                                    evt = json.loads(payload)
+                                except json.JSONDecodeError:
+                                    continue
+                                for choice in evt.get("choices") or []:
+                                    delta = choice.get("delta") or {}
+                                    if choice.get("finish_reason"):
+                                        finish_reason = str(choice["finish_reason"])
+                                        yield "finish", finish_reason
+                                    content = delta.get("content") or ""
+                                    reasoning = delta.get("reasoning") or ""
+                                    if content:
+                                        clean = stripper.feed(content)
+                                        if clean:
+                                            text_buf += clean
+                                            yield "delta", clean
+                                    if reasoning:
+                                        reasoning_buf += reasoning
+                                        yield "reasoning", reasoning
+                                    for container in (delta, choice.get("message") or {}):
+                                        for tc in container.get("tool_calls") or []:
+                                            tool_accumulator.absorb(tc)
+                                if "error" in evt and not finish_reason:
+                                    raise RuntimeError(f"Ollama stream error: {evt.get('error')}")
+                            break
+                except httpx.HTTPError as exc:
+                    raise RuntimeError(f"Ollama network error: {exc}") from exc
 
-        tail = stripper.drain()
-        if tail:
-            text_buf += tail
-            yield "delta", tail
+            tail = stripper.drain()
+            if tail:
+                text_buf += tail
+                yield "delta", tail
 
-        tool_calls_out = tool_accumulator.finalize()
-        if use_tools and self._has_valid_runtime_tool_call(tool_calls_out):
-            # Keep the probe/cache identity consistent with the model
-            # currently loaded in Ollama.  Malformed or non-object arguments
-            # remain in the public calls for execution-boundary rejection but
-            # are not positive capability evidence.
-            await self._persist_capability(tag, "tools")
+            tool_calls_out = tool_accumulator.finalize()
+            if use_tools and self._has_valid_runtime_tool_call(tool_calls_out):
+                # Keep the probe/cache identity consistent with the model
+                # currently loaded in Ollama.  Malformed or non-object arguments
+                # remain in the public calls for execution-boundary rejection but
+                # are not positive capability evidence.
+                await self._persist_capability(tag, "tools")
 
-        done = {
-            "role": "assistant",
-            "content": text_buf,
-            "tool_calls": tool_calls_out,
-            "finish_reason": finish_reason,
-        }
-        yield "done", done
+            done = {
+                "role": "assistant",
+                "content": text_buf,
+                "tool_calls": tool_calls_out,
+                "finish_reason": finish_reason,
+            }
+            yield "done", done
+        finally:
+            self._active_streams -= 1
 
 
 RUNNER = LocalModelRunner()

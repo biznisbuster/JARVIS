@@ -24,7 +24,12 @@ export interface AppState {
   ttsEnabled: boolean;
   lastAssistantFinal: string;
   models: ModelInfo[];
+  /** Confirmed backend-safe execution model; never a merely requested local model. */
   currentModel: string;
+  /** User's latest local selection while the runner is transitioning. */
+  pendingModel: string | null;
+  /** Visible error from the latest model selection transition. */
+  modelLoadError: string | null;
   voices: VoicesPayload | null;
   listenReasons: string[];
   recording: boolean;
@@ -59,9 +64,13 @@ export interface PttState {
 
 export interface LocalRunner {
   engine_available: boolean;
-  state: string;
+  state: 'idle' | 'loading' | 'ready' | 'error' | 'unloading';
   loaded_id: string | null;
+  loaded_tag?: string | null;
+  target_id?: string | null;
+  target_tag?: string | null;
   error: string | null;
+  active_streams?: number;
 }
 
 export interface LocalModel {
@@ -70,7 +79,7 @@ export interface LocalModel {
   n_ctx: number;
   keep_alive: string;
   size: number;
-  capability?: 'tools' | 'notools' | null;
+  capability?: 'tools' | 'notools' | 'unknown';
   in_ram?: boolean;
 }
 
@@ -97,6 +106,8 @@ class Store {
     lastAssistantFinal: '',
     models: [],
     currentModel: '',
+    pendingModel: null,
+    modelLoadError: null,
     voices: null,
     listenReasons: [],
     recording: false,

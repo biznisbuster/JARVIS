@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 from collections.abc import Iterable
@@ -33,6 +34,410 @@ def _ready_runner() -> local_models.LocalModelRunner:
     runner._loaded_id = "fake:model"
     runner._loaded_tag = "fake:model"
     return runner
+
+
+def _patch_lifecycle_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: local_models.LocalModelRunner,
+    *,
+    ps_tags: list[str] | None = None,
+    warmup=None,
+) -> None:
+    async def available() -> bool:
+        return True
+
+    async def has_model(_tag: str) -> bool:
+        return True
+
+    async def fake_warmup(tag: str, *, keep_alive: str) -> None:
+        if warmup is not None:
+            await warmup(tag, keep_alive=keep_alive)
+
+    async def fake_ps_tags() -> list[str]:
+        return list(ps_tags or [])
+
+    async def fake_probe(_tag: str) -> str:
+        return "tools"
+
+    monkeypatch.setattr(runner, "available_async", available)
+    monkeypatch.setattr(runner, "_has_model", has_model)
+    monkeypatch.setattr(runner, "_warmup", fake_warmup)
+    monkeypatch.setattr(runner, "_ps_tags", fake_ps_tags)
+    monkeypatch.setattr(runner, "probe_tools", fake_probe)
+
+
+@pytest.mark.asyncio
+async def test_loading_snapshot_keeps_loaded_id_confirmed_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = local_models.LocalModelRunner()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def warmup(_tag: str, *, keep_alive: str) -> None:
+        started.set()
+        await release.wait()
+
+    _patch_lifecycle_fakes(monkeypatch, runner, ps_tags=["fake:model"], warmup=warmup)
+
+    task = asyncio.create_task(runner.load("fake:model"))
+    await started.wait()
+
+    loading = await runner.astatus()
+    assert loading["state"] == "loading"
+    assert loading["loaded_id"] is None
+    assert loading["loaded_tag"] is None
+    assert loading["target_id"] == "fake:model"
+    assert loading["target_tag"] == "fake:model"
+    assert not runner.is_ready("fake:model")
+
+    release.set()
+    ready = await task
+    assert ready["state"] == "ready"
+    assert ready["loaded_id"] == "fake:model"
+    assert ready["loaded_tag"] == "fake:model"
+    assert ready["target_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_same_ready_model_load_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _ready_runner()
+    warmups = 0
+
+    async def warmup(_tag: str, *, keep_alive: str) -> None:
+        nonlocal warmups
+        warmups += 1
+
+    _patch_lifecycle_fakes(monkeypatch, runner, ps_tags=["fake:model"], warmup=warmup)
+
+    result = await runner.load("fake:model")
+
+    assert result["state"] == "ready"
+    assert result["loaded_id"] == "fake:model"
+    assert warmups == 0
+
+
+@pytest.mark.asyncio
+async def test_load_failure_restores_previous_ready_model_when_still_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = local_models.LocalModelRunner()
+    runner._state = "ready"
+    runner._loaded_id = "old:model"
+    runner._loaded_tag = "old:model"
+
+    async def available() -> bool:
+        return True
+
+    async def has_model(_tag: str) -> bool:
+        return True
+
+    async def warmup(_tag: str, *, keep_alive: str) -> None:
+        raise RuntimeError("warmup failed")
+
+    async def ps_tags() -> list[str]:
+        return ["old:model"]
+
+    monkeypatch.setattr(runner, "available_async", available)
+    monkeypatch.setattr(runner, "_has_model", has_model)
+    monkeypatch.setattr(runner, "_warmup", warmup)
+    monkeypatch.setattr(runner, "_ps_tags", ps_tags)
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        await runner.load("new:model")
+
+    status = await runner.astatus()
+    assert status["state"] == "ready"
+    assert status["loaded_id"] == "old:model"
+    assert status["target_id"] is None
+    assert status["error"] == "warmup failed"
+    assert runner.is_ready("old:model")
+    assert not runner.is_ready("new:model")
+
+
+@pytest.mark.asyncio
+async def test_load_failure_without_previous_model_enters_error_and_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = local_models.LocalModelRunner()
+
+    async def available() -> bool:
+        return True
+
+    async def has_model(_tag: str) -> bool:
+        return True
+
+    async def warmup(_tag: str, *, keep_alive: str) -> None:
+        raise RuntimeError("missing resident model")
+
+    async def ps_tags() -> list[str]:
+        return []
+
+    monkeypatch.setattr(runner, "available_async", available)
+    monkeypatch.setattr(runner, "_has_model", has_model)
+    monkeypatch.setattr(runner, "_warmup", warmup)
+    monkeypatch.setattr(runner, "_ps_tags", ps_tags)
+
+    with pytest.raises(RuntimeError, match="missing resident model"):
+        await runner.load("fake:model")
+
+    status = await runner.astatus()
+    assert status["state"] == "error"
+    assert status["loaded_id"] is None
+    assert status["target_id"] is None
+    assert not runner.is_ready("fake:model")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_loads_are_serialized_and_last_completed_request_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = local_models.LocalModelRunner()
+    warmups: list[str] = []
+
+    async def warmup(tag: str, *, keep_alive: str) -> None:
+        warmups.append(tag)
+        await asyncio.sleep(0)
+
+    _patch_lifecycle_fakes(monkeypatch, runner, ps_tags=["a:model", "b:model"], warmup=warmup)
+
+    first, second = await asyncio.gather(
+        runner.load("a:model"),
+        runner.load("b:model"),
+    )
+
+    assert [first["loaded_id"], second["loaded_id"]] == ["a:model", "b:model"]
+    assert warmups == ["a:model", "b:model"]
+    assert (await runner.astatus())["loaded_id"] == "b:model"
+
+
+@pytest.mark.asyncio
+async def test_same_model_concurrent_load_does_not_duplicate_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = local_models.LocalModelRunner()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    warmups = 0
+
+    async def warmup(_tag: str, *, keep_alive: str) -> None:
+        nonlocal warmups
+        warmups += 1
+        started.set()
+        await release.wait()
+
+    _patch_lifecycle_fakes(monkeypatch, runner, ps_tags=["fake:model"], warmup=warmup)
+
+    first = asyncio.create_task(runner.load("fake:model"))
+    await started.wait()
+    second = asyncio.create_task(runner.load("fake:model"))
+    await asyncio.sleep(0)
+    assert not second.done()
+
+    release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result["loaded_id"] == second_result["loaded_id"] == "fake:model"
+    assert warmups == 1
+
+
+@pytest.mark.asyncio
+async def test_unload_reports_unloading_and_then_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _ready_runner()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def available() -> bool:
+        return True
+
+    async def unload_tag(_tag: str) -> None:
+        started.set()
+        await release.wait()
+
+    async def ps_tags() -> list[str]:
+        return []
+
+    monkeypatch.setattr(runner, "available_async", available)
+    monkeypatch.setattr(runner, "_unload_tag", unload_tag)
+    monkeypatch.setattr(runner, "_ps_tags", ps_tags)
+
+    task = asyncio.create_task(runner.unload())
+    await started.wait()
+
+    unloading = await runner.astatus()
+    assert unloading["state"] == "unloading"
+    assert unloading["loaded_id"] == "fake:model"
+    assert unloading["target_id"] == "fake:model"
+    assert not runner.is_ready("fake:model")
+
+    release.set()
+    idle = await task
+    assert idle["state"] == "idle"
+    assert idle["loaded_id"] is None
+    assert idle["target_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_unload_waits_for_delayed_residency_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _ready_runner()
+    checks = 0
+
+    async def available() -> bool:
+        return True
+
+    async def unload_tag(_tag: str) -> None:
+        return None
+
+    async def ps_tags() -> list[str]:
+        nonlocal checks
+        checks += 1
+        return ["fake:model"] if checks < 3 else []
+
+    monkeypatch.setattr(runner, "available_async", available)
+    monkeypatch.setattr(runner, "_unload_tag", unload_tag)
+    monkeypatch.setattr(runner, "_ps_tags", ps_tags)
+
+    result = await runner.unload()
+
+    assert result["state"] == "idle"
+    assert checks == 3
+
+
+@pytest.mark.asyncio
+async def test_unload_failure_does_not_claim_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _ready_runner()
+
+    async def available() -> bool:
+        return True
+
+    async def unload_tag(_tag: str) -> None:
+        raise RuntimeError("unload failed")
+
+    async def ps_tags() -> list[str]:
+        return ["fake:model"]
+
+    monkeypatch.setattr(runner, "available_async", available)
+    monkeypatch.setattr(runner, "_unload_tag", unload_tag)
+    monkeypatch.setattr(runner, "_ps_tags", ps_tags)
+
+    with pytest.raises(RuntimeError, match="unload failed"):
+        await runner.unload()
+
+    status = await runner.astatus()
+    assert status["state"] == "ready"
+    assert status["loaded_id"] == "fake:model"
+    assert status["error"] == "unload failed"
+
+
+@pytest.mark.asyncio
+async def test_unload_rejects_active_local_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _ready_runner()
+    runner._active_streams = 1
+    unload_called = False
+
+    async def unload_tag(_tag: str) -> None:
+        nonlocal unload_called
+        unload_called = True
+
+    monkeypatch.setattr(runner, "_unload_tag", unload_tag)
+
+    with pytest.raises(local_models.LocalModelBusyError):
+        await runner.unload()
+
+    assert unload_called is False
+    assert (await runner.astatus())["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_active_stream_count_returns_to_zero_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _ready_runner()
+    client = FakeAsyncOllamaClient(
+        _sse([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}])
+    )
+    monkeypatch.setattr(local_models.httpx, "AsyncClient", lambda **kwargs: client)
+
+    events = [event async for event in runner.stream_chat("fake:model", [{"role": "user", "content": "hi"}])]
+
+    assert next(value for kind, value in events if kind == "done")["content"] == "ok"
+    assert runner._active_streams == 0
+
+
+@pytest.mark.asyncio
+async def test_active_stream_count_returns_to_zero_after_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _ready_runner()
+
+    class FailingResponse:
+        status_code = 500
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def aread(self) -> bytes:
+            return b"boom"
+
+    class FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def stream(self, method: str, url: str, **kwargs: Any) -> FailingResponse:
+            return FailingResponse()
+
+    client = FailingClient()
+    monkeypatch.setattr(local_models.httpx, "AsyncClient", lambda **kwargs: client)
+
+    with pytest.raises(RuntimeError, match="Ollama HTTP 500"):
+        _ = [event async for event in runner.stream_chat("fake:model", [{"role": "user", "content": "hi"}])]
+
+    assert runner._active_streams == 0
+
+
+@pytest.mark.asyncio
+async def test_active_stream_count_returns_to_zero_after_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _ready_runner()
+    entered = asyncio.Event()
+
+    class BlockingResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def aiter_lines(self):
+            entered.set()
+            await asyncio.Event().wait()
+            yield ""
+
+    class BlockingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def stream(self, method: str, url: str, **kwargs: Any) -> BlockingResponse:
+            return BlockingResponse()
+
+    monkeypatch.setattr(local_models.httpx, "AsyncClient", lambda **kwargs: BlockingClient())
+
+    async def consume() -> None:
+        async for _event in runner.stream_chat("fake:model", [{"role": "user", "content": "hi"}]):
+            pass
+
+    task = asyncio.create_task(consume())
+    await entered.wait()
+    assert runner._active_streams == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runner._active_streams == 0
 
 
 async def _run_runtime_tool_calls(
