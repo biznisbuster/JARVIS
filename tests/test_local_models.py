@@ -35,6 +35,39 @@ def _ready_runner() -> local_models.LocalModelRunner:
     return runner
 
 
+async def _run_runtime_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    *tool_calls: dict[str, Any],
+) -> tuple[local_models.LocalModelRunner, list[tuple[str, Any]], dict[str, Any]]:
+    runner = _ready_runner()
+    persisted: dict[str, Any] = {}
+
+    async def fake_set_state(key: str, value: object) -> None:
+        persisted[key] = value
+
+    monkeypatch.setattr(local_models.state_store, "get_state_value", _empty_state)
+    monkeypatch.setattr(local_models.state_store, "set_state_value", fake_set_state)
+    client = FakeAsyncOllamaClient(
+        _sse(
+            [
+                _choice_tool(*tool_calls),
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            ]
+        )
+    )
+    monkeypatch.setattr(local_models.httpx, "AsyncClient", lambda **kwargs: client)
+
+    events = [
+        event
+        async for event in runner.stream_chat(
+            "fake:model",
+            [{"role": "user", "content": "call a tool"}],
+            tools=[{"type": "function", "function": {"name": "time_now"}}],
+        )
+    ]
+    return runner, events, persisted
+
+
 async def test_local_fragmented_tool_call_is_one_call(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _ready_runner()
     lines = _sse(
@@ -382,3 +415,84 @@ async def test_runtime_tool_rejection_retries_once_with_sanitized_history(
     assert all(message["role"] != "tool" for message in second_body["messages"])
     assert all("tool_calls" not in message for message in second_body["messages"])
     assert next(value for kind, value in events if kind == "done")["tool_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_runtime_call_is_preserved_but_not_capability_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, events, persisted = await _run_runtime_tool_calls(
+        monkeypatch,
+        {
+            "index": 0,
+            "id": "call-bad",
+            "function": {"name": "time_now", "arguments": '{"broken"'},
+        },
+    )
+
+    done = next(value for kind, value in events if kind == "done")
+    assert done["tool_calls"][0]["function"]["arguments"] == '{"broken"'
+    assert runner.capability_for("fake:model") == "unknown"
+    assert "local_model_capabilities" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_non_object_runtime_arguments_are_not_capability_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, events, persisted = await _run_runtime_tool_calls(
+        monkeypatch,
+        {
+            "index": 0,
+            "id": "call-list",
+            "function": {"name": "time_now", "arguments": "[]"},
+        },
+    )
+
+    done = next(value for kind, value in events if kind == "done")
+    assert done["tool_calls"][0]["function"]["arguments"] == "[]"
+    assert runner.capability_for("fake:model") == "unknown"
+    assert "local_model_capabilities" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_valid_runtime_call_persists_tools_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner, events, persisted = await _run_runtime_tool_calls(
+        monkeypatch,
+        {
+            "index": 0,
+            "id": "call-valid",
+            "function": {"name": "time_now", "arguments": "{}"},
+        },
+    )
+
+    done = next(value for kind, value in events if kind == "done")
+    assert done["tool_calls"][0]["function"] == {"name": "time_now", "arguments": "{}"}
+    assert runner.capability_for("fake:model") == "tools"
+    assert persisted["local_model_capabilities"]["fake:model"]["capability"] == "tools"
+
+
+@pytest.mark.asyncio
+async def test_valid_runtime_call_outweighs_malformed_call_for_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, events, persisted = await _run_runtime_tool_calls(
+        monkeypatch,
+        {
+            "index": 0,
+            "id": "call-bad",
+            "function": {"name": "time_now", "arguments": '{"broken"'},
+        },
+        {
+            "index": 1,
+            "id": "call-valid",
+            "function": {"name": "time_now", "arguments": "{}"},
+        },
+    )
+
+    done = next(value for kind, value in events if kind == "done")
+    assert len(done["tool_calls"]) == 2
+    assert done["tool_calls"][0]["function"]["arguments"] == '{"broken"'
+    assert done["tool_calls"][1]["function"]["arguments"] == "{}"
+    assert runner.capability_for("fake:model") == "tools"
+    assert persisted["local_model_capabilities"]["fake:model"]["capability"] == "tools"

@@ -601,6 +601,38 @@ class LocalModelRunner:
             return "notools"
         return "unknown"
 
+    @staticmethod
+    def _has_valid_runtime_tool_call(tool_calls: list[dict[str, Any]]) -> bool:
+        """Return whether runtime output is positive native-tool evidence.
+
+        The finalized public calls deliberately retain malformed arguments so
+        the agent execution boundary can reject them.  Capability promotion
+        needs the stricter semantic check: a named call whose arguments are
+        valid JSON representing an object.
+        """
+
+        for call in tool_calls:
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            arguments = function.get("arguments")
+            if isinstance(arguments, dict):
+                parsed = arguments
+            elif isinstance(arguments, str):
+                try:
+                    parsed = json.loads(arguments)
+                except (TypeError, ValueError):
+                    continue
+            else:
+                continue
+            if isinstance(parsed, dict):
+                return True
+        return False
+
     async def probe_tools(self, tag: str) -> Capability:
         """Probe native tool calling and persist ``tools/notools/unknown``."""
 
@@ -882,10 +914,11 @@ class LocalModelRunner:
             yield "delta", tail
 
         tool_calls_out = tool_accumulator.finalize()
-        if use_tools and tool_calls_out:
-            # A valid structured call is positive runtime evidence that the
-            # model supports native tools.  Keep the probe/cache identity
-            # consistent with the model currently loaded in Ollama.
+        if use_tools and self._has_valid_runtime_tool_call(tool_calls_out):
+            # Keep the probe/cache identity consistent with the model
+            # currently loaded in Ollama.  Malformed or non-object arguments
+            # remain in the public calls for execution-boundary rejection but
+            # are not positive capability evidence.
             await self._persist_capability(tag, "tools")
 
         done = {
