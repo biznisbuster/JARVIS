@@ -13,8 +13,41 @@ interface LocalModelsPayload {
 interface LocalLoadPayload {
   ok: boolean;
   error?: string;
+  detail?: string;
   error_code?: string;
   runner?: LocalRunner;
+}
+
+interface LocalLoadSuccess extends LocalLoadPayload {
+  ok: true;
+  runner: LocalRunner;
+}
+
+type LocalLoadFailure = Error & { payload?: LocalLoadPayload };
+
+function localLoadFailure(payload: LocalLoadPayload, status: number): LocalLoadFailure {
+  const message = payload.error || payload.detail || `HTTP ${status}`;
+  const error = new Error(String(message)) as LocalLoadFailure;
+  error.payload = payload;
+  return error;
+}
+
+async function postLocalModelLoad(modelId: string): Promise<LocalLoadSuccess> {
+  const response = await fetch('/api/local_models/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model_id: modelId }),
+  });
+  const payload = (await response.json().catch(() => ({}))) as LocalLoadPayload;
+  if (!response.ok || payload.ok !== true || !payload.runner) {
+    throw localLoadFailure(payload, response.status);
+  }
+  return payload as LocalLoadSuccess;
+}
+
+function localLoadFailureRunner(error: unknown): LocalRunner | null {
+  if (!error || typeof error !== 'object') return null;
+  return ((error as LocalLoadFailure).payload?.runner as LocalRunner | undefined) || null;
 }
 
 let modelSelectionGeneration = 0;
@@ -154,12 +187,7 @@ export async function loadPersistedUI(): Promise<string | null> {
 
 export async function ensureLocalLoaded(modelId: string, generation?: number): Promise<LocalRunner> {
   store.addTool(`… učitavam lokalni model ${modelId} u RAM`);
-  const data = await jpost<LocalLoadPayload>('/api/local_models/load', {
-    model_id: modelId,
-  });
-  if (!data.ok || !data.runner) {
-    throw new Error(data.error || 'lokalni model nije spreman');
-  }
+  const data = await postLocalModelLoad(modelId);
   if (generation === undefined || generation === modelSelectionGeneration) {
     store.set({ localRunner: data.runner });
   }
@@ -215,8 +243,14 @@ export async function bootModels(): Promise<void> {
       store.set({ currentModel: desired, pendingModel: null, modelLoadError: null, localRunner: loaded });
     } catch (e) {
       if (generation !== modelSelectionGeneration) return;
-      store.set({ pendingModel: null, modelLoadError: (e as Error).message });
-      store.addTool(`⚠ lokalni model: ${(e as Error).message}`);
+      const message = e instanceof Error ? e.message : String(e);
+      const failureRunner = localLoadFailureRunner(e);
+      store.set({
+        pendingModel: null,
+        modelLoadError: message,
+        ...(failureRunner ? { localRunner: failureRunner } : {}),
+      });
+      store.addTool(`⚠ lokalni model: ${message}`);
     }
   } catch (e) {
     store.addTool(`⚠ modeli: ${(e as Error).message}`);
@@ -244,9 +278,12 @@ export async function onModelChange(id: string): Promise<void> {
     return;
   }
 
+  const confirmedBeforeTransition = store.state.currentModel;
   const localId = id.slice('local:'.length);
   const safeCloud = store.state.models.find((model) => !model.id.startsWith('local:'))?.id || '';
-  const confirmedCurrent = store.state.currentModel.startsWith('local:') ? safeCloud : store.state.currentModel;
+  const confirmedCurrent = confirmedBeforeTransition.startsWith('local:')
+    ? safeCloud
+    : confirmedBeforeTransition;
   store.set({
     currentModel: confirmedCurrent,
     pendingModel: id,
@@ -263,8 +300,20 @@ export async function onModelChange(id: string): Promise<void> {
     store.set({ currentModel: id, pendingModel: null, modelLoadError: null, localRunner: runner });
   } catch (e) {
     if (generation !== modelSelectionGeneration) return;
-    store.set({ pendingModel: null, modelLoadError: (e as Error).message });
-    store.addTool(`⚠ lokalni model: ${(e as Error).message}`);
+    const message = e instanceof Error ? e.message : String(e);
+    const failureRunner = localLoadFailureRunner(e);
+    const previousLocalId = confirmedBeforeTransition.startsWith('local:')
+      ? confirmedBeforeTransition.slice('local:'.length)
+      : null;
+    const canRestorePrevious =
+      !!previousLocalId && failureRunner?.state === 'ready' && failureRunner.loaded_id === previousLocalId;
+    store.set({
+      currentModel: canRestorePrevious ? confirmedBeforeTransition : confirmedCurrent,
+      pendingModel: null,
+      modelLoadError: message,
+      ...(failureRunner ? { localRunner: failureRunner } : {}),
+    });
+    store.addTool(`⚠ lokalni model: ${message}`);
   }
 }
 

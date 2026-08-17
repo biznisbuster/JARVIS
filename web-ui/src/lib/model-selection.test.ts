@@ -18,6 +18,19 @@ function readyRunner(id: string) {
   };
 }
 
+function errorRunner() {
+  return {
+    engine_available: true,
+    state: 'error' as const,
+    loaded_id: null,
+    loaded_tag: null,
+    target_id: 'model-b',
+    target_tag: 'model-b',
+    error: 'model B nije spreman',
+    active_streams: 0,
+  };
+}
+
 function resetStore(): void {
   store.clearTranscript();
   store.set({
@@ -145,6 +158,145 @@ describe('local model selection', () => {
     expect(store.state.currentModel).toBe('cloud:model');
     expect(store.state.pendingModel).toBeNull();
     expect(store.state.modelLoadError).toContain('warmup failed');
+  });
+
+  it('restores local A after B fails when the failure snapshot proves A is ready', async () => {
+    vi.stubGlobal('window', {});
+    const { onModelChange } = await import('./actions');
+    const preferenceWrites: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/api/local_models/load')) {
+          return Promise.resolve(
+            jsonResponse(
+              { ok: false, error: 'B failed to load', runner: readyRunner('model-a') },
+              400,
+            ),
+          );
+        }
+        if (url.endsWith('/api/state') && init?.method === 'PUT') {
+          preferenceWrites.push(JSON.parse(String(init.body)));
+        }
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }),
+    );
+
+    store.set({
+      currentModel: 'local:model-a',
+      localRunner: readyRunner('model-a'),
+      models: [
+        { id: 'cloud:model', label: 'Cloud' },
+        { id: 'local:model-a', label: 'A' },
+        { id: 'local:model-b', label: 'B' },
+      ],
+    });
+
+    await onModelChange('local:model-b');
+
+    expect(store.state.currentModel).toBe('local:model-a');
+    expect(store.state.pendingModel).toBeNull();
+    expect(store.state.modelLoadError).toContain('B failed to load');
+    expect(store.state.localRunner).toMatchObject(readyRunner('model-a'));
+    expect(preferenceWrites).toEqual([{ model: 'local:model-b' }]);
+  });
+
+  it('keeps the safe cloud model when the failure snapshot no longer proves A ready', async () => {
+    vi.stubGlobal('window', {});
+    const { onModelChange } = await import('./actions');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        if (String(input).endsWith('/api/local_models/load')) {
+          return Promise.resolve(jsonResponse({ ok: false, error: 'B failed to load', runner: errorRunner() }, 400));
+        }
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }),
+    );
+
+    store.set({
+      currentModel: 'local:model-a',
+      localRunner: readyRunner('model-a'),
+      models: [{ id: 'cloud:model', label: 'Cloud' }, { id: 'local:model-a', label: 'A' }],
+    });
+
+    await onModelChange('local:model-b');
+
+    expect(store.state.currentModel).toBe('cloud:model');
+    expect(store.state.pendingModel).toBeNull();
+    expect(store.state.modelLoadError).toContain('B failed to load');
+  });
+
+  it('does not restore A when the user selects cloud before B fails', async () => {
+    vi.stubGlobal('window', {});
+    const { onModelChange } = await import('./actions');
+    let releaseLoad!: (response: Response) => void;
+    const loadResponse = new Promise<Response>((resolve) => {
+      releaseLoad = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        if (String(input).endsWith('/api/local_models/load')) return loadResponse;
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }),
+    );
+
+    store.set({
+      currentModel: 'local:model-a',
+      models: [{ id: 'cloud:model', label: 'Cloud' }, { id: 'local:model-a', label: 'A' }],
+    });
+    const transition = onModelChange('local:model-b');
+    await vi.waitFor(() => expect(store.state.pendingModel).toBe('local:model-b'));
+    await onModelChange('cloud:model');
+
+    releaseLoad(jsonResponse({ ok: false, error: 'B failed to load', runner: readyRunner('model-a') }, 400));
+    await transition;
+
+    expect(store.state.currentModel).toBe('cloud:model');
+    expect(store.state.pendingModel).toBeNull();
+  });
+
+  it('does not let a stale B failure overwrite a newer C transition', async () => {
+    vi.stubGlobal('window', {});
+    const { onModelChange } = await import('./actions');
+    const releases: Array<(response: Response) => void> = [];
+    const loads = [
+      new Promise<Response>((resolve) => releases.push(resolve)),
+      new Promise<Response>((resolve) => releases.push(resolve)),
+    ];
+    let loadIndex = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        if (String(input).endsWith('/api/local_models/load')) return loads[loadIndex++];
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }),
+    );
+
+    store.set({
+      currentModel: 'local:model-a',
+      models: [
+        { id: 'cloud:model', label: 'Cloud' },
+        { id: 'local:model-a', label: 'A' },
+        { id: 'local:model-c', label: 'C' },
+      ],
+    });
+    const b = onModelChange('local:model-b');
+    const c = onModelChange('local:model-c');
+    await vi.waitFor(() => expect(store.state.pendingModel).toBe('local:model-c'));
+
+    releases[0](jsonResponse({ ok: false, error: 'B failed to load', runner: readyRunner('model-a') }, 400));
+    await b;
+    expect(store.state.currentModel).toBe('cloud:model');
+    expect(store.state.pendingModel).toBe('local:model-c');
+    expect(store.state.modelLoadError).toBeNull();
+
+    releases[1](jsonResponse({ ok: true, runner: readyRunner('model-c') }));
+    await c;
+    expect(store.state.currentModel).toBe('local:model-c');
+    expect(store.state.pendingModel).toBeNull();
   });
 
   it('blocks typed send while a transition is pending and preserves the draft', async () => {
