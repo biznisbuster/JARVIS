@@ -1,7 +1,23 @@
 import { jfetch, jpost, jput } from './api';
 import { store } from '../store';
+import type { LocalModel, LocalPull, LocalRunner } from '../store';
 import { speakManual, stopSpeech } from './speech';
 import type { ModelsPayload, SessionDetail, SessionMeta, VoicesPayload } from './types';
+
+interface LocalModelsPayload {
+  runner: LocalRunner;
+  models: LocalModel[];
+  pulls: LocalPull[];
+}
+
+interface LocalLoadPayload {
+  ok: boolean;
+  error?: string;
+  error_code?: string;
+  runner?: LocalRunner;
+}
+
+let modelSelectionGeneration = 0;
 
 export async function refreshSessions(): Promise<void> {
   try {
@@ -58,14 +74,30 @@ export async function deleteSession(id: string): Promise<void> {
 
 export async function sendText(
   text: string,
-  opts?: { interrupt?: boolean; userLabel?: string; source?: 'text' | 'ptt' },
+  opts?: {
+    interrupt?: boolean;
+    userLabel?: string;
+    source?: 'text' | 'ptt';
+    preserveOnBlocked?: boolean;
+  },
 ): Promise<boolean> {
+  const pending = store.state.pendingModel;
+  if (pending) {
+    if (opts?.preserveOnBlocked !== false) {
+      const draft = store.state.draft;
+      store.set({ draft: draft ? `${draft} ${text}` : text });
+    }
+    store.addTool('… lokalni model se još učitava — transkript je sačuvan u inputu.');
+    return false;
+  }
+
+  const requestedModel = store.state.currentModel || null;
   stopSpeech();
   try {
     const data = await jpost<{ session_id: string }>('/api/chat', {
       text,
       session_id: store.state.sessionId,
-      model: store.state.currentModel || null,
+      model: requestedModel,
       interrupt: !!opts?.interrupt,
       source: opts?.source || 'text',
     });
@@ -74,6 +106,10 @@ export async function sendText(
     void refreshSessions();
     return true;
   } catch (e) {
+    if (opts?.source === 'ptt' || opts?.userLabel) {
+      const draft = store.state.draft;
+      store.set({ draft: draft ? `${draft} ${text}` : text });
+    }
     store.addTool(`⚠ chat: ${(e as Error).message}`);
     return false;
   }
@@ -82,9 +118,12 @@ export async function sendText(
 export async function sendDraft(): Promise<void> {
   const text = store.state.draft.trim();
   if (!text) return;
-  store.set({ draft: '' });
-  store.addUser(text);
-  await sendText(text, { interrupt: false });
+  if (store.state.pendingModel) return;
+  const accepted = await sendText(text, { interrupt: false, preserveOnBlocked: false });
+  if (accepted) {
+    store.set({ draft: '' });
+    store.addUser(text);
+  }
 }
 
 export async function stopTurn(): Promise<void> {
@@ -113,16 +152,18 @@ export async function loadPersistedUI(): Promise<string | null> {
   }
 }
 
-export async function ensureLocalLoaded(modelId: string): Promise<void> {
+export async function ensureLocalLoaded(modelId: string, generation?: number): Promise<LocalRunner> {
   store.addTool(`… učitavam lokalni model ${modelId} u RAM`);
-  try {
-    const data = await jpost<{ ok: boolean; error?: string }>('/api/local_models/load', {
-      model_id: modelId,
-    });
-    if (!data.ok) store.addTool(`⚠ load: ${data.error}`);
-  } catch (e) {
-    store.addTool(`⚠ load: ${(e as Error).message}`);
+  const data = await jpost<LocalLoadPayload>('/api/local_models/load', {
+    model_id: modelId,
+  });
+  if (!data.ok || !data.runner) {
+    throw new Error(data.error || 'lokalni model nije spreman');
   }
+  if (generation === undefined || generation === modelSelectionGeneration) {
+    store.set({ localRunner: data.runner });
+  }
+  return data.runner;
 }
 
 export async function bootModels(): Promise<void> {
@@ -130,11 +171,53 @@ export async function bootModels(): Promise<void> {
     const m = await jfetch<ModelsPayload>('/api/models');
     store.set({ models: m.available });
     const persisted = await loadPersistedUI();
-    let sel = m.current || '';
-    if (persisted && m.available.some((x) => x.id === persisted)) sel = persisted;
-    else if (!sel || !m.available.some((x) => x.id === sel)) sel = m.available[0]?.id || '';
-    store.set({ currentModel: sel });
-    if (sel.startsWith('local:')) void ensureLocalLoaded(sel.slice('local:'.length));
+    let desired = m.current || '';
+    if (persisted && m.available.some((x) => x.id === persisted)) desired = persisted;
+    else if (!desired || !m.available.some((x) => x.id === desired)) {
+      desired = m.available.find((x) => !x.id.startsWith('local:'))?.id || m.available[0]?.id || '';
+    }
+
+    const generation = ++modelSelectionGeneration;
+    if (!desired.startsWith('local:')) {
+      store.set({ currentModel: desired, pendingModel: null, modelLoadError: null });
+      return;
+    }
+
+    const safeCurrent = m.available.find((x) => !x.id.startsWith('local:'))?.id || '';
+    store.set({
+      currentModel: safeCurrent,
+      pendingModel: desired,
+      modelLoadError: null,
+    });
+
+    let runner: LocalRunner | null = null;
+    try {
+      const local = await jfetch<LocalModelsPayload>('/api/local_models');
+      runner = local.runner;
+      store.set({ localRunner: runner });
+    } catch {
+      // The authoritative load endpoint below still gets a chance to
+      // reconcile readiness; its failure is shown as the transition error.
+    }
+
+    const localId = desired.slice('local:'.length);
+    if (runner?.state === 'ready' && runner.loaded_id === localId) {
+      store.set({ currentModel: desired, pendingModel: null, modelLoadError: null });
+      return;
+    }
+
+    try {
+      const loaded = await ensureLocalLoaded(localId, generation);
+      if (generation !== modelSelectionGeneration) return;
+      if (loaded.state !== 'ready' || loaded.loaded_id !== localId) {
+        throw new Error('backend nije potvrdio ready stanje lokalnog modela');
+      }
+      store.set({ currentModel: desired, pendingModel: null, modelLoadError: null, localRunner: loaded });
+    } catch (e) {
+      if (generation !== modelSelectionGeneration) return;
+      store.set({ pendingModel: null, modelLoadError: (e as Error).message });
+      store.addTool(`⚠ lokalni model: ${(e as Error).message}`);
+    }
   } catch (e) {
     store.addTool(`⚠ modeli: ${(e as Error).message}`);
   }
@@ -143,20 +226,46 @@ export async function bootModels(): Promise<void> {
 export async function refreshModels(): Promise<void> {
   try {
     const m = await jfetch<ModelsPayload>('/api/models');
-    const prev = store.state.currentModel;
     store.set({ models: m.available });
-    if (prev && m.available.some((x) => x.id === prev)) return;
-    const next = m.current || m.available[0]?.id || '';
-    store.set({ currentModel: next });
+    if (!store.state.currentModel && !store.state.pendingModel) {
+      const next = m.current || m.available.find((x) => !x.id.startsWith('local:'))?.id || '';
+      store.set({ currentModel: next });
+    }
   } catch (e) {
     store.addTool(`⚠ modeli: ${(e as Error).message}`);
   }
 }
 
 export async function onModelChange(id: string): Promise<void> {
-  store.set({ currentModel: id });
+  const generation = ++modelSelectionGeneration;
+  if (!id.startsWith('local:')) {
+    store.set({ currentModel: id, pendingModel: null, modelLoadError: null });
+    persistUI({ model: id });
+    return;
+  }
+
+  const localId = id.slice('local:'.length);
+  const safeCloud = store.state.models.find((model) => !model.id.startsWith('local:'))?.id || '';
+  const confirmedCurrent = store.state.currentModel.startsWith('local:') ? safeCloud : store.state.currentModel;
+  store.set({
+    currentModel: confirmedCurrent,
+    pendingModel: id,
+    modelLoadError: null,
+  });
   persistUI({ model: id });
-  if (id.startsWith('local:')) await ensureLocalLoaded(id.slice('local:'.length));
+
+  try {
+    const runner = await ensureLocalLoaded(localId, generation);
+    if (generation !== modelSelectionGeneration) return;
+    if (runner.state !== 'ready' || runner.loaded_id !== localId) {
+      throw new Error('backend nije potvrdio ready stanje lokalnog modela');
+    }
+    store.set({ currentModel: id, pendingModel: null, modelLoadError: null, localRunner: runner });
+  } catch (e) {
+    if (generation !== modelSelectionGeneration) return;
+    store.set({ pendingModel: null, modelLoadError: (e as Error).message });
+    store.addTool(`⚠ lokalni model: ${(e as Error).message}`);
+  }
 }
 
 export async function loadVoices(): Promise<void> {
@@ -248,8 +357,10 @@ export async function toggleMic(): Promise<void> {
           body: fd,
         });
         if (data.ok && data.text) {
-          store.addUser('🎙 ' + data.text);
-          await sendText(data.text, { interrupt: true });
+          await sendText(data.text, {
+            interrupt: true,
+            userLabel: '🎙 ' + data.text,
+          });
         } else if (!data.ok) {
           store.addTool(`⚠ STT greška: ${data.error}`);
         }

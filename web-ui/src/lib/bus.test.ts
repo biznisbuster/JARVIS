@@ -10,6 +10,10 @@ function resetStore(): void {
     logs: [],
     sessionId: null,
     currentModel: '',
+    pendingModel: null,
+    modelLoadError: null,
+    models: [],
+    localRunner: null,
   });
 }
 
@@ -99,6 +103,78 @@ describe('PTT transcript delivery', () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(store.state.transcript.at(-1)).toMatchObject({ role: 'tool', text: '… PTT: nisam jasno čuo' });
+  });
+
+  it('preserves a PTT transcript while a local model transition is pending', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    store.set({ currentModel: 'cloud:model', pendingModel: 'local:model-a' });
+
+    handleEvent({
+      kind: 'voice_ptt_transcribed',
+      t: 1,
+      payload: { ok: true, text: 'sačuvaj glas', auto_send: true },
+    });
+
+    await vi.waitFor(() => expect(store.state.draft).toBe('sačuvaj glas'));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.state.transcript.at(-1)).toMatchObject({
+      role: 'tool',
+      text: '… lokalni model se još učitava — transkript je sačuvan u inputu.',
+    });
+  });
+
+  it('does not activate a stale local_model_ready event', () => {
+    store.set({ currentModel: 'cloud:model', pendingModel: 'local:model-b' });
+
+    handleEvent({
+      kind: 'local_model_ready',
+      t: 1,
+      payload: {
+        engine_available: true,
+        state: 'ready',
+        loaded_id: 'model-a',
+        loaded_tag: 'model-a',
+        target_id: null,
+        target_tag: null,
+        error: null,
+        active_streams: 0,
+      },
+    });
+
+    expect(store.state.currentModel).toBe('cloud:model');
+    expect(store.state.pendingModel).toBe('local:model-b');
+  });
+
+  it('removes a no-longer-ready local model from confirmed execution state', () => {
+    store.set({
+      currentModel: 'local:model-a',
+      localRunner: {
+        engine_available: true,
+        state: 'ready',
+        loaded_id: 'model-a',
+        target_id: null,
+        error: null,
+        active_streams: 0,
+      },
+      models: [{ id: 'cloud:model', label: 'Cloud' }, { id: 'local:model-a', label: 'Local' }],
+    });
+
+    handleEvent({
+      kind: 'local_model_unloading',
+      t: 1,
+      payload: {
+        engine_available: true,
+        state: 'unloading',
+        loaded_id: 'model-a',
+        target_id: 'model-a',
+        error: null,
+        active_streams: 0,
+      },
+    });
+
+    expect(store.state.currentModel).toBe('cloud:model');
+    expect(store.state.modelLoadError).toContain('unloading');
   });
 
   it('falls back to system playback when browser audio is blocked', async () => {

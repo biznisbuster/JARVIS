@@ -3,6 +3,7 @@ import type { AppState } from '../store';
 import { enqueueSpeech, stopSpeech } from './speech';
 import { refreshModels, sendText } from './actions';
 import type { BusEvent, TtsSpeakPayload } from './types';
+import type { LocalRunner } from '../store';
 
 export const SESSION_SCOPED_EVENTS = new Set([
   'assistant_start',
@@ -22,6 +23,49 @@ export const SESSION_SCOPED_EVENTS = new Set([
 function eventSession(payload: Record<string, unknown> | undefined): string | null {
   if (!payload) return null;
   return (payload.session as string) || (payload.id as string) || null;
+}
+
+function runnerFromEvent(payload: Record<string, unknown>, previous: LocalRunner | null): LocalRunner {
+  return {
+    engine_available:
+      typeof payload.engine_available === 'boolean'
+        ? payload.engine_available
+        : previous?.engine_available ?? false,
+    state:
+      (typeof payload.state === 'string' ? payload.state : previous?.state || 'idle') as LocalRunner['state'],
+    loaded_id:
+      payload.loaded_id === undefined ? previous?.loaded_id ?? null : (payload.loaded_id as string | null),
+    loaded_tag:
+      payload.loaded_tag === undefined ? previous?.loaded_tag ?? null : (payload.loaded_tag as string | null),
+    target_id:
+      payload.target_id === undefined ? previous?.target_id ?? null : (payload.target_id as string | null),
+    target_tag:
+      payload.target_tag === undefined ? previous?.target_tag ?? null : (payload.target_tag as string | null),
+    error: payload.error === undefined ? previous?.error ?? null : (payload.error as string | null),
+    active_streams:
+      payload.active_streams === undefined
+        ? previous?.active_streams ?? 0
+        : Number(payload.active_streams || 0),
+  };
+}
+
+function safeCloudModel(): string {
+  return store.state.models.find((model) => !model.id.startsWith('local:'))?.id || '';
+}
+
+function reconcileActiveModel(previous: LocalRunner | null, next: LocalRunner): void {
+  const current = store.state.currentModel;
+  if (!current.startsWith('local:') || next.state === 'ready') return;
+  const localId = current.slice('local:'.length);
+  const affected =
+    localId === previous?.loaded_id ||
+    localId === next.loaded_id ||
+    localId === next.target_id;
+  if (!affected) return;
+  store.set({
+    currentModel: safeCloudModel(),
+    modelLoadError: `lokalni model ${localId} više nije spreman (${next.state})`,
+  });
 }
 
 export function handleEvent(msg: BusEvent): void {
@@ -170,20 +214,41 @@ export function handleEvent(msg: BusEvent): void {
       break;
     }
     case 'local_model_loading': {
+      const previous = store.state.localRunner;
+      const next = runnerFromEvent(p, previous);
+      store.set({ localRunner: next });
+      reconcileActiveModel(previous, next);
       store.addTool(`… učitavam lokalni model: ${p.id}`);
       break;
     }
     case 'local_model_ready': {
+      store.set({ localRunner: runnerFromEvent(p, store.state.localRunner) });
       store.addTool(`✓ lokalni model učitan: ${p.loaded_id}`);
       void refreshModels();
       break;
     }
+    case 'local_model_unloading': {
+      const previous = store.state.localRunner;
+      const next = runnerFromEvent(p, previous);
+      store.set({ localRunner: next });
+      reconcileActiveModel(previous, next);
+      store.addTool(`… oslobađam lokalni model: ${p.target_id || p.loaded_id || ''}`);
+      break;
+    }
     case 'local_model_unloaded': {
+      const previous = store.state.localRunner;
+      const next = runnerFromEvent(p, previous);
+      store.set({ localRunner: next });
+      reconcileActiveModel(previous, next);
       store.addTool('■ lokalni model oslobođen iz RAM-a');
       void refreshModels();
       break;
     }
     case 'local_model_error': {
+      const previous = store.state.localRunner;
+      const next = runnerFromEvent(p, previous);
+      store.set({ localRunner: next });
+      reconcileActiveModel(previous, next);
       store.addTool(`⚠ lokalni model: ${p.error || 'load failed'}`);
       break;
     }

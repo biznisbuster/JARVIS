@@ -200,6 +200,21 @@ code {
 .ws-dot.ok { background: var(--ok); box-shadow: 0 0 6px rgba(95, 211, 140, 0.6); }
 .ws-dot.err { background: var(--err); }
 
+.model-transition {
+  color: var(--warn);
+  font-size: var(--fs-s);
+  white-space: nowrap;
+}
+
+.model-error {
+  color: var(--err);
+  font-size: var(--fs-s);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ============================================================
    Chat layout
    ============================================================ */

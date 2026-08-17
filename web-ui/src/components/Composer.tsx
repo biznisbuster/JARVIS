@@ -5,6 +5,7 @@ import { sendDraft, stopTurn, toggleMic } from '../lib/actions';
 export default function Composer() {
   const draft = useApp((s) => s.draft);
   const busy = useApp((s) => s.busy);
+  const pendingModel = useApp((s) => s.pendingModel);
   const queued = useApp((s) => s.queued);
   const recording = useApp((s) => s.recording);
   const listenReasons = useApp((s) => s.listenReasons);
@@ -60,6 +61,12 @@ export default function Composer() {
         {busy ? (queued > 0 ? `… razmišljam (+${queued} u redu)` : '… razmišljam') : ''}
       </span>
 
+      {pendingModel && (
+        <span className="model-transition" role="status">
+          … učitavam lokalni model — slanje je privremeno onemogućeno
+        </span>
+      )}
+
       <button
         type="button"
         className="stop-btn"
@@ -70,7 +77,12 @@ export default function Composer() {
         ■
       </button>
 
-      <button type="button" className="btn primary" onClick={() => void sendDraft()}>
+      <button
+        type="button"
+        className="btn primary"
+        disabled={!!pendingModel}
+        onClick={() => void sendDraft()}
+      >
         Pošalji
       </button>
     </div>

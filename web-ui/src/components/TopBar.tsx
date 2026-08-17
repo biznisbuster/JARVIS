@@ -28,6 +28,9 @@ export default function TopBar() {
   const wsConnected = useApp((s) => s.wsConnected);
   const models = useApp((s) => s.models);
   const currentModel = useApp((s) => s.currentModel);
+  const pendingModel = useApp((s) => s.pendingModel);
+  const modelLoadError = useApp((s) => s.modelLoadError);
+  const busy = useApp((s) => s.busy);
   const voices = useApp((s) => s.voices);
   const ttsEnabled = useApp((s) => s.ttsEnabled);
 
@@ -50,14 +53,26 @@ export default function TopBar() {
         <label className="visually-hidden" htmlFor="model-select">Aktivan model</label>
         <select
           id="model-select"
-          title="Aktivan model"
-          value={currentModel}
+          title={pendingModel ? 'Lokalni model se učitava' : 'Aktivan model'}
+          value={pendingModel || currentModel}
+          disabled={busy}
           onChange={(e) => void onModelChange(e.target.value)}
         >
           {models.map((m) => (
             <option key={m.id} value={m.id}>{m.label}</option>
           ))}
         </select>
+
+        {pendingModel && (
+          <span className="model-transition" role="status">
+            … učitavam lokalni model
+          </span>
+        )}
+        {modelLoadError && (
+          <span className="model-error" role="alert" title={modelLoadError}>
+            ⚠ model: {modelLoadError}
+          </span>
+        )}
 
         <label className="visually-hidden" htmlFor="voice-select">Jarvis glas (TTS)</label>
         <select

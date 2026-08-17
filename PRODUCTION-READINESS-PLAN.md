@@ -1996,17 +1996,17 @@ explicit runtime fallback.
 
 ## Backend tasks
 
-- [ ] Formalize runner states:
+- [x] Formalize runner states:
   - idle,
   - loading,
   - ready,
   - error,
   - unloading.
-- [ ] Return state consistently from endpoints.
-- [ ] Ensure concurrent load requests are deterministic.
-- [ ] Define what happens when selecting model B while A is loading.
-- [ ] Define unload behavior during active chats.
-- [ ] Emit explicit fallback reason/event.
+- [x] Return state consistently from endpoints.
+- [x] Ensure concurrent load requests are deterministic.
+- [x] Define what happens when selecting model B while A is loading.
+- [x] Define unload behavior during active chats.
+- [x] Emit explicit fallback reason/event.
 
 ## Frontend tasks
 
@@ -2018,13 +2018,13 @@ web-ui/src/store.ts
 web-ui/src/lib/bus.ts
 ```
 
-- [ ] Add `pendingModel`.
-- [ ] Do not set `currentModel` until load success.
-- [ ] Surface load error.
-- [ ] Disable send or queue chat while explicit model transition is pending.
-- [ ] Make fallback to cloud visible but non-destructive to selected preference
+- [x] Add `pendingModel`.
+- [x] Do not set `currentModel` until load success.
+- [x] Surface load error.
+- [x] Disable send or queue chat while explicit model transition is pending.
+- [x] Make fallback to cloud visible but non-destructive to selected preference
       unless policy intentionally changes it.
-- [ ] On boot, if persisted local model exists, show loading state until ready.
+- [x] On boot, if persisted local model exists, show loading state until ready.
 
 ## Definition of done
 
@@ -2041,6 +2041,111 @@ while backend considers X not ready.
 ```text
 make local model selection wait for readiness
 ```
+
+## Phase 4 report (2026-08-17)
+
+### Root cause
+
+The UI treated a requested local model as active before the runner had
+positively confirmed readiness. The backend also stored the loading target in
+`loaded_id`, had no explicit unloading state, and allowed pre-start local
+requests to enter the existing cloud fallback path.
+
+### Completed
+
+- Added the `idle/loading/ready/error/unloading` runner state machine with
+  separate `loaded_*` and `target_*` fields, coherent lifecycle events and
+  bounded unload verification.
+- Serialized lifecycle requests, made same-ready loads idempotent, restored a
+  resident previous model after a failed switch, and rejected load/unload
+  during active local streams with cancellation-safe refcounting.
+- Added local readiness preflight so loading/unloading/not-ready local turns
+  return `NOT_READY` without cloud fallback; runtime stream failures retain the
+  existing explicit cloud fallback and emit `requested_model`,
+  `fallback_model`, `reason` and `stage`.
+- Split frontend `currentModel` (confirmed execution model) from
+  `pendingModel`, protected transitions with a generation token, preserved
+  drafts/transcripts through the typed, Enter, PTT and browser-mic send gate,
+  and kept persisted local preferences available for retry without silently
+  rewriting them.
+- Kept manual Local Models-tab RAM loading independent from chat selection and
+  surfaced formal runner states, active-stream restrictions, errors and
+  `unknown` capability badges.
+
+### Files changed
+
+- `jarvis/local_models.py`
+- `jarvis/agent/loop.py`
+- `jarvis/app.py`
+- `tests/test_local_models.py`
+- `tests/test_integration_chat.py`
+- `tests/test_phase4_model_api.py`
+- `web-ui/src/store.ts`
+- `web-ui/src/lib/actions.ts`
+- `web-ui/src/lib/bus.ts`
+- `web-ui/src/lib/model-selection.test.ts`
+- `web-ui/src/lib/bus.test.ts`
+- `web-ui/src/components/TopBar.tsx`
+- `web-ui/src/components/Composer.tsx`
+- `web-ui/src/components/LocalModelsTab.tsx`
+- `web-ui/src/styles.css`
+
+### Tests added/changed
+
+- Runner lifecycle, target/loaded semantics, serialized A/B and duplicate
+  loads, failure restoration, delayed unload verification, unload conflicts,
+  and active-stream success/exception/cancellation coverage.
+- Agent preflight/no-cloud-fallback and runtime-fallback preference coverage.
+- GET/load/unload/chat API snapshot and conflict coverage.
+- Vitest coverage for stale selections, boot transitions, typed/browser-mic
+  send gating, PTT transcript preservation and stale lifecycle events.
+
+### Validation
+
+- `./.venv/bin/pytest -q` -> PASS (301 passed)
+- focused backend lifecycle/history/tool regressions -> PASS (45 passed)
+- `tests/test_integration_chat.py` -> PASS (8 passed)
+- `tests/test_phase4_model_api.py` -> PASS (4 passed)
+- `npm run test` -> PASS (20 passed)
+- `npm run typecheck` -> PASS
+- `npm run build` -> PASS
+- targeted Ruff and format checks on all changed Python files -> PASS
+- `./.venv/bin/python -m compileall -q jarvis` -> PASS
+- `git diff --check` -> PASS
+- repository-wide `ruff check .` -> FAIL on three pre-existing unused imports
+  in `jarvis/audio/focus.py`, `jarvis/log.py` and `tests/test_web_ui_7b.py`
+- repository-wide `ruff format --check .` -> FAIL on four pre-existing files:
+  `AGENTS.md`, `DEVELOPER-GUIDE.md`, `jarvis/audio/focus.py` and `jarvis/log.py`
+- `pytest --collect-only -q tests/test_web_ui_7b.py` -> NO TESTS COLLECTED
+  (exit 5). The full suite still passed; this remains a CI/Playwright
+  handoff rather than a Phase 4 change.
+
+### Manual validation still required
+
+- None for the Phase 4 acceptance checkpoint. The real normal UI matrix passed:
+  cloud-to-local readiness and simple local chat, send-during-load draft
+  preservation, rapid A-to-B selection, local-to-cloud stale completion,
+  persisted-local restart boot, manual RAM load without chat selection, and
+  ready-to-unloading-to-idle cleanup.
+
+### New issues discovered
+
+- No new Phase 4 product issue remains. The first live unload attempt exposed
+  asynchronous Ollama eviction; bounded polling and a regression test now cover
+  it.
+
+### Remaining risks
+
+- A destructive local runtime failure was not intentionally induced in the live
+  UI; the explicit fallback path is covered by integration tests and the
+  preference-preservation assertion. Direct physical microphone/PTT hardware
+  was not used; browser/voice transition gating is covered by frontend tests.
+- The repository-wide lint/format baseline and empty Playwright collection
+  remain outside Phase 4 scope.
+
+### Ready for next phase
+
+YES. Phase 5 remains unstarted.
 
 ---
 

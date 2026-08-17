@@ -22,6 +22,8 @@ export default function LocalModelsTab() {
   const [err, setErr] = useState<string | null>(null);
   const [pullTag, setPullTag] = useState('');
   const wsPulls = useApp((s) => s.localPulls);
+  const liveRunner = useApp((s) => s.localRunner);
+  const currentModel = useApp((s) => s.currentModel);
 
   useEffect(() => {
     void load();
@@ -31,6 +33,7 @@ export default function LocalModelsTab() {
     try {
       const d = await jfetch<LocalModelsPayload>('/api/local_models');
       setData(d);
+      store.set({ localRunner: d.runner });
       setErr(null);
     } catch (e) {
       setErr((e as Error).message);
@@ -93,7 +96,7 @@ export default function LocalModelsTab() {
     return <div className="panel"><p className="hint">učitavam…</p></div>;
   }
 
-  const runner = data.runner;
+  const runner = liveRunner || data.runner;
   const models = data.models;
   const serverPulls = data.pulls || [];
   const livePulls = mergePulls(serverPulls, wsPulls);
@@ -119,6 +122,9 @@ export default function LocalModelsTab() {
           (ili <code>brew services start ollama</code>) i osveži ovu stranicu.
         </div>
       )}
+      {runner?.error && (
+        <p className="hint err" role="alert">⚠ poslednja promena modela: {runner.error}</p>
+      )}
       <table className="data-table">
         <thead>
           <tr>
@@ -141,17 +147,55 @@ export default function LocalModelsTab() {
           )}
           {models.map((m) => {
             const isLoaded = runner.state === 'ready' && runner.loaded_id === m.id;
-            const isLoading = runner.state === 'loading' && runner.loaded_id === m.id;
+            const isLoading = runner.state === 'loading' && runner.target_id === m.id;
+            const isUnloading = runner.state === 'unloading' && runner.target_id === m.id;
+            const activeStreams = runner.active_streams || 0;
+            const isActiveChatModel = currentModel === `local:${m.id}`;
+            const anotherLocalModelIsActive = currentModel.startsWith('local:') && !isActiveChatModel;
             const status = isLoaded
               ? <span className="ok">● učitan u RAM</span>
               : isLoading
                 ? <span className="hint">… učitavam</span>
+                : isUnloading
+                  ? <span className="hint">… oslobađam</span>
+                  : runner.state === 'error' && (runner.loaded_id === m.id || runner.target_id === m.id)
+                    ? <span className="err">⚠ {runner.error || 'greška'}</span>
                 : m.in_ram
                   ? <span className="hint">● u RAM (Ollama)</span>
                   : <span className="hint">○ na disku</span>;
             const action = isLoaded
-              ? <button type="button" onClick={() => void unloadModel()}>Oslobodi iz RAM-a</button>
-              : <button type="button" className="primary" onClick={() => void loadModel(m.id)}>Učitaj u RAM</button>;
+              ? (
+                <button
+                  type="button"
+                  disabled={activeStreams > 0 || runner.state !== 'ready' || isActiveChatModel}
+                  title={
+                    isActiveChatModel
+                      ? 'Prvo izaberi drugi model za chat'
+                      : activeStreams > 0
+                        ? 'Lokalni model trenutno odgovara'
+                        : undefined
+                  }
+                  onClick={() => void unloadModel()}
+                >
+                  Oslobodi iz RAM-a
+                </button>
+              )
+              : (
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={
+                    runner.state === 'loading' ||
+                    runner.state === 'unloading' ||
+                    activeStreams > 0 ||
+                    anotherLocalModelIsActive
+                  }
+                  title={anotherLocalModelIsActive ? 'Prvo izaberi cloud model za chat' : undefined}
+                  onClick={() => void loadModel(m.id)}
+                >
+                  Učitaj u RAM
+                </button>
+              );
             return (
               <tr key={m.id}>
                 <td><code>{m.id}</code></td>
@@ -233,7 +277,7 @@ function fmtSize(bytes: number | undefined): string {
   return gb >= 1 ? `${gb.toFixed(1)} GB` : `${(bytes / (1024 ** 2)).toFixed(0)} MB`;
 }
 
-function capabilityBadge(cap: 'tools' | 'notools' | null | undefined) {
+function capabilityBadge(cap: 'tools' | 'notools' | 'unknown' | undefined) {
   if (cap === 'tools') return <span className="ok">✓ tool-ovi</span>;
   if (cap === 'notools') {
     return (

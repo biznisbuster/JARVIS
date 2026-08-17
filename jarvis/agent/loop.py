@@ -224,6 +224,7 @@ async def chat(
     ``interrupt=False`` the turn is appended to the session's FIFO queue,
     so rapid consecutive messages are processed in order, never lost.
     """
+    await _ensure_local_model_ready(model)
     sess = get_or_create(session_id)
     if interrupt:
         _cancel_turn(sess)
@@ -293,7 +294,19 @@ async def _session_worker(sess: Session, store: perm_mod.PermissionStore) -> Non
                 _repair_after_cancel(sess)
                 await BUS.publish("assistant_cancelled", {"session": sess.id})
             except Exception as exc:  # noqa: BLE001
-                await BUS.publish("assistant_error", {"session": sess.id, "error": repr(exc)})
+                from ..local_models import LocalModelNotReadyError
+
+                if isinstance(exc, LocalModelNotReadyError):
+                    await BUS.publish(
+                        "assistant_error",
+                        {
+                            "session": sess.id,
+                            "error_code": exc.code,
+                            "error": str(exc),
+                        },
+                    )
+                else:
+                    await BUS.publish("assistant_error", {"session": sess.id, "error": repr(exc)})
             finally:
                 sess.turn_task = None
                 await _publish_busy(sess)
@@ -339,8 +352,37 @@ async def _fallback_to_cloud(session: Session, local_model: str, exc: Exception)
     await SPEECH.cancel(session.id)
     await BUS.publish(
         "model_fallback",
-        {"session": session.id, "model": local_model, "reason": str(exc)[:300]},
+        {
+            "session": session.id,
+            "model": local_model,
+            "requested_model": local_model,
+            "fallback_model": SETTINGS.llm.model,
+            "reason": str(exc)[:300],
+            "stage": "runtime",
+        },
     )
+
+
+async def _ensure_local_model_ready(model: str | None) -> None:
+    """Reject explicit local requests before a turn can fall back to cloud."""
+
+    if not model or not model.startswith("local:"):
+        return
+    from ..local_models import RUNNER, LocalModelNotReadyError
+
+    local_id = model[len("local:") :]
+    if not RUNNER.is_ready(local_id):
+        status_reader = getattr(RUNNER, "astatus", None)
+        if callable(status_reader):
+            status = await status_reader()
+        else:
+            sync_status = getattr(RUNNER, "status", None)
+            status = sync_status() if callable(sync_status) else {}
+        state = status.get("state") if isinstance(status, dict) else None
+        detail = f"lokalni model {local_id!r} nije spreman za chat"
+        if state:
+            detail += f" (stanje: {state})"
+        raise LocalModelNotReadyError(detail)
 
 
 async def run_turn(
@@ -354,6 +396,7 @@ async def run_turn(
 ) -> str:
     """Drive a single user turn. Streams everything to the bus and feeds the
     speech scheduler. Returns the final assistant text."""
+    await _ensure_local_model_ready(model)
     session.messages.append({"role": "user", "content": user_text})
     if len(session.messages) == 1 and not session.title.startswith("✦"):
         session.title = user_text.strip().split("\n", 1)[0][:60]
@@ -373,18 +416,7 @@ async def run_turn(
         from ..local_models import RUNNER
 
         local_id = active_model[len("local:") :]
-        if not RUNNER.is_ready(local_id):
-            await BUS.publish(
-                "model_fallback",
-                {
-                    "session": session.id,
-                    "model": active_model,
-                    "reason": f"lokalni model {local_id!r} nije učitan u RAM",
-                },
-            )
-            active_model = None
-        else:
-            capability = await RUNNER.capability_for_model(local_id)
+        capability = await RUNNER.capability_for_model(local_id)
 
     def _system_content_for(mdl: str | None) -> str:
         prompt = SYSTEM_PROMPT_NOTOOLS if (capability == "notools" and mdl) else SYSTEM_PROMPT
@@ -444,7 +476,19 @@ async def run_turn(
             except asyncio.CancelledError:
                 cancelled = True
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
+                from ..local_models import LocalModelNotReadyError
+
+                if isinstance(exc, LocalModelNotReadyError):
+                    await BUS.publish(
+                        "assistant_error",
+                        {
+                            "session": session.id,
+                            "error_code": exc.code,
+                            "error": str(exc),
+                        },
+                    )
+                    return final_text
                 if active_model and active_model.startswith("local:") and iteration < max_iterations:
                     await _fallback_to_cloud(session, active_model, exc)
                     active_model = None
