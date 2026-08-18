@@ -26,25 +26,12 @@ from ..bus import BUS
 from ..config import SETTINGS
 from ..context import build_world_state
 from ..llm import LLMError, stream_clean
-from . import tools as tools_mod
+from ..tools import DEFAULT_REGISTRY, ToolErrorCode, ToolExecutionContext, ToolExecutor, ToolResult
 from .prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_NOTOOLS
 
-AUDIO_TOOLS = frozenset(
-    {
-        "ytm_play",
-        "ytm_pause",
-        "ytm_resume",
-        "ytm_next",
-        "ytm_previous",
-        "ytm_volume_up",
-        "ytm_volume_down",
-        "ytm_volume_set",
-        "ytm_volume_mute",
-        "play_youtube",
-    }
-)
-
 MAX_HISTORY_MESSAGES = 80
+
+TOOL_EXECUTOR = ToolExecutor(DEFAULT_REGISTRY, speech_suppressor=SPEECH.suppress)
 
 
 def _collapse_double(text: str) -> str:
@@ -341,7 +328,7 @@ def _repair_after_cancel(sess: Session) -> None:
                 "role": "tool",
                 "tool_call_id": call_id,
                 "name": name,
-                "content": json.dumps({"ok": False, "error": "cancelled by user"}),
+                "content": ToolResult.failure(ToolErrorCode.CANCELLED, "cancelled by user").to_json(),
             }
         )
 
@@ -437,7 +424,7 @@ async def run_turn(
                 full_text = ""
                 tool_calls: list[dict[str, Any]] = []
                 finish_reason: str | None = None
-                model_tools = tools_mod.all_schemas()
+                model_tools = TOOL_EXECUTOR.registry.schemas()
                 if active_model and active_model.startswith("local:") and capability == "notools":
                     model_tools = None
                 async for kind, value in stream_clean(msgs, model=active_model, tools=model_tools):
@@ -512,92 +499,8 @@ async def run_turn(
 
 
 async def _execute_tool(session: Session, tc: dict[str, Any], store: perm_mod.PermissionStore) -> None:
-    fn = tc.get("function") or {}
-    name = fn.get("name") or ""
-    raw_args = fn.get("arguments") or "{}"
-    try:
-        args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-    except json.JSONDecodeError as exc:
-        call_id = tc.get("id") or uuid.uuid4().hex[:10]
-        result_text = json.dumps(
-            {
-                "ok": False,
-                "error_code": "INVALID_ARGUMENTS",
-                "error": f"invalid tool arguments JSON: {exc.msg}",
-            }
-        )
-        session.messages.append(
-            {"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text}
-        )
-        await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
-        return
-    if not isinstance(args, dict):
-        call_id = tc.get("id") or uuid.uuid4().hex[:10]
-        result_text = json.dumps(
-            {
-                "ok": False,
-                "error_code": "INVALID_ARGUMENTS",
-                "error": "tool arguments must be a JSON object",
-            }
-        )
-        session.messages.append(
-            {"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text}
-        )
-        await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
-        return
-    call_id = tc.get("id") or uuid.uuid4().hex[:10]
-
-    if not name:
-        result_text = json.dumps(
-            {"ok": False, "error_code": "INVALID_ARGUMENTS", "error": "tool call is missing a function name"}
-        )
-        session.messages.append(
-            {"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text}
-        )
-        await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
-        return
-
-    await BUS.publish(
-        "tool_call",
-        {"session": session.id, "tool": name, "args": args, "call_id": call_id},
+    execution = await TOOL_EXECUTOR.execute_call(
+        tc,
+        context=ToolExecutionContext(session_id=session.id, permission_store=store),
     )
-
-    tool = tools_mod.get(name)
-    if tool is None:
-        result_text = json.dumps({"ok": False, "error": f"unknown tool: {name}"})
-        await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
-        session.messages.append(
-            {"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text}
-        )
-        return
-
-    allowed = await store.check(name, args)
-    if not allowed:
-        denied = json.dumps({"ok": False, "error": f"denied by permission policy for tool '{name}'"})
-        session.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": denied})
-        await BUS.publish("tool_done", {"session": session.id, "tool": name, "denied": True})
-        return
-
-    if name in AUDIO_TOOLS:
-        SPEECH.suppress(session.id)
-
-    try:
-        result_text = await tool.execute(args)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        result_text = json.dumps({"ok": False, "error": repr(exc)})
-        await BUS.publish("tool_error", {"session": session.id, "tool": name, "error": result_text})
-    else:
-        done_payload: dict[str, Any] = {"session": session.id, "tool": name, "ok": True}
-        try:
-            result = json.loads(result_text)
-        except (TypeError, json.JSONDecodeError):
-            result = None
-        if isinstance(result, dict) and isinstance(result.get("ok"), bool):
-            done_payload["ok"] = result["ok"]
-            for key in ("delivered", "verified", "degraded", "verification", "error"):
-                if key in result:
-                    done_payload[key] = result[key]
-        await BUS.publish("tool_done", done_payload)
-    session.messages.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
+    session.messages.append(execution.tool_message())

@@ -104,9 +104,19 @@ jarvis/
 │
 ├── agent/
 │   ├── loop.py            session queue + turn orchestration
-│   ├── tools.py           current tool registry + many implementations
+│   ├── tools.py           compatibility exports for the canonical tool package
 │   ├── prompts.py         system prompts
-│   └── kilo_bridge.py     Kilo CLI bridge
+│   └── kilo_bridge.py     compatibility exports for the Kilo tool bridge
+│
+├── tools/
+│   ├── base.py            ToolSpec, ToolError and ToolResult
+│   ├── registry.py        explicit public tool registry and schemas
+│   ├── executor.py        validation, permission, timeout and event boundary
+│   ├── apple/             Reminders and Calendar implementations
+│   ├── system/            macOS, clipboard, volume and ordinary YouTube tools
+│   ├── search/            DuckDuckGo implementation
+│   ├── media.py           MediaService tool adapters
+│   └── coding/            Kilo CLI implementation
 │
 ├── media/
 │   ├── nowplaying.py      generic macOS media state/control

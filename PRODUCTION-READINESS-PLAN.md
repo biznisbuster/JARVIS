@@ -2182,21 +2182,21 @@ Do not force exact names if a cleaner current-project fit exists.
 
 ## Tasks
 
-- [ ] Create canonical `ToolResult`.
-- [ ] Create canonical `ToolError`.
-- [ ] Create `ToolExecutor`.
-- [ ] Centralize:
+- [x] Create canonical `ToolResult`.
+- [x] Create canonical `ToolError`.
+- [x] Create `ToolExecutor`.
+- [x] Centralize:
   - lookup,
   - permission check,
   - timeout,
   - exception normalization,
   - BUS events.
-- [ ] Move domain implementations out of `agent/tools.py`.
-- [ ] Keep agent loop dependent on registry/executor, not implementation
+- [x] Move domain implementations out of `agent/tools.py`.
+- [x] Keep agent loop dependent on registry/executor, not implementation
       modules.
-- [ ] Add per-tool/default timeout configuration.
-- [ ] Validate arguments before execution where practical.
-- [ ] Preserve OpenAI-compatible schemas.
+- [x] Add per-tool/default timeout configuration.
+- [x] Validate arguments before execution where practical.
+- [x] Preserve OpenAI-compatible schemas.
 
 ## Tool error codes
 
@@ -2226,6 +2226,92 @@ short migration period.
 ```text
 refactor tool execution architecture
 ```
+
+## Phase 5 report
+
+### Root cause
+
+Tool definitions, domain implementations, compatibility helpers, permission
+checks, argument parsing, timeout behavior, result normalization and BUS event
+emission were spread across `agent/tools.py` and `agent/loop.py`. This made
+new tools depend on loop internals and allowed provider/domain-specific
+execution behavior to drift.
+
+### Completed
+
+- Added the canonical `jarvis.tools` package with `ToolResult`, `ToolError`,
+  `ToolSpec`, `ToolRegistry` and `ToolExecutor`.
+- `ToolError` carries `code`, `message` and optional `details`, using the
+  roadmap vocabulary while preserving explicit domain codes when supplied.
+- `ToolResult` carries `ok`, `data`, `error` and `meta`; its flat serializer
+  preserves current model-visible fields and its normalization path accepts
+  `ToolResult`, dicts and legacy JSON strings.
+- `ToolRegistry` explicitly registers all 22 public tools, rejects duplicate
+  names and schema/name mismatches, and remains the source for model schemas.
+- Centralized lookup, schema validation, permission resolution, speech
+  suppression metadata, execution timeouts, cancellation propagation,
+  exception normalization, legacy-result normalization and terminal BUS
+  events in the executor.
+- Permission waits are outside execution timeouts; structured domain failures
+  publish `tool_done`, while invalid/unknown/timeout/uncaught failures publish
+  `tool_error`, with one terminal event per execution.
+- Media adapters now return `ToolResult` while retaining `MediaActionResult`
+  as the media-domain model; other unchanged domain return shapes remain
+  supported through the executor normalization boundary.
+- Moved Apple, system, web-search, media, YouTube and Kilo implementations
+  out of `agent/tools.py`.
+- Reduced `agent/tools.py` and `agent/kilo_bridge.py` to compatibility shims.
+- Preserved the existing public tool names, OpenAI-compatible schemas and flat
+  serialized tool-result fields, including media verification fields.
+- Kept `MediaService`, local-model lifecycle, and provider tool-call
+  accumulation outside this phase.
+
+### Files changed
+
+- `jarvis/tools/` — new canonical package and domain modules.
+- `jarvis/agent/loop.py` — delegates tool calls to `ToolExecutor`.
+- `jarvis/agent/tools.py` — compatibility exports and wrappers only.
+- `jarvis/agent/kilo_bridge.py` — compatibility shim.
+- `tests/test_tool_architecture.py` — new architecture and contract coverage.
+- `tests/test_loop_tool_events.py` — executor/event integration coverage.
+- `DEVELOPER-GUIDE.md` — current repository map and ownership boundaries.
+
+### Validation
+
+- Backend test suite: `322 passed`.
+- Frontend typecheck, Vitest suite (`24 passed`) and production build: PASS.
+- Changed-file Ruff and format checks: PASS.
+- Compile and whitespace checks: PASS.
+- Full `ruff check .`: FAIL only on the three pre-existing findings in
+  `jarvis/audio/focus.py`, `jarvis/log.py` and `tests/test_web_ui_7b.py`.
+- Full `ruff format --check .`: FAIL only on the four pre-existing files
+  `AGENTS.md`, `DEVELOPER-GUIDE.md`, `jarvis/audio/focus.py` and
+  `jarvis/log.py`.
+
+### Manual validation still required
+
+The live cloud/local/no-tools/web/YTM application matrix was not run because
+this environment does not provide a configured live UI session, cloud
+credentials, local model runtime or connected YouTube Music profile. The
+automated suite uses fakes and covers the executor contracts and integration
+boundaries without requiring those services.
+
+### New issues discovered
+
+None requiring scope expansion. The repository-wide Ruff and formatting
+findings above predate Phase 5 and remain outside this phase.
+
+### Remaining risks
+
+Live platform verification remains outstanding. Some non-media domain modules
+still emit legacy JSON strings at their executor boundary; the executor is the
+sole normalization path, and a later migration can convert individual
+handlers to return `ToolResult` directly without changing the loop contract.
+
+### Ready for next phase
+
+YES — Phase 5 implementation and automated acceptance criteria are complete.
+Do not begin Phase 6 as part of this change.
 
 ---
 
