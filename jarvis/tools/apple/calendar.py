@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..system.process import _osascript
+from ..system.process import _osascript, process_error_code
 
 
 async def calendar_today(args: dict[str, Any]) -> str:
@@ -34,8 +34,9 @@ async def calendar_today(args: dict[str, Any]) -> str:
             "error": err or "Calendar unavailable",
             "events": [],
         }
-        if rc == 127:
-            payload["error_code"] = "DEPENDENCY_MISSING"
+        error_code = process_error_code(rc)
+        if error_code is not None:
+            payload["error_code"] = error_code
         return json.dumps(payload, ensure_ascii=False)
     events: list[dict[str, str]] = []
     for line in (out or "").splitlines():

@@ -2258,6 +2258,11 @@ execution behavior to drift.
 - Media adapters now return `ToolResult` while retaining `MediaActionResult`
   as the media-domain model; other unchanged domain return shapes remain
   supported through the executor normalization boundary.
+- Added the focused post-review subprocess correction: the shared process
+  policy maps helper-owned `124` to `TIMEOUT`, `127` to
+  `DEPENDENCY_MISSING`, and leaves ordinary nonzero return codes for generic
+  executor normalization. Apple, system, clipboard and volume consumers use
+  this policy consistently.
 - Moved Apple, system, web-search, media, YouTube and Kilo implementations
   out of `agent/tools.py`.
 - Reduced `agent/tools.py` and `agent/kilo_bridge.py` to compatibility shims.
@@ -2278,7 +2283,7 @@ execution behavior to drift.
 
 ### Validation
 
-- Backend test suite: `322 passed`.
+- Backend test suite: `331 passed`.
 - Frontend typecheck, Vitest suite (`24 passed`) and production build: PASS.
 - Changed-file Ruff and format checks: PASS.
 - Compile and whitespace checks: PASS.

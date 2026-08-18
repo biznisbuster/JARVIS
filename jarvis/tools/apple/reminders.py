@@ -6,7 +6,7 @@ import datetime as dt
 import json
 from typing import Any
 
-from ..system.process import _osascript
+from ..system.process import _osascript, process_error_code
 
 
 async def reminders_create(args: dict[str, Any]) -> str:
@@ -48,8 +48,9 @@ async def reminders_create(args: dict[str, Any]) -> str:
     )
     rc, _out, err = await _osascript(script)
     payload: dict[str, Any] = {"ok": rc == 0, "list": list_name, "title": title, "error": err or None}
-    if rc == 127:
-        payload["error_code"] = "DEPENDENCY_MISSING"
+    error_code = process_error_code(rc)
+    if error_code is not None:
+        payload["error_code"] = error_code
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -74,8 +75,9 @@ async def reminders_list(args: dict[str, Any]) -> str:
             "error": err or "Reminders unavailable",
             "items": [],
         }
-        if rc == 127:
-            payload["error_code"] = "DEPENDENCY_MISSING"
+        error_code = process_error_code(rc)
+        if error_code is not None:
+            payload["error_code"] = error_code
         return json.dumps(payload, ensure_ascii=False)
     items: list[dict[str, str]] = []
     for line in (out or "").splitlines():

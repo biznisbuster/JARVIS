@@ -7,6 +7,16 @@ import subprocess
 from typing import Any
 
 
+def process_error_code(returncode: int) -> str | None:
+    """Map helper-owned sentinel return codes to canonical tool errors."""
+
+    if returncode == 124:
+        return "TIMEOUT"
+    if returncode == 127:
+        return "DEPENDENCY_MISSING"
+    return None
+
+
 def _osascript_sync(script: str, timeout: float = 20.0) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
