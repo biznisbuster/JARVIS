@@ -2263,6 +2263,10 @@ execution behavior to drift.
   `DEPENDENCY_MISSING`, and leaves ordinary nonzero return codes for generic
   executor normalization. Apple, system, clipboard and volume consumers use
   this policy consistently.
+- Added the focused timeout-hierarchy correction: process-backed production
+  tools now keep their bounded subprocess timeout below the executor timeout;
+  `system_volume` uses the shared 20-second process bound and a 25-second
+  executor bound, with a table-driven registry policy regression.
 - Moved Apple, system, web-search, media, YouTube and Kilo implementations
   out of `agent/tools.py`.
 - Reduced `agent/tools.py` and `agent/kilo_bridge.py` to compatibility shims.

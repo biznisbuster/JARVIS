@@ -9,9 +9,11 @@ from typing import Any
 
 from .process import _run, process_error_code
 
+CLIPBOARD_TIMEOUT_S = 5.0
+
 
 async def read_clipboard(args: dict[str, Any]) -> str:
-    rc, out, err = await _run(["pbpaste"], timeout=5)
+    rc, out, err = await _run(["pbpaste"], timeout=CLIPBOARD_TIMEOUT_S)
     payload: dict[str, Any] = {"ok": rc == 0, "text": out if rc == 0 else "", "error": err or None}
     error_code = process_error_code(rc)
     if error_code is not None:
@@ -23,7 +25,7 @@ async def write_clipboard(args: dict[str, Any]) -> str:
     text = args.get("text") or ""
 
     def _do() -> int:
-        proc = subprocess.run(["pbcopy"], input=text, text=True, timeout=5)
+        proc = subprocess.run(["pbcopy"], input=text, text=True, timeout=CLIPBOARD_TIMEOUT_S)
         return proc.returncode
 
     try:

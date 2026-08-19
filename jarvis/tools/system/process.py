@@ -6,6 +6,8 @@ import asyncio
 import subprocess
 from typing import Any
 
+DEFAULT_PROCESS_TIMEOUT_S = 20.0
+
 
 def process_error_code(returncode: int) -> str | None:
     """Map helper-owned sentinel return codes to canonical tool errors."""
@@ -17,7 +19,7 @@ def process_error_code(returncode: int) -> str | None:
     return None
 
 
-def _osascript_sync(script: str, timeout: float = 20.0) -> tuple[int, str, str]:
+def _osascript_sync(script: str, timeout: float = DEFAULT_PROCESS_TIMEOUT_S) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
             ["osascript", "-e", script],
@@ -32,11 +34,13 @@ def _osascript_sync(script: str, timeout: float = 20.0) -> tuple[int, str, str]:
         return 127, "", str(exc)
 
 
-async def _osascript(script: str, timeout: float = 20.0) -> tuple[int, str, str]:
+async def _osascript(script: str, timeout: float = DEFAULT_PROCESS_TIMEOUT_S) -> tuple[int, str, str]:
     return await asyncio.to_thread(_osascript_sync, script, timeout)
 
 
-def _run_sync(cmd: list[str], timeout: float = 20.0, **kwargs: Any) -> tuple[int, str, str]:
+def _run_sync(
+    cmd: list[str], timeout: float = DEFAULT_PROCESS_TIMEOUT_S, **kwargs: Any
+) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
@@ -46,5 +50,7 @@ def _run_sync(cmd: list[str], timeout: float = 20.0, **kwargs: Any) -> tuple[int
         return 127, "", str(exc)
 
 
-async def _run(cmd: list[str], timeout: float = 20.0, **kwargs: Any) -> tuple[int, str, str]:
+async def _run(
+    cmd: list[str], timeout: float = DEFAULT_PROCESS_TIMEOUT_S, **kwargs: Any
+) -> tuple[int, str, str]:
     return await asyncio.to_thread(_run_sync, cmd, timeout, **kwargs)

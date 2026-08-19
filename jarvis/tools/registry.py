@@ -325,7 +325,7 @@ def build_registry() -> ToolRegistry:
                     [],
                 ),
                 system_volume,
-                timeout_s=15,
+                timeout_s=25,
             ),
             ToolSpec(
                 "kilo_run",

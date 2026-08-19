@@ -6,7 +6,10 @@ import datetime as dt
 import json
 from typing import Any
 
-from ..system.process import _osascript, process_error_code
+from ..system.process import DEFAULT_PROCESS_TIMEOUT_S, _osascript, process_error_code
+
+REMINDERS_CREATE_TIMEOUT_S = DEFAULT_PROCESS_TIMEOUT_S
+REMINDERS_LIST_TIMEOUT_S = 15.0
 
 
 async def reminders_create(args: dict[str, Any]) -> str:
@@ -46,7 +49,7 @@ async def reminders_create(args: dict[str, Any]) -> str:
         "end tell\n"
         'return "ok"'
     )
-    rc, _out, err = await _osascript(script)
+    rc, _out, err = await _osascript(script, timeout=REMINDERS_CREATE_TIMEOUT_S)
     payload: dict[str, Any] = {"ok": rc == 0, "list": list_name, "title": title, "error": err or None}
     error_code = process_error_code(rc)
     if error_code is not None:
@@ -68,7 +71,7 @@ async def reminders_list(args: dict[str, Any]) -> str:
         "  return out\n"
         "end tell"
     )
-    rc, out, err = await _osascript(script, timeout=15)
+    rc, out, err = await _osascript(script, timeout=REMINDERS_LIST_TIMEOUT_S)
     if rc != 0:
         payload: dict[str, Any] = {
             "ok": False,

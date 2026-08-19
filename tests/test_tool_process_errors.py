@@ -8,8 +8,11 @@ from typing import Any
 import pytest
 
 from jarvis.tools import DEFAULT_REGISTRY, ToolExecutionContext, ToolExecutor
+from jarvis.tools.apple import calendar as calendar_tools
 from jarvis.tools.apple import reminders
 from jarvis.tools.system import apps
+from jarvis.tools.system import clipboard as clipboard_tools
+from jarvis.tools.system import volume as volume_tools
 from jarvis.tools.system.process import process_error_code
 
 
@@ -40,6 +43,26 @@ def _context() -> ToolExecutionContext:
 )
 def test_process_error_code_maps_only_helper_sentinels(returncode: int, expected: str | None) -> None:
     assert process_error_code(returncode) == expected
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "internal_timeout_s"),
+    [
+        ("reminders_create", reminders.REMINDERS_CREATE_TIMEOUT_S),
+        ("reminders_list", reminders.REMINDERS_LIST_TIMEOUT_S),
+        ("calendar_today", calendar_tools.CALENDAR_TIMEOUT_S),
+        ("open_app", apps.APP_OPEN_TIMEOUT_S),
+        ("open_url", apps.APP_OPEN_TIMEOUT_S),
+        ("read_clipboard", clipboard_tools.CLIPBOARD_TIMEOUT_S),
+        ("write_clipboard", clipboard_tools.CLIPBOARD_TIMEOUT_S),
+        ("system_volume", volume_tools.SYSTEM_VOLUME_TIMEOUT_S),
+    ],
+)
+def test_process_backed_tools_have_outer_timeout_margin(tool_name: str, internal_timeout_s: float) -> None:
+    definition = DEFAULT_REGISTRY.get(tool_name)
+    assert definition is not None
+    assert definition.timeout_s is not None
+    assert internal_timeout_s < definition.timeout_s
 
 
 @pytest.mark.asyncio

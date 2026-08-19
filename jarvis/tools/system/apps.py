@@ -7,12 +7,14 @@ from typing import Any
 
 from .process import _run, process_error_code
 
+APP_OPEN_TIMEOUT_S = 10.0
+
 
 async def open_app(args: dict[str, Any]) -> str:
     name = (args.get("name") or "").strip()
     if not name:
         return json.dumps({"ok": False, "error": "name is required", "error_code": "INVALID_ARGUMENTS"})
-    rc, _out, err = await _run(["open", "-a", name], timeout=10)
+    rc, _out, err = await _run(["open", "-a", name], timeout=APP_OPEN_TIMEOUT_S)
     payload: dict[str, Any] = {"ok": rc == 0, "app": name, "error": err or None}
     error_code = process_error_code(rc)
     if error_code:
@@ -33,7 +35,7 @@ async def open_url(args: dict[str, Any]) -> str:
     if browser:
         cmd += ["-a", browser]
     cmd.append(url)
-    rc, _out, err = await _run(cmd, timeout=10)
+    rc, _out, err = await _run(cmd, timeout=APP_OPEN_TIMEOUT_S)
     payload = {"ok": rc == 0, "url": url, "browser": browser, "error": err or None}
     error_code = process_error_code(rc)
     if error_code is not None:

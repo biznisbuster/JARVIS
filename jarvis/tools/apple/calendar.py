@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..system.process import _osascript, process_error_code
+from ..system.process import DEFAULT_PROCESS_TIMEOUT_S, _osascript, process_error_code
+
+CALENDAR_TIMEOUT_S = DEFAULT_PROCESS_TIMEOUT_S
 
 
 async def calendar_today(args: dict[str, Any]) -> str:
@@ -27,7 +29,7 @@ async def calendar_today(args: dict[str, Any]) -> str:
         "  return out\n"
         "end tell"
     )
-    rc, out, err = await _osascript(script, timeout=20)
+    rc, out, err = await _osascript(script, timeout=CALENDAR_TIMEOUT_S)
     if rc != 0:
         payload: dict[str, Any] = {
             "ok": False,
