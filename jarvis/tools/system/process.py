@@ -1,0 +1,56 @@
+"""Bounded subprocess helpers shared by macOS tool modules."""
+
+from __future__ import annotations
+
+import asyncio
+import subprocess
+from typing import Any
+
+DEFAULT_PROCESS_TIMEOUT_S = 20.0
+
+
+def process_error_code(returncode: int) -> str | None:
+    """Map helper-owned sentinel return codes to canonical tool errors."""
+
+    if returncode == 124:
+        return "TIMEOUT"
+    if returncode == 127:
+        return "DEPENDENCY_MISSING"
+    return None
+
+
+def _osascript_sync(script: str, timeout: float = DEFAULT_PROCESS_TIMEOUT_S) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "osascript timeout"
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+
+
+async def _osascript(script: str, timeout: float = DEFAULT_PROCESS_TIMEOUT_S) -> tuple[int, str, str]:
+    return await asyncio.to_thread(_osascript_sync, script, timeout)
+
+
+def _run_sync(
+    cmd: list[str], timeout: float = DEFAULT_PROCESS_TIMEOUT_S, **kwargs: Any
+) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+
+
+async def _run(
+    cmd: list[str], timeout: float = DEFAULT_PROCESS_TIMEOUT_S, **kwargs: Any
+) -> tuple[int, str, str]:
+    return await asyncio.to_thread(_run_sync, cmd, timeout, **kwargs)
